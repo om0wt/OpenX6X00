@@ -5,6 +5,7 @@
 #
 #   host/podman.sh                 build and run
 #   host/podman.sh shot <theme>... choose each theme through the config socket, save shots/<theme>.png
+#   host/podman.sh theme <theme>   switch the theme
 #   host/podman.sh shell           a shell in the running container
 #
 # build-host/ lives in the podman volume x6100-build, not on the Mac's disk.
@@ -44,6 +45,8 @@ shot)
         echo "shots/$(echo "$t" | tr ' ' _).png"
     done
     ;;
+theme)
+    podman exec $CT sh -c "echo '{\"cmd\":\"disp_set\",\"text\":\"theme\",\"theme\":\"$2\"}' | socat - UNIX-CONNECT:/tmp/x6100_cfg.sock" ;;
 shell) exec podman exec -it $CT bash ;;
-*) echo "usage: host/podman.sh [run|shot <theme>...|shell]" >&2; exit 2 ;;
+*) echo "usage: host/podman.sh [run|shot <theme>...|theme <theme>|shell]" >&2; exit 2 ;;
 esac
