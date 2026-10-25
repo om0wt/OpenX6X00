@@ -1,0 +1,90 @@
+# Builds the X6100 buildroot tree once and keeps it: the image as main.yml makes it, then
+# `make sdk`, buildroot's relocatable toolchain with the sysroot of every library the GUI
+# links. Both go to the release "sdk-x6100" (replaced on every run), where gui.yml picks the
+# SDK up to build only the GUI in a few minutes. Run it by hand again when the buildroot
+# side changes (packages, defconfig, local-build.sh), not for GUI changes.
+name: Build SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sdk:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      BR: ${{ github.workspace }}/AetherX6100Buildroot
+
+    steps:
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: true
+        swap-storage: true
+
+    - name: Checkout GUI
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+        path: x6100_gui
+
+    - name: Checkout buildroot
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+        repository: gdyuldin/AetherX6100Buildroot
+        path: AetherX6100Buildroot
+
+    - name: Prepare ccache timestamp
+      id: ts
+      run: echo "timestamp=$(date -u +%Y-%m-%d-%H%M%S)" >> $GITHUB_OUTPUT
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.buildroot-ccache
+        key: ${{ runner.os }}-x6100-ccache-${{ steps.ts.outputs.timestamp }}
+        restore-keys: |
+          ${{ runner.os }}-x6100-ccache-
+
+    - name: Build the image
+      run: |
+        MODEL=x6100 GUI_DIR=$GITHUB_WORKSPACE/x6100_gui BR_DIR=$BR bash x6100_gui/buildroot/local-build.sh
+
+    - name: Save ccache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.buildroot-ccache
+        key: ${{ runner.os }}-x6100-ccache-${{ steps.ts.outputs.timestamp }}
+
+    - name: Make the SDK
+      run: |
+        make -C $BR/build sdk
+        cd $BR/build/images
+        mv arm-buildroot-linux-gnueabihf_sdk-buildroot.tar.gz x6100-sdk.tar.gz
+        zip -q OpenX6X00-x6100-sdk-build-sdcard.img.zip OpenX6X00-x6100-local-sdcard.img
+        ls -la x6100-sdk.tar.gz OpenX6X00-x6100-sdk-build-sdcard.img.zip
+
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: sdk-x6100
+        name: X6100 buildroot SDK
+        prerelease: true
+        body: |
+          Buildroot SDK for building the GUI (gui.yml) and the image it was built with.
+          Built from ${{ github.sha }} on ${{ steps.ts.outputs.timestamp }}.
+        files: |
+          ${{ env.BR }}/build/images/x6100-sdk.tar.gz
+          ${{ env.BR }}/build/images/OpenX6X00-x6100-sdk-build-sdcard.img.zip

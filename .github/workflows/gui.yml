@@ -1,0 +1,52 @@
+# Builds only the GUI (x6100_gui) with the SDK that sdk.yml keeps in the release "sdk-x6100":
+# a few minutes instead of the two hours of a buildroot run. The binary is a workflow
+# artifact; on the radio it replaces /usr/sbin/x6100_gui (keep the old one).
+name: Build GUI
+
+on:
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+jobs:
+  gui:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Checkout GUI
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - name: Get the SDK
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release download sdk-x6100 -p x6100-sdk.tar.gz -D $RUNNER_TEMP
+        mkdir -p $RUNNER_TEMP/sdk
+        tar xzf $RUNNER_TEMP/x6100-sdk.tar.gz -C $RUNNER_TEMP/sdk --strip-components=1
+        $RUNNER_TEMP/sdk/relocate-sdk.sh
+
+    # The settings buildroot gives a cmake package (as buildroot/build.sh)
+    - name: Build
+      run: |
+        OPTS=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DHW_BACKEND=x6100
+              -DCMAKE_TOOLCHAIN_FILE=$RUNNER_TEMP/sdk/share/buildroot/toolchainfile.cmake
+              -DLV_CONF_BUILD_DISABLE_EXAMPLES=ON -DLV_CONF_BUILD_DISABLE_DEMOS=ON)
+        for o in BUILD_DOC BUILD_DOCS BUILD_EXAMPLE BUILD_EXAMPLES BUILD_TEST BUILD_TESTS BUILD_TESTING \
+                 BUILD_SHARED_LIBS BUILD_SHARED_LIB; do OPTS+=(-D$o=OFF); done
+        cmake -S . -B build "${OPTS[@]}"
+        cmake --build build -j$(nproc)
+        file build/src/x6100_gui
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: x6100_gui-${{ github.ref_name }}-${{ github.sha }}
+        path: build/src/x6100_gui
+        retention-days: 30
