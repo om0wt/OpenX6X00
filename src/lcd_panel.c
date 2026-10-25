@@ -4,7 +4,7 @@
  *  KX3Lovers: the radio's state on a segment display laid out as the LCD drawn in Elecraft's KX3
  *  owner's manual (Rev C5, page 8): the bar graph with its scales and the filter graphic on the
  *  left, VFO A in seven segments, the icons and VFO B in fourteen segments under it, the VFO and
- *  mode icons on the right. Every segment and icon is on the glass; the lit ones are in ink.
+ *  mode icons on the right. As on the backlit glass, only what is lit shows, in ink.
  *  The places are the manual's drawing, 1248 x 313 units, scaled to the 800 px of the screen.
  *
  *  Copyright (c) 2026 Pavol Calfa OM0WT
@@ -63,6 +63,7 @@ static int text(int x, int y, const char *s, bool lit, const lv_font_t *font) {
     dsc.font  = font;
     dsc.color = ink(lit);
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (!lit) return x + size.x * ART_W / 800;
     lv_area_t a = {.x1 = ox + U(x), .y1 = oy + U(y) - size.y / 2};
     a.x2 = a.x1 + size.x;
     a.y2 = a.y1 + size.y;
@@ -81,6 +82,7 @@ static void text_c(int x, int y, const char *s, bool lit, const lv_font_t *font)
 static void rect(int x1, int y1, int x2, int y2, bool lit) {
     lv_draw_rect_dsc_t dsc;
 
+    if (!lit) return;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_color = ink(lit);
     lv_area_t a = {ox + U(x1), oy + U(y1), ox + U(x2), oy + U(y2)};
@@ -90,6 +92,7 @@ static void rect(int x1, int y1, int x2, int y2, bool lit) {
 static void line(int x1, int y1, int x2, int y2, int w, bool lit) {
     lv_draw_line_dsc_t dsc;
 
+    if (!lit) return;
     lv_draw_line_dsc_init(&dsc);
     dsc.color = ink(lit);
     dsc.width = w;
@@ -101,6 +104,7 @@ static void poly(const lv_point_t *u, int n, bool lit) {
     lv_draw_rect_dsc_t dsc;
     lv_point_t         p[8];
 
+    if (!lit) return;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_color = ink(lit);
     for (int i = 0; i < n; i++) p[i] = (lv_point_t){ox + U(u[i].x), oy + U(u[i].y)};
@@ -124,6 +128,7 @@ static void tri(int x, int y, int r, int dir, bool lit) {
 static void frame(int x1, int y1, int x2, int y2, int r, bool lit) {
     lv_draw_rect_dsc_t dsc;
 
+    if (!lit) return;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_opa       = LV_OPA_TRANSP;
     dsc.border_color = ink(lit);
@@ -208,7 +213,7 @@ static uint16_t seg14_of(char c) {
 
 static void seg14(const lv_area_t *box, uint16_t lit, lv_color_t color) {
     lv_coord_t w = lv_area_get_width(box), h = lv_area_get_height(box);
-    lv_coord_t t = LV_MAX(w / 5, 2);
+    lv_coord_t t = LV_MAX(w / 8, 2);
     lv_coord_t l = box->x1 + t / 2, r = box->x2 - t / 2, c = (l + r) / 2;
     lv_coord_t top = box->y1 + t / 2, m = (box->y1 + box->y2) / 2, b = box->y2 - t / 2;
     const lv_coord_t s[14][4] = {
@@ -246,7 +251,7 @@ static void freq_cells(int32_t f, char cells[9]) {
 static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fourteen) {
     static const uint8_t seven[10] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
     lv_draw_rect_dsc_t   on;
-    int                  pitch = (x2 - x1) / 8, dw = pitch * 4 / 5;
+    int                  pitch = (x2 - x1) / 8, dw = pitch * (fourteen ? 3 : 4) / 5;   /* VFO B: apart */
 
     lv_draw_rect_dsc_init(&on);
     on.bg_color = ink(true);
