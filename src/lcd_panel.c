@@ -14,6 +14,7 @@
 
 #include "cfg/cfg_api.h"
 #include "clock.h"
+#include "cw_tune_view.h"
 #include "freq_scale.h"
 #include "info_bar.h"
 #include "gui_styles.h"
@@ -53,6 +54,8 @@ typedef struct {
     int16_t sdb, swr10, pwr10, volts10, minute;
     uint16_t cw_seq;
     bool    cw;
+    bool    cwt, cwt_on;    /* CW with the tuning aid on; a tone locked in the last second */
+    int16_t cwt_hz;         /* its offset from the pitch */
     int32_t bw;
 } lcd_state_t;
 
@@ -347,7 +350,19 @@ static void plus_scales(const lcd_state_t *st) {
 
     for (int i = 0; i < 8; i++) text_c(s_major[i] + (i ? 0 : 6), 17, s_text[i], true, &sony_20);
     ruler(31, 470, 58, 8.6f, s_major, 8);
-    if (!tx && st->sdb > S1) rect(31, 46, plus_s_x(st->sdb), 54, true);
+    if (!tx && st->sdb > S1) rect(31, 46, st->cwt ? LV_MIN(plus_s_x(st->sdb), PLUS_S9) : plus_s_x(st->sdb), 54, true);
+    if (st->cwt && !tx) {
+        /* CWT (the KX3's tuning aid): the S-meter's right half, zero beat in its middle under the
+         * mark, the tone's offset as a block (as cw_tune_view: a lower tone to the right), +-50 Hz to
+         * the ends, wider within 10 Hz */
+        const int mid = (PLUS_S9 + PLUS_S60) / 2, half = (PLUS_S60 - PLUS_S9) / 2 - 6;
+
+        tri(mid, 34, 5, 1, true);
+        if (st->cwt_on) {
+            int x = mid - LV_CLAMP(-50, st->cwt_hz, 50) * half / 50, w = LV_ABS(st->cwt_hz) <= 10 ? 9 : 4;
+            rect(x - w, 44, x + w, 56, true);
+        }
+    }
 
     ruler(31, 185, 95, 7.7f, swr_major, 3);
     ruler(227, 463, 95, 11.8f, rf_major, 3);
@@ -506,6 +521,10 @@ static void read_state(lcd_state_t *st) {
     st->cw     = (st->mode == radio_mode_cw || st->mode == radio_mode_cwr) &&
                  (tx || (cw_line[0] && lv_tick_elaps(cw_ms) < CW_HOLD_MS));
     pthread_mutex_unlock(&cw_mux);
+    int hz = 0;
+    st->cwt    = param_i_get(cfg_cw_tune) && (st->mode == radio_mode_cw || st->mode == radio_mode_cwr);
+    st->cwt_on = st->cwt && cw_tune_recent(&hz);
+    st->cwt_hz = st->cwt_on ? LV_CLAMP(-99, hz, 99) : 0;
     st->flags = tx | (param_i_get(cfg_band_split) ? 2 : 0);
     st->icons = (cparam_i_get(cfg_cur_att) ? 1 << I_ATT : 0) | (cparam_i_get(cfg_cur_pre) ? 1 << I_PRE : 0);
 }
