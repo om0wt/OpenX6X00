@@ -1,7 +1,7 @@
 #!/bin/sh
 # OpenX6X00 - the GUI on a PC without Linux (macOS, Windows): host/build.sh in an Ubuntu
 # container under podman, the SDL window in a virtual X screen of 800x480 (PulseAudio without a
-# sound card). The screen over VNC, keys as in host/README.md: open vnc://localhost:5900, password x6100
+# sound card). The screen over VNC, keys as in host/README.md: open vnc://localhost:5901, password x6100
 #
 #   host/podman.sh                 build and run
 #   host/podman.sh shot <theme>... choose each theme through the config socket, save shots/<theme>.png
@@ -29,11 +29,11 @@ case "${1:-run}" in
 run)
     image
     podman rm -f $CT >/dev/null 2>&1 || true
-    podman run -d --name $CT -p 5900:5900 -v "$PWD":/src -v x6100-build:/src/build-host -w /src $IMG \
+    podman run -d --name $CT -p 127.0.0.1:5901:5900 -v "$PWD":/src -v x6100-build:/src/build-host -w /src $IMG \
         sh -c 'host/build.sh build && mkdir -p build-host/data/themes && cp themes/*.json build-host/data/themes/ &&
                { Xvfb :1 -screen 0 800x480x24 -nolisten tcp & } && pulseaudio -D --exit-idle-time=-1 &&
                sleep 2 && { x11vnc -display :1 -forever -shared -passwd x6100 -q >/dev/null 2>&1 & } && DISPLAY=:1 exec build-host/src/x6100_gui'
-    echo "building, then: open vnc://localhost:5900 (password x6100)   (podman logs -f $CT)"
+    echo "building, then: open vnc://localhost:5901 (password x6100)   (podman logs -f $CT)"
     ;;
 shot)
     shift; mkdir -p shots
