@@ -194,7 +194,7 @@ typedef struct {
 #define VISION_FONT_STEPS 3 /* VISION: every font this many sizes up, apps and Settings too (fonts_scale) */
     bool    deck;           /* Black Metal, Total Black: two rows of state on top, S/SWR/ALC scales beside a big
                              * frequency, the frequency edges in the spectrum, one-line flat buttons */
-    bool    lcd;            /* LCD: the deck as a segment display, the frequency in seven segments with the
+    bool    lcd;            /* KX3Lovers: the deck as a segment display, the frequency in seven segments with the
                              * unlit ones showing (in track) */
     uint32_t waterfall[16];    /* palette stops from weak to strong signal */
     uint8_t  waterfall_n;       /* 0 = a built-in table (waterfall_table) */

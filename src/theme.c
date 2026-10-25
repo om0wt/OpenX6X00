@@ -25,7 +25,7 @@
 enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD, B_COUNT };
 
 static const char *const builtin_names[B_COUNT] = {"RF.Guru", "Legacy", "Outdoor", "Classic", "Outdoor-Negative",
-                                                   "VISION", "Black Metal", "Total Black", "LCD"};
+                                                   "VISION", "Black Metal", "Total Black", "KX3Lovers"};
 
 /* VISION: the default's colours made "warm anthracite": white digits on dark grey, orange for what is on,
  * aqua frames, the layout big (styles.c) */
@@ -85,7 +85,7 @@ static const theme_set_t total_black_colors[] = {   /* over deck_colors */
     {TC_list, 0x000000},        {TC_frame, 0x000000},        {TC_veil, 0x000000},
 };
 
-/* LCD: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
+/* KX3Lovers: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
  * than the glass (track). On Outdoor's colours for everything this table does not set */
 #define LCD_GLASS 0xe8b04c
 #define LCD_INK   0x1e1608
