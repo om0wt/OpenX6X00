@@ -108,6 +108,86 @@ static void step_mark_draw_cb(lv_event_t *e) {
     lv_draw_line(lv_event_get_draw_ctx(e), &dsc, &p1, &p2);
 }
 
+/* LCD: a digit in seven segments (bits a..g: top, top right, bottom right, bottom, bottom left,
+ * top left, middle) in box, leaning right like a segment display */
+static void seg7(lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *dsc, const lv_area_t *box, uint8_t lit) {
+    lv_coord_t w = lv_area_get_width(box), h = lv_area_get_height(box);
+    lv_coord_t t = LV_MAX(w / 6, 3), g = 1;
+    lv_coord_t xl = box->x1 + t / 2, xr = box->x2 - t / 2;
+    lv_coord_t yt = box->y1 + t / 2, ym = (box->y1 + box->y2) / 2, yb = box->y2 - t / 2;
+    /* horizontal: y, from x to x; vertical: x, from y to y */
+    const lv_coord_t seg[7][4] = {
+        {yt, xl, xr, 0}, {xr, yt, ym, 1}, {xr, ym, yb, 1}, {yb, xl, xr, 0},
+        {xl, ym, yb, 1}, {xl, yt, ym, 1}, {ym, xl, xr, 0},
+    };
+
+    for (int i = 0; i < 7; i++) {
+        if (!(lit & 1 << i)) continue;
+        lv_coord_t c = seg[i][0], a = seg[i][1] + g, b = seg[i][2] - g;
+        lv_point_t p[6];
+
+        if (seg[i][3]) {
+            p[0] = (lv_point_t){c, a};
+            p[1] = (lv_point_t){c + t / 2, a + t / 2};
+            p[2] = (lv_point_t){c + t / 2, b - t / 2};
+            p[3] = (lv_point_t){c, b};
+            p[4] = (lv_point_t){c - t / 2, b - t / 2};
+            p[5] = (lv_point_t){c - t / 2, a + t / 2};
+        } else {
+            p[0] = (lv_point_t){a, c};
+            p[1] = (lv_point_t){a + t / 2, c - t / 2};
+            p[2] = (lv_point_t){b - t / 2, c - t / 2};
+            p[3] = (lv_point_t){b, c};
+            p[4] = (lv_point_t){b - t / 2, c + t / 2};
+            p[5] = (lv_point_t){a + t / 2, c + t / 2};
+        }
+        for (int k = 0; k < 6; k++) p[k].x += (box->y2 - p[k].y) * w / (8 * h);   /* the lean */
+        lv_draw_polygon(draw_ctx, dsc, p, 6);
+    }
+}
+
+/* LCD: the label's text (drawn see-through) as segments, every segment first in the unlit colour */
+static void seg7_draw_cb(lv_event_t *e) {
+    static const uint8_t digits[10] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
+    lv_obj_t           *label = lv_event_get_target(e);
+    const char         *text = lv_label_get_text(label);
+    const lv_font_t    *font = lv_obj_get_style_text_font(label, 0);
+    lv_font_glyph_dsc_t eight;
+    lv_draw_rect_dsc_t  on, off;
+    lv_area_t           a;
+
+    if (!lv_font_get_glyph_dsc(font, &eight, '8', 0)) return;
+    lv_obj_get_content_coords(label, &a);
+    lv_draw_rect_dsc_init(&on);
+    lv_draw_rect_dsc_init(&off);
+    on.bg_color  = TC(text);
+    off.bg_color = TC(track);
+
+    lv_coord_t m = eight.adv_w / 10;   /* the room between two digits */
+
+    for (int i = 0; text[i]; i++) {
+        lv_point_t p;
+
+        lv_label_get_letter_pos(label, i, &p);
+        lv_coord_t x = a.x1 + p.x, top = a.y1 + p.y + font->line_height - font->base_line - eight.box_h - eight.ofs_y;
+        lv_area_t  box = {.x1 = x + m, .y1 = top, .x2 = x + eight.adv_w - m - 1, .y2 = top + eight.box_h - 1};
+
+        if (text[i] >= '0' && text[i] <= '9') {
+            seg7(lv_event_get_draw_ctx(e), &off, &box, 0x7f);
+            seg7(lv_event_get_draw_ctx(e), &on, &box, digits[text[i] - '0']);
+        } else if (text[i] == '.') {
+            lv_font_glyph_dsc_t dot;
+            lv_coord_t          t = LV_MAX(eight.adv_w / 6, 3);
+
+            lv_font_get_glyph_dsc(font, &dot, '.', 0);
+            box.x1 = x + (dot.adv_w - t) / 2;
+            box.x2 = box.x1 + t - 1;
+            box.y1 = box.y2 - t + 1;
+            lv_draw_rect(lv_event_get_draw_ctx(e), &on, &box);
+        }
+    }
+}
+
 static void step_change_cb(Subject *subj, void *user_data) {
     lv_obj_invalidate(freq_label);
 }
@@ -420,6 +500,13 @@ lv_obj_t *freq_strip_init(lv_obj_t *parent) {
         lv_obj_set_style_bg_opa(vfo_badge, LV_OPA_COVER, 0);
         lv_obj_set_style_pad_hor(vfo_badge, 5, 0);
         lv_obj_add_event_cb(freq_small, step_mark_draw_cb, LV_EVENT_DRAW_POST, NULL);
+        if (theme_shape.lcd) {   /* the text see-through, the segments drawn over it */
+            lv_obj_t *seg[] = {freq_label, freq_small};
+            for (int i = 0; i < 2; i++) {
+                lv_obj_set_style_text_opa(seg[i], LV_OPA_TRANSP, 0);
+                lv_obj_add_event_cb(seg[i], seg7_draw_cb, LV_EVENT_DRAW_MAIN_END, NULL);
+            }
+        }
         subject_subscribe_delayed((Subject *)cfg_band_current_vfo, update_cb, NULL);
     }
 

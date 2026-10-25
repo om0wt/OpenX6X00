@@ -6,7 +6,8 @@ shapes, the font and the waterfall palette.
 
 Built in: **RF.Guru** (default: near-black surfaces, gold for what is on, electric blue as the second accent), **Classic** (black, grey keys, IC-7300 style)
 **Outdoor** (light, for the sun), **Outdoor-Negative** (Outdoor with the
-lightness inverted: dark, the hues kept) and, not offered in the menu, Legacy. More themes are JSON files
+lightness inverted: dark, the hues kept), **LCD** (a backlit segment display: dark segments on amber, the
+frequency in seven segments with the unlit ones showing, the Black Metal layout) and, not offered in the menu, Legacy. More themes are JSON files
 on the SD card in `/mnt/themes/`, one per file: `/mnt/themes/My theme.json`
 shows up as *My theme* in Settings -> Display -> INTERFACE -> Theme. Choosing a theme
 applies it at once, without restarting the radio app (an open app closes).
@@ -40,7 +41,7 @@ Every key is optional: what a file does not set comes from its `base`.
 
 | Key | Meaning |
 |---|---|
-| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor` or `Outdoor-Negative` (default RF.Guru) |
+| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor`, `Outdoor-Negative`, `VISION`, `Black Metal`, `Total Black` or `LCD` (default RF.Guru) |
 | `colors` | role -> `#rrggbb`, roles below |
 | `radius`, `radius_btn`, `radius_popup` | corners of the boxes (top bar, strip, windows), of the bottom buttons, of menus and panels in the apps |
 | `border` | border width of boxes and buttons (3 or more: high contrast boxes) |

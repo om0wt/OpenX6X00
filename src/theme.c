@@ -22,10 +22,10 @@
 #define THEMES_DIR BOARD_DATA "/themes"
 #endif
 
-enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_COUNT };
+enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD, B_COUNT };
 
 static const char *const builtin_names[B_COUNT] = {"RF.Guru", "Legacy", "Outdoor", "Classic", "Outdoor-Negative",
-                                                   "VISION", "Black Metal", "Total Black"};
+                                                   "VISION", "Black Metal", "Total Black", "LCD"};
 
 /* VISION: the default's colours made "warm anthracite": white digits on dark grey, orange for what is on,
  * aqua frames, the layout big (styles.c) */
@@ -83,6 +83,34 @@ static const theme_set_t total_black_colors[] = {   /* over deck_colors */
     {TC_btn, 0x000000},         {TC_btn_grad, 0x000000},     {TC_btn_border, 0x46494d},     {TC_btn_active, 0x000000},
     {TC_btn_active_grad, 0x000000}, {TC_btn_page, 0x000000}, {TC_popup, 0x000000},          {TC_side, 0x000000},
     {TC_list, 0x000000},        {TC_frame, 0x000000},        {TC_veil, 0x000000},
+};
+
+/* LCD: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
+ * than the glass (track). On Outdoor's colours for everything this table does not set */
+#define LCD_GLASS 0xe8b04c
+#define LCD_INK   0x1e1608
+#define LCD_DIM   0x5a4218
+#define LCD_OFF   0x9a7430
+#define LCD_GHOST 0xd9a240
+static const theme_set_t lcd_colors[] = {
+    {TC_bg, LCD_GLASS},         {TC_panel, LCD_GLASS},       {TC_bar, LCD_GLASS},           {TC_bar_grad, LCD_GLASS},
+    {TC_bar_border, LCD_INK},   {TC_strip, LCD_GLASS},       {TC_strip_grad, LCD_GLASS},    {TC_strip_border, LCD_INK},
+    {TC_dialog, LCD_GLASS},     {TC_dialog_grad, LCD_GLASS}, {TC_dialog_border, LCD_INK},   {TC_btn, LCD_GLASS},
+    {TC_btn_grad, LCD_GLASS},   {TC_btn_border, LCD_INK},    {TC_btn_text, LCD_INK},        {TC_btn_active, LCD_INK},
+    {TC_btn_active_grad, LCD_INK}, {TC_btn_active_border, LCD_INK}, {TC_btn_active_text, LCD_GLASS},
+    {TC_btn_page, 0xdca444},    {TC_btn_page_text, LCD_INK}, {TC_btn_off_text, LCD_OFF},    {TC_btn_off_border, LCD_OFF},
+    {TC_card, LCD_INK},         {TC_popup, 0xf0c060},        {TC_popup_border, LCD_INK},    {TC_side, LCD_GLASS},
+    {TC_chip, 0xdea648},        {TC_sel_bg, LCD_INK},        {TC_sel_text, LCD_GLASS},      {TC_sel_border, LCD_INK},
+    {TC_focus, LCD_INK},        {TC_focus_text, LCD_GLASS},  {TC_edited, LCD_DIM},          {TC_vfo, LCD_INK},
+    {TC_vfo_bg, 0xd09838},      {TC_text, LCD_INK},          {TC_text_value, LCD_INK},      {TC_text_dim, LCD_DIM},
+    {TC_text_soft, LCD_DIM},    {TC_text_mute, LCD_OFF},     {TC_text_faint, 0xc49440},     {TC_text_head, LCD_INK},
+    {TC_line, LCD_INK},         {TC_off, LCD_OFF},           {TC_track, LCD_GHOST},         {TC_icon_off, 0xcc9a42},
+    {TC_info, LCD_INK},         {TC_accent, LCD_INK},        {TC_ok, LCD_INK},              {TC_toggle_on, LCD_INK},
+    {TC_vfo_line, LCD_INK},     {TC_spot, LCD_INK},          {TC_mode_text, LCD_INK},       {TC_mode_bg, LCD_GLASS},
+    {TC_mode_border, LCD_INK},  {TC_meter_bar, LCD_INK},     {TC_meter_weak, LCD_INK},      {TC_meter_low, LCD_INK},
+    {TC_meter_high, LCD_INK},   {TC_meter_over, LCD_INK},    {TC_pill_off_text, LCD_OFF},   {TC_btn_mark, LCD_OFF},
+    {TC_btn_mark_assigned, LCD_DIM}, {TC_btn_mark_active, LCD_INK},
+    {TC_list, LCD_GLASS},       {TC_row, 0xdea648},          {TC_frame, LCD_GLASS},         {TC_veil, 0xd09838},
 };
 
 static const uint32_t builtin_colors[B_OUTDOOR_NEG][TC_COUNT] = {   /* VISION and Outdoor-Negative are made from these */
@@ -163,7 +191,7 @@ static void theme_set(const theme_set_t *s, size_t n) {
 
 /* Outdoor-Negative: Outdoor with every colour and the waterfall through negative() */
 static void use_builtin(int b) {
-    int src = b == B_OUTDOOR_NEG ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
+    int src = b == B_OUTDOOR_NEG || b == B_LCD ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
 
     memcpy(colors, builtin_colors[src], sizeof(colors));
     theme_shape = builtin_shapes[src];
@@ -189,6 +217,14 @@ static void use_builtin(int b) {
                                       /* black, deep blue, blue, cyan, yellow-green */
                                       .waterfall = {0x000000, 0x000418, 0x00145e, 0x0a5ad2, 0x28c8f0, 0xc8f05a},
                                       .waterfall_n = 6};
+    }
+    if (b == B_LCD) {
+        theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
+        theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true, .lcd = true,
+                                      .mono_cluster = true,
+                                      /* the glass to the ink */
+                                      .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
+                                      .waterfall_n = 5};
     }
     snprintf(theme_shape.name, sizeof(theme_shape.name), "%s", builtin_names[b]);
 }
