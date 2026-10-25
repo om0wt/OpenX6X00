@@ -24,6 +24,7 @@
 #include "tx_meters.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +37,16 @@
 static int un = 800, ud = ART_W;
 
 static lv_obj_t      *panel;
+static lv_obj_t      *strip;            /* Plus: the spectrum strip */
 static lv_timer_t    *timer;
+
+/* Plus, CW: the decoded text in the strip's lower half while keying or while text comes in */
+#define CW_HOLD_MS  10000
+#define STRIP_H     54
+static pthread_mutex_t cw_mux = PTHREAD_MUTEX_INITIALIZER;
+static char            cw_line[160];
+static uint16_t        cw_seq;
+static uint32_t        cw_ms;           /* lv_tick_get() of the last text */
 static lv_coord_t     ox, oy;           /* the drawing's top left on the screen */
 static lv_draw_ctx_t *ctx;
 
@@ -47,6 +57,8 @@ typedef struct {
     uint8_t flags;      /* tx, split, lock */
     uint16_t icons;
     int16_t sdb, swr10, pwr10, volts10, minute;   /* Plus */
+    uint16_t cw_seq;
+    bool    cw;
     int32_t bw;
 } lcd_state_t;
 
@@ -527,6 +539,23 @@ static void plus_info(const lcd_state_t *st) {
     text_r(x - 22, 427, s, true, &sony_24);
 }
 
+/* The strip's lower half: the newest text that fits, ending at the right */
+static void plus_cw(const lcd_state_t *st) {
+    char t[sizeof(cw_line)];
+    const char *s = t;
+    lv_point_t  size;
+
+    if (!st->cw) return;
+    pthread_mutex_lock(&cw_mux);
+    strcpy(t, cw_line);
+    pthread_mutex_unlock(&cw_mux);
+    frame(0, 356 + STRIP_H / 2, 799, 356 + STRIP_H, 0, true);
+    do {
+        lv_txt_get_size(&size, s, &sony_22, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    } while (size.x > 780 && *s++);
+    text_r(792, 356 + STRIP_H * 3 / 4, s, true, &sony_22);
+}
+
 static void draw_plus(void) {
     char cells[9];
 
@@ -538,6 +567,7 @@ static void draw_plus(void) {
     freq_cells(shown.fb, cells);
     digits(430, 782, 285, 338, cells, true, 80);
     plus_info(&shown);
+    plus_cw(&shown);
 }
 
 static void draw_cb(lv_event_t *e) {
@@ -596,6 +626,11 @@ static void read_state(lcd_state_t *st) {
         st->volts10 = (ext >= 3.0f ? ext : bat) * 10 + 0.5f;
         st->minute  = t.tm_hour * 60 + t.tm_min;
         st->bw      = cparam_i_get(cfg_cur_filter_bw);
+        pthread_mutex_lock(&cw_mux);
+        st->cw_seq = cw_seq;
+        st->cw     = (st->mode == radio_mode_cw || st->mode == radio_mode_cwr) &&
+                     (tx || (cw_line[0] && lv_tick_elaps(cw_ms) < CW_HOLD_MS));
+        pthread_mutex_unlock(&cw_mux);
     }
     st->flags = tx | (param_i_get(cfg_band_split) ? 2 : 0) | (main_screen_freq_locked() ? 4 : 0);
     st->icons = (param_i_get(cfg_vox_on) ? 1 << I_VOX : 0) | (param_i_get(cfg_atu_enabled) ? 1 << I_ATU : 0) |
@@ -611,6 +646,7 @@ static void poll_cb(lv_timer_t *t) {
 
     read_state(&st);
     if (memcmp(&st, &shown, sizeof(st))) {
+        if (strip && st.cw != shown.cw) lv_obj_set_height(strip, st.cw ? STRIP_H / 2 : STRIP_H);   /* the spectrum half */
         shown = st;
         lv_obj_invalidate(panel);
     }
@@ -620,6 +656,7 @@ static void delete_cb(lv_event_t *e) {
     lv_timer_del(timer);
     timer = NULL;
     panel = NULL;
+    strip = NULL;
 }
 
 lv_obj_t *lcd_panel_init(lv_obj_t *parent, lv_coord_t height) {
@@ -640,4 +677,26 @@ lv_obj_t *lcd_panel_init(lv_obj_t *parent, lv_coord_t height) {
     read_state(&shown);
     timer = lv_timer_create(poll_cb, 100, NULL);
     return panel;
+}
+
+void lcd_panel_set_strip(lv_obj_t *spectrum) {
+    strip = spectrum;
+}
+
+/* Any thread: the CW decoder's text, kept to the last line's worth */
+void lcd_panel_cw_text(const char *text) {
+    pthread_mutex_lock(&cw_mux);
+    size_t n = strlen(cw_line), add = strlen(text);
+    if (n + add >= sizeof(cw_line)) {
+        size_t drop = n + add - sizeof(cw_line) + 1;
+        if (drop > n) drop = n;
+        memmove(cw_line, cw_line + drop, n - drop + 1);
+        n -= drop;
+    }
+    snprintf(cw_line + n, sizeof(cw_line) - n, "%s", text);
+    for (char *c = cw_line + n; *c; c++)
+        if (*c == '\n' || *c == '\r') *c = ' ';
+    cw_seq++;
+    cw_ms = lv_tick_get();
+    pthread_mutex_unlock(&cw_mux);
 }

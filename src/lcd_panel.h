@@ -12,3 +12,9 @@
 
 /* Over the top of the main screen, height px tall: the display in the middle of it */
 lv_obj_t *lcd_panel_init(lv_obj_t *parent, lv_coord_t height);
+
+/* Plus: the spectrum strip, half as tall in CW while keying or while decoded text comes in */
+void lcd_panel_set_strip(lv_obj_t *spectrum);
+
+/* Any thread: CW decoder text, shown in the strip's lower half (Plus) */
+void lcd_panel_cw_text(const char *text);

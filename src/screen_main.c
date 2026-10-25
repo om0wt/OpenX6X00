@@ -1419,6 +1419,7 @@ static void build(void) {
         lv_obj_set_style_border_color(spectrum, TC(text), 0);
         lv_obj_move_foreground(spectrum);
         freq_scale_foreground();
+        lcd_panel_set_strip(spectrum);
     }
     tx_info = tx_info_init(obj);
 
