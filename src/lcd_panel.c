@@ -284,8 +284,8 @@ static void freq_cells(int32_t f, char cells[9]) {
     snprintf(cells, 9, "%8.8s", s + LV_MAX(0, (int)strlen(s) - 8));
 }
 
-static const seg_style_t plus_a = {80, 5, 12, true, true}, plus_b = {80, 8, 12, true, true};
-static const seg_style_t plus_text = {80, 7, 12, true, false};
+static const seg_style_t plus_a = {80, 5, 12, true, false}, plus_b = {80, 8, 12, true, false};
+static const seg_style_t plus_text = {80, 4, 12, true, false};   /* CW text: bold */
 
 /* A point t square at the bottom right of a place, leaning with it */
 static void point(lv_coord_t x, lv_coord_t y2, lv_coord_t t) {
