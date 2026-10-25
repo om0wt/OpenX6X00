@@ -1,0 +1,71 @@
+# The themes in an emulator: the GUI built for a PC (host/build.sh: SDL window, stub radio) runs in
+# a virtual X screen of 800x480, each theme is chosen through the GUI's config socket and the screen
+# taken as a PNG. The shots are the artifact "theme-shots". Themes in themes/*.json can be tried too.
+name: Theme shots
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'themes/**'
+      - '.github/workflows/emu.yml'
+  workflow_dispatch:
+    inputs:
+      themes:
+        description: 'Themes, comma separated (built-in names or themes/*.json without .json)'
+        default: 'KX3Lovers,Black Metal,RF.Guru'
+
+jobs:
+  shots:
+    runs-on: ubuntu-24.04
+    env:
+      THEMES: ${{ inputs.themes || 'KX3Lovers,Black Metal,RF.Guru' }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - name: Packages
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -yq --no-install-recommends build-essential cmake ninja-build sqlite3 libsqlite3-dev \
+          libsdl2-dev libdrm-dev libxkbcommon-dev libnm-dev libdbus-glib-1-dev libpng-dev libjpeg-dev \
+          libsndfile1-dev libudev-dev libpulse-dev libasound2-dev libgps-dev autoconf automake libtool \
+          xvfb imagemagick socat
+
+    # liquid-dsp, ft8_lib and the boost headers, built once by host/build.sh
+    - uses: actions/cache@v4
+      with:
+        path: build-host/deps
+        key: host-deps-${{ hashFiles('host/build.sh') }}
+
+    - name: Build
+      run: host/build.sh build
+
+    - name: Shots
+      run: |
+        mkdir -p shots build-host/data/themes
+        cp -r themes/*.json build-host/data/themes/ 2>/dev/null || true
+        xvfb-run -a -s "-screen 0 800x480x24" bash -c '
+          build-host/src/x6100_gui > gui.log 2>&1 &
+          for i in $(seq 60); do [ -S /tmp/x6100_cfg.sock ] && break; sleep 1; done
+          sleep 8
+          IFS=, read -ra list <<< "$THEMES"
+          for t in "${list[@]}"; do
+            echo "{\"cmd\":\"disp_set\",\"text\":\"theme\",\"theme\":\"$t\"}" | socat - UNIX-CONNECT:/tmp/x6100_cfg.sock
+            sleep 5
+            import -window root "shots/${t// /_}.png"
+          done
+          kill %1'
+        tail -20 gui.log
+        ls -la shots
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: theme-shots
+        path: |
+          shots/
+          gui.log
+        retention-days: 30
