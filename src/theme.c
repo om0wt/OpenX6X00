@@ -22,11 +22,11 @@
 #define THEMES_DIR BOARD_DATA "/themes"
 #endif
 
-enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD, B_LCD_STRICT, B_COUNT };
+enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD, B_LCD_STRICT, B_LCD_PLUS, B_COUNT };
 
 static const char *const builtin_names[B_COUNT] = {"RF.Guru", "Legacy", "Outdoor", "Classic", "Outdoor-Negative",
                                                    "VISION", "Black Metal", "Total Black", "KX3Lovers",
-                                                   "KX3Lovers Strict"};
+                                                   "KX3Lovers Strict", "KX3Lovers Plus"};
 
 /* VISION: the default's colours made "warm anthracite": white digits on dark grey, orange for what is on,
  * aqua frames, the layout big (styles.c) */
@@ -225,11 +225,18 @@ static void use_builtin(int b) {
     if (b >= B_LCD) {
         theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
         theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true,
-                                      .kx3 = b == B_LCD_STRICT ? 2 : 1,
+                                      .kx3 = b == B_LCD_STRICT ? 2 : b == B_LCD_PLUS ? 3 : 1,
                                       .mono_cluster = true,
                                       /* the glass to the ink */
                                       .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
                                       .waterfall_n = 5};
+    }
+    if (b == B_LCD_PLUS) {   /* the buttons as text between lines, the active one not inverted */
+        static const theme_set_t plus[] = {
+            {TC_btn_active, LCD_GLASS}, {TC_btn_active_grad, LCD_GLASS}, {TC_btn_active_text, LCD_INK},
+            {TC_btn_page, LCD_GLASS},   {TC_panel, 0xf4c870},   /* the spectrum strip: lighter glass */
+        };
+        theme_set(plus, sizeof(plus) / sizeof(plus[0]));
     }
     snprintf(theme_shape.name, sizeof(theme_shape.name), "%s", builtin_names[b]);
 }

@@ -87,6 +87,7 @@ static void bar_sizes(void) {
         clock_w      = 280;
     }
     if (theme_shape.kx3) freq_strip_h = LCD_PANEL_H - top_bar_h;   /* the spectrum under the display */
+    if (theme_shape.kx3 == 3) buttons_h = 36;                       /* Plus: one line of text */
 }
 
 static void screen_styles(void) {
@@ -316,7 +317,12 @@ static void button_colours(void) {
     lv_style_set_border_color(&btn_active_style, TC(btn_active_border));
     lv_style_set_border_width(&btn_active_style, top_line ? 3 : LV_MAX(theme_shape.border, 2));
     lv_style_set_border_side(&btn_active_style, top_line ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
-    lv_style_set_border_side(&btn_style, theme_shape.deck ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
+    lv_style_set_border_side(&btn_style, theme_shape.kx3 == 3 ? LV_BORDER_SIDE_LEFT
+                                         : theme_shape.deck ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
+    if (theme_shape.kx3 == 3) {   /* Plus: a line between the buttons, the active one plain */
+        lv_style_set_border_side(&btn_active_style, LV_BORDER_SIDE_LEFT);
+        lv_style_set_border_width(&btn_active_style, 1);
+    }
     lv_style_set_text_color(&btn_active_style, TC(btn_active_text));
 
     /* disabled: the same solid button, text and border dimmed */

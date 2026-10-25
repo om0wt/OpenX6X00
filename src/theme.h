@@ -195,7 +195,8 @@ typedef struct {
     bool    deck;           /* Black Metal, Total Black: two rows of state on top, S/SWR/ALC scales beside a big
                              * frequency, the frequency edges in the spectrum, one-line flat buttons */
     uint8_t kx3;            /* KX3Lovers: the KX3-style display (lcd_panel.c) over the top, 1 with the spectrum and
-                             * the waterfall under it, 2 alone as in the KX3 manual (Strict) */
+                             * the waterfall under it, 2 alone as in the KX3 manual (Strict), 3 the layout of the X6100 KX3
+                             * screen its author agreed to, a spectrum strip, one-line buttons (Plus) */
     uint32_t waterfall[16];    /* palette stops from weak to strong signal */
     uint8_t  waterfall_n;       /* 0 = a built-in table (waterfall_table) */
     uint8_t  waterfall_table;   /* 0 gauss, 1 legacy */

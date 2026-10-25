@@ -13,6 +13,8 @@
 #include "lcd_panel.h"
 
 #include "cfg/cfg_api.h"
+#include "clock.h"
+#include "info_bar.h"
 #include "gui_styles.h"
 #include "radio.h"
 #include "radio_types.h"
@@ -25,9 +27,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define ART_W   1248
 #define ART_H   313
+
+/* Units to pixels: the manual's drawing scaled to 800 px; Plus is drawn in pixels */
+static int un = 800, ud = ART_W;
 
 static lv_obj_t      *panel;
 static lv_timer_t    *timer;
@@ -40,6 +46,8 @@ typedef struct {
     int8_t  mode, agc, bars, swr_bars, rf_bars;
     uint8_t flags;      /* tx, split, lock */
     uint16_t icons;
+    int16_t sdb, swr10, pwr10, volts10, minute;   /* Plus */
+    int32_t bw;
 } lcd_state_t;
 
 static lcd_state_t shown;
@@ -47,7 +55,7 @@ static lcd_state_t shown;
 enum { I_VOX, I_ATU, I_RIT, I_XIT, I_SPLT, I_ATT, I_PRE, I_NB, I_NR, I_NTCH };
 
 static lv_coord_t U(int v) {
-    return v * 800 / ART_W;
+    return v * un / ud;
 }
 
 static lv_color_t ink(bool lit) {
@@ -63,12 +71,12 @@ static int text(int x, int y, const char *s, bool lit, const lv_font_t *font) {
     dsc.font  = font;
     dsc.color = ink(lit);
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    if (!lit) return x + size.x * ART_W / 800;
+    if (!lit) return x + size.x * ud / un;
     lv_area_t a = {.x1 = ox + U(x), .y1 = oy + U(y) - size.y / 2};
     a.x2 = a.x1 + size.x;
     a.y2 = a.y1 + size.y;
     lv_draw_label(ctx, &dsc, &a, s, NULL);
-    return x + size.x * ART_W / 800;
+    return x + size.x * ud / un;
 }
 
 /* Centred on x */
@@ -76,7 +84,17 @@ static void text_c(int x, int y, const char *s, bool lit, const lv_font_t *font)
     lv_point_t size;
 
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    text(x - size.x * ART_W / 1600, y, s, lit, font);
+    text(x - size.x * ud / (2 * un), y, s, lit, font);
+}
+
+/* Ending at x */
+static int text_r(int x, int y, const char *s, bool lit, const lv_font_t *font) {
+    lv_point_t size;
+
+    lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    x -= size.x * ud / un;
+    text(x, y, s, lit, font);
+    return x;
 }
 
 static void rect(int x1, int y1, int x2, int y2, bool lit) {
@@ -152,7 +170,7 @@ static void lock_icon(int x, int y, bool lit) {
  * left, middle) in box, leaning right like a segment display */
 static void seg7(const lv_draw_rect_dsc_t *dsc, const lv_area_t *box, uint8_t lit) {
     lv_coord_t w = lv_area_get_width(box), h = lv_area_get_height(box);
-    lv_coord_t t = LV_MAX(w / 6, 3), g = 1;
+    lv_coord_t t = LV_MAX(w / 7, 3), g = 1;
     lv_coord_t xl = box->x1 + t / 2, xr = box->x2 - t / 2;
     lv_coord_t yt = box->y1 + t / 2, ym = (box->y1 + box->y2) / 2, yb = box->y2 - t / 2;
     /* horizontal: y, from x to x; vertical: x, from y to y */
@@ -248,10 +266,10 @@ static void freq_cells(int32_t f, char cells[9]) {
 }
 
 /* The places of a display: x1..x2, y1..y2 in units; only the lit segments, no outlines of the rest */
-static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fourteen) {
+static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fourteen, int dw_pct) {
     static const uint8_t seven[10] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
     lv_draw_rect_dsc_t   on;
-    int                  pitch = (x2 - x1) / 8, dw = pitch * (fourteen ? 3 : 4) / 5;   /* VFO B: apart */
+    int                  pitch = (x2 - x1) / 8, dw = pitch * dw_pct / 100;
 
     lv_draw_rect_dsc_init(&on);
     on.bg_color = ink(true);
@@ -408,6 +426,120 @@ static void mode_icons(const lcd_state_t *st) {
     text(x + 8, 258, "-", false, &sony_18);
 }
 
+/* Plus: the layout of the X6100 KX3 screen in the photo its author agreed to, on the amber glass, the
+ * volts after the time; in pixels. The spectrum strip is the spectrum itself (screen_main.c) */
+#define PLUS_S1     32
+#define PLUS_S9     204
+#define PLUS_S60    470
+
+static int plus_s_x(int db) {
+    if (db <= S1) return PLUS_S1;
+    if (db <= S9) return PLUS_S1 + (db - S1) * (PLUS_S9 - PLUS_S1) / (S9 - S1);
+    return LV_MIN(PLUS_S60, PLUS_S9 + (db - S9) * (PLUS_S60 - PLUS_S9) / 60);
+}
+
+/* A ruler from x1 to x2, its base at y: a tick every step px, the long ones at majors[] */
+static void ruler(int x1, int x2, int y, float step, const int *majors, int n) {
+    line(x1, y, x2, y, 2, true);
+    for (float x = x1; x <= x2 + 0.5f; x += step) line(x, y - 5, x, y, 1, true);
+    for (int i = 0; i < n; i++) line(majors[i], y - 11, majors[i], y, 2, true);
+}
+
+static void plus_scales(const lcd_state_t *st) {
+    static const int  s_major[] = {32, 74, 117, 161, 204, 292, 380, 470};
+    static const char *s_text[] = {"S1", "3", "5", "7", "9", "20", "40", "60"};
+    static const int  swr_major[] = {31, 108, 184}, rf_major[] = {227, 345, 463};
+    bool tx = st->flags & 1;
+
+    for (int i = 0; i < 8; i++) text_c(s_major[i] + (i ? 0 : 6), 17, s_text[i], true, &sony_20);
+    ruler(31, 470, 58, 8.6f, s_major, 8);
+    if (!tx && st->sdb > S1) rect(31, 46, plus_s_x(st->sdb), 54, true);
+
+    ruler(31, 185, 95, 7.7f, swr_major, 3);
+    ruler(227, 463, 95, 11.8f, rf_major, 3);
+    text(31, 110, "SWR", true, &sony_20);
+    text_c(108, 110, "2", true, &sony_20);
+    text_c(184, 110, "3", true, &sony_20);
+    text(228, 110, "RF", true, &sony_20);
+    text_c(345, 110, "5", true, &sony_20);
+    text_c(461, 110, "10", true, &sony_20);
+    if (tx) {
+        rect(31, 83, 31 + LV_CLAMP(0, (st->swr10 - 10) * 154 / 20, 154), 91, true);   /* 1.0 to 3.0 */
+        rect(227, 83, 227 + LV_CLAMP(0, st->pwr10 * 236 / 100, 236), 91, true);      /* 0 to 10 W */
+    }
+}
+
+static void plus_filter(const lcd_state_t *st) {
+    int lo = LV_MIN(abs(st->lo), abs(st->hi)), hi = LV_MAX(abs(st->lo), abs(st->hi));
+
+    for (int i = 0; i < 10; i++) {
+        int        x = 46 + i * 15, hz = (i * 2 + 1) * 4000 / 20;
+        lv_point_t p[4] = {{x + 8, 280}, {x + 19, 280}, {x + 11, 312}, {x, 312}};
+        poly(p, 4, hz >= lo && hz <= hi);
+    }
+    line(17, 332, 47, 321, 2, true);
+    line(47, 321, 183, 321, 2, true);
+    line(183, 321, 217, 332, 2, true);
+    tri(66, 328, 3, 0, true);
+    tri(172, 328, 3, 0, true);
+}
+
+static void plus_icons(const lcd_state_t *st) {
+    static const char agc[] = {'-', 'S', 'F', 'A'};   /* radio_agc_t order */
+    char s[8];
+
+    line(220, 283, 220, 309, 2, true);
+    snprintf(s, sizeof(s), "AGC-%c", agc[st->agc & 3]);
+    text(245, 300, s, st->agc != radio_agc_off, &sony_22);
+    text(328, 300, "PRE", st->icons & 1 << I_PRE, &sony_22);
+    text(380, 300, "ATT", st->icons & 1 << I_ATT, &sony_22);
+    line(228, 326, 296, 326, 2, true);
+    text(299, 326, "XFIL", true, &sony_20);
+    line(341, 326, 377, 326, 2, true);
+    line(228, 326, 228, 333, 2, true);
+    line(377, 326, 377, 333, 2, true);
+    text(232, 342, "FL1", true, &sony_16);
+
+    /* the VFOs, the mode */
+    bool b = param_i_get(cfg_band_current_vfo) == RADIO_VFO_B;
+    frame(546, 9, 590, 42, 4, true);
+    text_c(568, 25, b ? "B" : "A", true, &sony_24);
+    frame(730, 58, 774, 89, 4, true);
+    text_c(752, 73, b ? "A" : "B", true, &sony_24);
+    frame(546, 58, 629, 88, 4, st->flags & 2);
+    text_c(587, 73, "SPLT", st->flags & 2, &sony_22);
+    text_c(668, 73, "TX", st->flags & 1, &sony_22);
+    text_r(774, 27, info_params_mode_label_get(), true, &sony_36);
+}
+
+static void plus_info(const lcd_state_t *st) {
+    char s[32];
+    int  x;
+
+    snprintf(s, sizeof(s), "%d.%dW", st->pwr10 / 10, st->pwr10 % 10);
+    x = text(30, 427, s, true, &sony_24);
+    snprintf(s, sizeof(s), "IF %d.%dk", (int)(st->bw / 1000), (int)(st->bw / 100 % 10));
+    text(x + 22, 427, s, true, &sony_24);
+    /* the volts after the time, on the right */
+    snprintf(s, sizeof(s), "%d.%dV", st->volts10 / 10, st->volts10 % 10);
+    x = text_r(770, 427, s, true, &sony_24);
+    snprintf(s, sizeof(s), "%02d:%02dZ", st->minute / 60, st->minute % 60);
+    text_r(x - 22, 427, s, true, &sony_24);
+}
+
+static void draw_plus(void) {
+    char cells[9];
+
+    plus_scales(&shown);
+    freq_cells(shown.fa, cells);
+    digits(32, 720, 136, 258, cells, false, 80);
+    plus_filter(&shown);
+    plus_icons(&shown);
+    freq_cells(shown.fb, cells);
+    digits(430, 782, 285, 338, cells, true, 80);
+    plus_info(&shown);
+}
+
 static void draw_cb(lv_event_t *e) {
     lv_area_t a;
     char      cells[9];
@@ -415,14 +547,19 @@ static void draw_cb(lv_event_t *e) {
     ctx = lv_event_get_draw_ctx(e);
     lv_obj_get_coords(panel, &a);
     ox = a.x1;
+    if (theme_shape.kx3 == 3) {
+        oy = a.y1;
+        draw_plus();
+        return;
+    }
     oy = a.y1 + (lv_area_get_height(&a) - U(ART_H)) / 2;
     bar_graph(&shown);
     filter(&shown);
     freq_cells(shown.fa, cells);
-    digits(428, 1078, 37, 133, cells, false);
+    digits(428, 1078, 37, 133, cells, false, 80);
     icons(&shown);
     freq_cells(shown.fb, cells);
-    digits(685, 1078, 203, 275, cells, true);
+    digits(685, 1078, 203, 275, cells, true, 60);   /* VFO B: apart */
     vfo_icons(&shown);
     mode_icons(&shown);
 }
@@ -443,6 +580,22 @@ static void read_state(lcd_state_t *st) {
         tx_info_get(&pwr, &swr);
         st->swr_bars = LV_CLAMP(0, (int)((swr - 1.0f) * 3 + 0.5f), 7);   /* 1.0 to 3.0 on 7 bars */
         st->rf_bars  = LV_CLAMP(0, (int)(pwr * 11 / 10 + 0.5f), 11);     /* 0 to 10 W on 11 bars */
+    }
+    if (theme_shape.kx3 == 3) {
+        float    ext, bat;
+        uint8_t  cap;
+        bool     charge;
+        time_t   now = time(NULL);
+        struct tm t;
+
+        clock_power_get(&ext, &bat, &cap, &charge);
+        gmtime_r(&now, &t);
+        st->sdb     = (int16_t)meter_get_db();
+        st->swr10   = swr * 10 + 0.5f;
+        st->pwr10   = (tx ? pwr : param_f_get(cfg_pwr)) * 10 + 0.5f;
+        st->volts10 = (ext >= 3.0f ? ext : bat) * 10 + 0.5f;
+        st->minute  = t.tm_hour * 60 + t.tm_min;
+        st->bw      = cparam_i_get(cfg_cur_filter_bw);
     }
     st->flags = tx | (param_i_get(cfg_band_split) ? 2 : 0) | (main_screen_freq_locked() ? 4 : 0);
     st->icons = (param_i_get(cfg_vox_on) ? 1 << I_VOX : 0) | (param_i_get(cfg_atu_enabled) ? 1 << I_ATU : 0) |
@@ -470,6 +623,8 @@ static void delete_cb(lv_event_t *e) {
 }
 
 lv_obj_t *lcd_panel_init(lv_obj_t *parent, lv_coord_t height) {
+    un = theme_shape.kx3 == 3 ? 1 : 800;
+    ud = theme_shape.kx3 == 3 ? 1 : ART_W;
     panel = lv_obj_create(parent);
     lv_obj_remove_style_all(panel);
     lv_obj_set_pos(panel, 0, 0);
