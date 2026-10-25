@@ -52,6 +52,10 @@ void freq_scale_init(lv_obj_t *parent, lv_coord_t y) {
     }
 }
 
+void freq_scale_set_width(lv_coord_t w) {
+    lv_obj_set_x(edges[1], w - LABEL_W);
+}
+
 void freq_scale_foreground(void) {
     lv_obj_move_foreground(edges[0]);
     lv_obj_move_foreground(edges[1]);

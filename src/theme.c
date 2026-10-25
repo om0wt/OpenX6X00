@@ -22,11 +22,11 @@
 #define THEMES_DIR BOARD_DATA "/themes"
 #endif
 
-enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD, B_LCD_STRICT, B_LCD_PLUS, B_COUNT };
+enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_LCD_PLUS, B_COUNT };
 
 static const char *const builtin_names[B_COUNT] = {"RF.Guru", "Legacy", "Outdoor", "Classic", "Outdoor-Negative",
-                                                   "VISION", "Black Metal", "Total Black", "KX3Lovers",
-                                                   "KX3Lovers Strict", "KX3Lovers Plus"};
+                                                   "VISION", "Black Metal", "Total Black",
+                                                   "KX3Lovers Plus"};
 
 /* VISION: the default's colours made "warm anthracite": white digits on dark grey, orange for what is on,
  * aqua frames, the layout big (styles.c) */
@@ -195,7 +195,7 @@ static void theme_set(const theme_set_t *s, size_t n) {
 
 /* Outdoor-Negative: Outdoor with every colour and the waterfall through negative() */
 static void use_builtin(int b) {
-    int src = b == B_OUTDOOR_NEG || b >= B_LCD ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
+    int src = b == B_OUTDOOR_NEG || b == B_LCD_PLUS ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
 
     memcpy(colors, builtin_colors[src], sizeof(colors));
     theme_shape = builtin_shapes[src];
@@ -222,10 +222,9 @@ static void use_builtin(int b) {
                                       .waterfall = {0x000000, 0x000418, 0x00145e, 0x0a5ad2, 0x28c8f0, 0xc8f05a},
                                       .waterfall_n = 6};
     }
-    if (b >= B_LCD) {
+    if (b == B_LCD_PLUS) {
         theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
-        theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true,
-                                      .kx3 = b == B_LCD_STRICT ? 2 : b == B_LCD_PLUS ? 3 : 1,
+        theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true, .kx3 = true,
                                       .mono_cluster = true,
                                       /* the glass to the ink */
                                       .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
