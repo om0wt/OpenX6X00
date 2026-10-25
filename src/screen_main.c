@@ -65,6 +65,7 @@
 #include "wefax_window.h"
 #include "dialog_js8.h"
 #include "freq_strip.h"
+#include "lcd_panel.h"
 #include "freq_scale.h"
 #include "spot_marks.h"
 #include "band_plan.h"
@@ -1404,6 +1405,8 @@ static void build(void) {
     clock_init(obj);    /* deck: over the info rows */
     freq_strip_init(obj);
     meter = meter_init(obj);    /* deck: on the frequency panel */
+    /* KX3Lovers: the display over the top bars; Strict: over the spectrum and the waterfall too */
+    if (theme_shape.kx3) lcd_panel_init(obj, theme_shape.kx3 == 2 ? 480 - BUTTONS_H : LCD_PANEL_H);
     tx_info = tx_info_init(obj);
 
     /* Holo: an accent line between the top bar and the frequency strip */

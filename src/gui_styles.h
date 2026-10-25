@@ -37,6 +37,7 @@ extern int top_bar_h, freq_strip_h, clock_w, meter_row_h;
 
 #define FREQ_STRIP_Y        TOP_BAR_HEIGHT
 #define FREQ_STRIP_H        freq_strip_h
+#define LCD_PANEL_H         200             /* KX3Lovers: the display (lcd_panel.c) */
 #define METER_ROW_H         meter_row_h     /* VISION: the S-meter row under the strip; else 0 */
 #define VISION_POWER_W      190             /* VISION: the battery box at the right end of that row (clock.c) */
 

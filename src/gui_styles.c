@@ -86,6 +86,7 @@ static void bar_sizes(void) {
         freq_strip_h = 102;
         clock_w      = 280;
     }
+    if (theme_shape.kx3) freq_strip_h = LCD_PANEL_H - top_bar_h;   /* the spectrum under the display */
 }
 
 static void screen_styles(void) {
