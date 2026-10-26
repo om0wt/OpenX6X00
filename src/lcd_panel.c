@@ -311,7 +311,7 @@ static void freq_cells(int32_t f, char cells[9]) {
 }
 
 static const seg_style_t plus_a = {80, 5, 12, true, false}, plus_b = {80, 8, 12, true, false};
-static const seg_style_t plus_text = {80, 4, 12, true, false};   /* CW text: bold */
+static const seg_style_t plus_text = {80, 3, 12, true, false};   /* CW text: bold */
 
 /* A point t square at the bottom right of a place, leaning with it */
 static void point(lv_coord_t x, lv_coord_t y2, lv_coord_t t) {
@@ -458,28 +458,28 @@ static void icons(const lcd_state_t *st) {
 static void vfo_icons(const lcd_state_t *st) {
     bool split = st->flags & 2, b = param_i_get(cfg_band_current_vfo) == RADIO_VFO_B;
 
-    lock_icon(1115, 75, st->flags & 4);
-    frame(1100, 100, 1130, 130, 15, true);
-    text_c(1115, 115, b ? "B" : "A", true, &sony_18);
-    tri(1115, 146, 8, 0, !split);
-    text_c(1115, 168, "TX", true, &sony_20);
-    tri(1115, 190, 8, 1, split);
-    frame(1100, 208, 1130, 238, 15, true);
-    text_c(1115, 223, b ? "A" : "B", true, &sony_18);
+    lock_icon(1140, 75, st->flags & 4);
+    frame(1125, 100, 1155, 130, 15, true);
+    text_c(1140, 115, b ? "B" : "A", true, &sony_18);
+    tri(1140, 146, 8, 0, !split);
+    text_c(1140, 168, "TX", true, &sony_20);
+    tri(1140, 190, 8, 1, split);
+    frame(1125, 208, 1155, 238, 15, true);
+    text_c(1140, 223, b ? "A" : "B", true, &sony_18);
 }
 
 static void mode_icons(const lcd_state_t *st) {
     int8_t m = st->mode;
     int    x;
 
-    text(1148, 47, "LSB", m == radio_mode_lsb || m == radio_mode_lsb_dig, &sony_20);
-    text(1148, 77, "USB", m == radio_mode_usb || m == radio_mode_usb_dig, &sony_20);
-    text(1148, 107, "CW", m == radio_mode_cw || m == radio_mode_cwr, &sony_20);
-    text(1148, 138, "REV", m == radio_mode_cwr, &sony_20);
-    text(1148, 168, "DATA", m == radio_mode_lsb_dig || m == radio_mode_usb_dig, &sony_20);
-    x = text(1148, 198, "AM", m == radio_mode_am || m == radio_mode_sam, &sony_20);
+    text(1176, 47, "LSB", m == radio_mode_lsb || m == radio_mode_lsb_dig, &sony_20);
+    text(1176, 77, "USB", m == radio_mode_usb || m == radio_mode_usb_dig, &sony_20);
+    text(1176, 107, "CW", m == radio_mode_cw || m == radio_mode_cwr, &sony_20);
+    text(1176, 138, "REV", m == radio_mode_cwr, &sony_20);
+    text(1176, 168, "DATA", m == radio_mode_lsb_dig || m == radio_mode_usb_dig, &sony_20);
+    x = text(1176, 198, "AM", m == radio_mode_am || m == radio_mode_sam, &sony_20);
     text(x, 198, "-S", m == radio_mode_sam, &sony_20);
-    text(1148, 228, "FM", m == radio_mode_nfm || m == radio_mode_wfm, &sony_20);
+    text(1176, 228, "FM", m == radio_mode_nfm || m == radio_mode_wfm, &sony_20);
 }
 
 static void plus_info(const lcd_state_t *st) {
@@ -498,12 +498,12 @@ static void plus_info(const lcd_state_t *st) {
 }
 
 /* CW: the strip's right half, the newest text in fourteen segments, ending at the right */
-#define CW_CELLS    16
+#define CW_CELLS    12
 
 static void plus_cw(const lcd_state_t *st) {
     char       t[sizeof(cw_line)];
     const int  x1 = LCD_PLUS_STRIP_W / 2 + 8, x2 = 792, pitch = (x2 - x1) / CW_CELLS;
-    const int  y1 = LCD_PLUS_STRIP_Y + (LCD_PLUS_STRIP_H - 44) / 2, y2 = y1 + 44;   /* as VFO B's places */
+    const int  y1 = LCD_PLUS_STRIP_Y + (LCD_PLUS_STRIP_H - 60) / 2, y2 = y1 + 60;
 
     if (!st->cw) return;
     pthread_mutex_lock(&cw_mux);
@@ -522,7 +522,7 @@ static void plus_cw(const lcd_state_t *st) {
         char      ch  = i < first ? ' ' : s[i - first];
 
         seg14(&box, seg14_of(ch));
-        if (ch == '.' || ch == ',') point(box.x2 - 3, box.y2, 4);
+        if (ch == '.' || ch == ',') point(box.x2 - 4, box.y2, 7);
     }
 }
 
@@ -531,10 +531,11 @@ static void draw_plus(void) {
 
     kx = KX_X;
     ky = KX_Y;
+    oy += LCD_PLUS_LCD_Y;   /* the display down, near the spectrum */
     bar_graph(&shown);
     filter(&shown);
     freq_cells(shown.fa, cells);
-    digits(428, 1078, 37, 133, cells, false, &plus_a);
+    digits(418, 1110, 42, 150, cells, false, &plus_a);   /* a little bigger than the KX3's 428..1078 x 37..133 */
     icons(&shown);
     freq_cells(shown.fb, cells);
     digits(685, 1078, 203, 275, cells, true, &plus_b);
@@ -542,6 +543,7 @@ static void draw_plus(void) {
     mode_icons(&shown);
 
     kx = ky = 1;
+    oy -= LCD_PLUS_LCD_Y;
     plus_info(&shown);
     plus_cw(&shown);
 }
