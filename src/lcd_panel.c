@@ -311,7 +311,9 @@ static void freq_cells(int32_t f, char cells[9]) {
 }
 
 static const seg_style_t plus_a = {80, 5, 12, true, false}, plus_b = {80, 8, 12, true, false};
-static const seg_style_t plus_text = {80, 3, 12, true, false};   /* CW text: bold */
+/* CW text: strokes a fifth of the width, a slight lean, no outlines (thicker, leaning and outlined it
+ * could not be read) */
+static const seg_style_t plus_text = {80, 5, 6, false, false};
 
 /* A point t square at the bottom right of a place, leaning with it */
 static void point(lv_coord_t x, lv_coord_t y2, lv_coord_t t) {
@@ -503,7 +505,7 @@ static void plus_info(const lcd_state_t *st) {
 static void plus_cw(const lcd_state_t *st) {
     char       t[sizeof(cw_line)];
     const int  x1 = LCD_PLUS_STRIP_W / 2 + 8, x2 = 792, pitch = (x2 - x1) / CW_CELLS;
-    const int  y1 = LCD_PLUS_STRIP_Y + (LCD_PLUS_STRIP_H - 60) / 2, y2 = y1 + 60;
+    const int  y1 = LCD_PLUS_STRIP_Y + (LCD_PLUS_STRIP_H - 56) / 2, y2 = y1 + 56;
 
     if (!st->cw) return;
     pthread_mutex_lock(&cw_mux);
@@ -518,7 +520,7 @@ static void plus_cw(const lcd_state_t *st) {
     style   = &plus_text;
     lean_y2 = oy + y2;
     for (int i = 0; i < CW_CELLS; i++) {
-        lv_area_t box = {ox + x1 + i * pitch, oy + y1, ox + x1 + i * pitch + pitch * 3 / 4, oy + y2};
+        lv_area_t box = {ox + x1 + i * pitch, oy + y1, ox + x1 + i * pitch + pitch * 13 / 16, oy + y2};
         char      ch  = i < first ? ' ' : s[i - first];
 
         seg14(&box, seg14_of(ch));
