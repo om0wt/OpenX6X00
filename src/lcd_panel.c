@@ -1,11 +1,13 @@
 /*
  *  SPDX-License-Identifier: LGPL-2.1-or-later
  *
- *  KX3Lovers Plus: the radio's state on a KX3-style segment display, laid out as the X6100 KX3 screen
- *  whose author agreed to it, on amber glass: the S, SWR and RF scales on top, VFO A in seven
- *  segments, the filter graphic and VFO B in fourteen segments under it, a spectrum strip (the
- *  spectrum itself, screen_main.c), power, IF, then the time and the voltage on the right. The unlit
- *  segments show as a faint outline. In pixels.
+ *  KX3Lovers Plus: the radio's state on amber glass, laid out as the LCD drawn in Elecraft's KX3
+ *  owner's manual (Rev C5, page 8): the bar graph with its scales, CWT and the filter graphic on the
+ *  left, VFO A in seven segments, the icons and VFO B in fourteen segments under it, the VFO and mode
+ *  icons on the right; what is lit shows, the unlit digit segments as a faint outline. The manual's
+ *  drawing (1248 x 313 units) is stretched a little to fill the top of the screen. Under it, what the
+ *  KX3 has not: a spectrum strip (the spectrum itself, screen_main.c; in CW the decoded text beside
+ *  it), power, IF, the time and the voltage.
  *
  *  Copyright (c) 2026 Pavol Calfa OM0WT
  */
@@ -48,8 +50,8 @@ static lv_draw_ctx_t *ctx;
 /* What is on the glass: drawn again only when it changes */
 typedef struct {
     int32_t fa, fb, lo, hi;
-    int8_t  mode, agc;
-    uint8_t flags;      /* tx, split */
+    int8_t  mode, agc, bars, swr_bars, rf_bars;
+    uint8_t flags;      /* tx, split, lock */
     uint16_t icons;
     int16_t sdb, swr10, pwr10, volts10, minute;
     uint16_t cw_seq;
@@ -61,10 +63,21 @@ typedef struct {
 
 static lcd_state_t shown;
 
-enum { I_ATT, I_PRE };
+enum { I_VOX, I_ATU, I_RIT, I_XIT, I_SPLT, I_ATT, I_PRE, I_NB, I_NR, I_NTCH };
 
-static lv_coord_t U(int v) {   /* the places are in pixels */
-    return v;
+/* Units to pixels: the manual's drawing for the KX3 part, 1:1 for what is under it */
+#define ART_W   1248
+#define ART_H   313
+#define KX_X    (800.0f / ART_W)
+#define KX_Y    ((float)LCD_PLUS_LCD_H / ART_H)
+static float kx = 1, ky = 1;
+
+static lv_coord_t UX(float v) {
+    return lroundf(v * kx);
+}
+
+static lv_coord_t UY(float v) {
+    return lroundf(v * ky);
 }
 
 static lv_color_t ink(bool lit) {
@@ -80,12 +93,12 @@ static int text(int x, int y, const char *s, bool lit, const lv_font_t *font) {
     dsc.font  = font;
     dsc.color = ink(lit);
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    if (!lit) return x + size.x;
-    lv_area_t a = {.x1 = ox + U(x), .y1 = oy + U(y) - size.y / 2};
+    if (!lit) return x + lroundf(size.x / kx);
+    lv_area_t a = {.x1 = ox + UX(x), .y1 = oy + UY(y) - size.y / 2};
     a.x2 = a.x1 + size.x;
     a.y2 = a.y1 + size.y;
     lv_draw_label(ctx, &dsc, &a, s, NULL);
-    return x + size.x;
+    return x + lroundf(size.x / kx);
 }
 
 /* Centred on x */
@@ -93,7 +106,7 @@ static void text_c(int x, int y, const char *s, bool lit, const lv_font_t *font)
     lv_point_t size;
 
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    text(x - size.x / 2, y, s, lit, font);
+    text(x - lroundf(size.x / (2 * kx)), y, s, lit, font);
 }
 
 /* Ending at x */
@@ -101,7 +114,7 @@ static int text_r(int x, int y, const char *s, bool lit, const lv_font_t *font) 
     lv_point_t size;
 
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    x -= size.x;
+    x -= lroundf(size.x / kx);
     text(x, y, s, lit, font);
     return x;
 }
@@ -112,7 +125,7 @@ static void rect(int x1, int y1, int x2, int y2, bool lit) {
     if (!lit) return;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_color = ink(lit);
-    lv_area_t a = {ox + U(x1), oy + U(y1), ox + U(x2), oy + U(y2)};
+    lv_area_t a = {ox + UX(x1), oy + UY(y1), ox + UX(x2), oy + UY(y2)};
     lv_draw_rect(ctx, &dsc, &a);
 }
 
@@ -123,7 +136,7 @@ static void line(int x1, int y1, int x2, int y2, int w, bool lit) {
     lv_draw_line_dsc_init(&dsc);
     dsc.color = ink(lit);
     dsc.width = w;
-    lv_point_t p1 = {ox + U(x1), oy + U(y1)}, p2 = {ox + U(x2), oy + U(y2)};
+    lv_point_t p1 = {ox + UX(x1), oy + UY(y1)}, p2 = {ox + UX(x2), oy + UY(y2)};
     lv_draw_line(ctx, &dsc, &p1, &p2);
 }
 
@@ -134,7 +147,7 @@ static void poly(const lv_point_t *u, int n, bool lit) {
     if (!lit) return;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_color = ink(lit);
-    for (int i = 0; i < n; i++) p[i] = (lv_point_t){ox + U(u[i].x), oy + U(u[i].y)};
+    for (int i = 0; i < n; i++) p[i] = (lv_point_t){ox + UX(u[i].x), oy + UY(u[i].y)};
     lv_draw_polygon(ctx, &dsc, p, n);
 }
 
@@ -160,9 +173,19 @@ static void frame(int x1, int y1, int x2, int y2, int r, bool lit) {
     dsc.bg_opa       = LV_OPA_TRANSP;
     dsc.border_color = ink(lit);
     dsc.border_width = 2;
-    dsc.radius       = U(r);
-    lv_area_t a = {ox + U(x1), oy + U(y1), ox + U(x2), oy + U(y2)};
+    dsc.radius       = UX(r);
+    lv_area_t a = {ox + UX(x1), oy + UY(y1), ox + UX(x2), oy + UY(y2)};
     lv_draw_rect(ctx, &dsc, &a);
+}
+
+static void boxed(int x1, int x2, int y, const char *s, bool lit) {
+    frame(x1, y - 16, x2, y + 16, 8, lit);
+    text_c((x1 + x2) / 2, y, s, lit, &sony_18);
+}
+
+static void lock_icon(int x, int y, bool lit) {
+    frame(x - 9, y - 16, x + 9, y + 2, 9, lit);
+    rect(x - 14, y - 4, x + 14, y + 16, lit);
 }
 
 /* How a display's places are drawn */
@@ -307,9 +330,9 @@ static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fou
     int                  pitch = (x2 - x1) / 8, dw = pitch * st->dw_pct / 100;
 
     style   = st;
-    lean_y2 = oy + U(y2);
+    lean_y2 = oy + UY(y2);
     for (int i = 0; i < 8; i++) {
-        lv_area_t box = {ox + U(x1 + i * pitch), oy + U(y1), ox + U(x1 + i * pitch + dw), oy + U(y2)};
+        lv_area_t box = {ox + UX(x1 + i * pitch), oy + UY(y1), ox + UX(x1 + i * pitch + dw), oy + UY(y2)};
         char      ch  = cells[i];
 
         if (fourteen)
@@ -317,108 +340,146 @@ static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fou
         else
             seg7(&box, ch >= '0' && ch <= '9' ? seven[ch - '0'] : 0);
         if ((st->one_point ? i == 5 : i == 2 || i == 5) && ch != ' ') {   /* the decimal point; MHz and kHz */
-            lv_coord_t t = LV_MAX(U(dw) / st->thick, fourteen ? 2 : 3);
-            point(ox + U(x1 + i * pitch + dw + (pitch - dw) / 2) - t / 2, oy + U(y2), t);
+            lv_coord_t t = LV_MAX(UX(dw) / st->thick, fourteen ? 2 : 3);
+            point(ox + UX(x1 + i * pitch + dw + (pitch - dw) / 2) - t / 2, oy + UY(y2), t);
         }
     }
 }
 
-/* Plus: the layout of the X6100 KX3 screen in the photo its author agreed to, on the amber glass, the
- * volts after the time; in pixels. The spectrum strip is the spectrum itself (screen_main.c) */
-#define PLUS_S1     32
-#define PLUS_S9     204
-#define PLUS_S60    470
+/* The bar graph: 20 bars, S1..S9 on the first 9, +20..+60 on the other 11; in TX SWR on the first 7,
+ * RF on the last 11. CWT (the KX3's CW tuning aid, on with the tuning setting in CW): the S-meter
+ * keeps the first 9, the other 11 show the tone's offset from the pitch, zero beat in their middle
+ * under the mark, a bar 10 Hz (as cw_tune_view: a lower tone to the right) */
+#define BARS        20
+#define BAR_X(i)    (51 + (i) * 17)
+#define CWT_MID     14
 
-static int plus_s_x(int db) {
-    if (db <= S1) return PLUS_S1;
-    if (db <= S9) return PLUS_S1 + (db - S1) * (PLUS_S9 - PLUS_S1) / (S9 - S1);
-    return LV_MIN(PLUS_S60, PLUS_S9 + (db - S9) * (PLUS_S60 - PLUS_S9) / 60);
+static int s_bars(float db) {
+    int n = db < S1 ? 0 : db <= S9 ? 1 + (int)((db - S1) / 6) : 9 + (int)((db - S9) * 11 / 60 + 0.5f);
+    return LV_CLAMP(0, n, BARS);
 }
 
-/* A ruler from x1 to x2, its base at y: a tick every step px, the long ones at majors[] */
-static void ruler(int x1, int x2, int y, float step, const int *majors, int n) {
-    line(x1, y, x2, y, 2, true);
-    for (float x = x1; x <= x2 + 0.5f; x += step) line(x, y - 5, x, y, 1, true);
-    for (int i = 0; i < n; i++) line(majors[i], y - 11, majors[i], y, 2, true);
-}
+static void bar_graph(const lcd_state_t *st) {
+    static const struct { int bar; const char *s; } top[] = {
+        {0, "S1"}, {2, "3"}, {4, "5"}, {6, "7"}, {8, "9"}, {12, "+20"}, {15, "40"}, {19, "60"}};
+    bool tx = st->flags & 1, cwt = st->cwt && !tx;
+    int  tune = CWT_MID - LV_CLAMP(-5, (st->cwt_hz + (st->cwt_hz < 0 ? -5 : 5)) / 10, 5);
 
-static void plus_scales(const lcd_state_t *st) {
-    static const int  s_major[] = {32, 74, 117, 161, 204, 292, 380, 470};
-    static const char *s_text[] = {"S1", "3", "5", "7", "9", "20", "40", "60"};
-    static const int  swr_major[] = {31, 108, 184}, rf_major[] = {227, 345, 463};
-    bool tx = st->flags & 1;
+    for (size_t i = 0; i < sizeof(top) / sizeof(top[0]); i++)
+        text_c(BAR_X(top[i].bar) + 5, 73, top[i].s, true, &sony_18);
+    text_c(283, 46, "CWT", cwt, &sony_18);
+    tri(BAR_X(CWT_MID) + 5, 90, 7, 1, cwt);
+    line(51, 98, BAR_X(BARS - 1) + 11, 98, 2, true);
+    for (int i = 0; i < BARS; i++) {
+        bool lit;
 
-    for (int i = 0; i < 8; i++) text_c(s_major[i] + (i ? 0 : 6), 17, s_text[i], true, &sony_20);
-    ruler(31, 470, 58, 8.6f, s_major, 8);
-    if (!tx && st->sdb > S1) rect(31, 46, st->cwt ? LV_MIN(plus_s_x(st->sdb), PLUS_S9) : plus_s_x(st->sdb), 54, true);
-    if (st->cwt && !tx) {
-        /* CWT (the KX3's tuning aid): the S-meter's right half, zero beat in its middle under the
-         * mark, the tone's offset as a block (as cw_tune_view: a lower tone to the right), +-50 Hz to
-         * the ends, wider within 10 Hz */
-        const int mid = (PLUS_S9 + PLUS_S60) / 2, half = (PLUS_S60 - PLUS_S9) / 2 - 6;
-
-        tri(mid, 34, 5, 1, true);
-        if (st->cwt_on) {
-            int x = mid - LV_CLAMP(-50, st->cwt_hz, 50) * half / 50, w = LV_ABS(st->cwt_hz) <= 10 ? 9 : 4;
-            rect(x - w, 44, x + w, 56, true);
-        }
+        line(BAR_X(i) + 5, 92, BAR_X(i) + 5, 98, 2, true);
+        if (tx)
+            lit = i < 7 ? i < st->swr_bars : i >= 9 && i - 9 < st->rf_bars;
+        else if (cwt && i >= 9)
+            lit = st->cwt_on && (i == tune || (LV_ABS(st->cwt_hz) <= 10 && LV_ABS(i - CWT_MID) <= 1));
+        else
+            lit = i < (cwt ? LV_MIN(st->bars, 9) : st->bars);
+        rect(BAR_X(i), 108, BAR_X(i) + 11, 137, lit);
     }
-
-    ruler(31, 185, 95, 7.7f, swr_major, 3);
-    ruler(227, 463, 95, 11.8f, rf_major, 3);
-    text(31, 110, "SWR", true, &sony_20);
-    text_c(108, 110, "2", true, &sony_20);
-    text_c(184, 110, "3", true, &sony_20);
-    text(228, 110, "RF", true, &sony_20);
-    text_c(345, 110, "5", true, &sony_20);
-    text_c(461, 110, "10", true, &sony_20);
-    if (tx) {
-        rect(31, 83, 31 + LV_CLAMP(0, (st->swr10 - 10) * 154 / 20, 154), 91, true);   /* 1.0 to 3.0 */
-        rect(227, 83, 227 + LV_CLAMP(0, st->pwr10 * 236 / 100, 236), 91, true);      /* 0 to 10 W */
-    }
+    /* the TX scales: SWR and CMP under the first 7 bars, RF (the X6100's 0..10 W) and ALC under the last 11 */
+    line(51, 150, BAR_X(6) + 11, 150, 2, true);
+    line(BAR_X(9), 150, BAR_X(19) + 11, 150, 2, true);
+    for (int i = 0; i < BARS; i++)
+        if (i < 7 || i >= 9) line(BAR_X(i) + 5, 150, BAR_X(i) + 5, 156, 2, true);
+    text(33, 176, "SWR", true, &sony_18);
+    text_c(BAR_X(3) + 5, 176, "2", true, &sony_18);
+    text_c(BAR_X(6) + 5, 176, "3", true, &sony_18);
+    text(33, 202, "CMP", true, &sony_18);
+    text_c(BAR_X(3) + 5, 202, "10", true, &sony_18);
+    text_c(BAR_X(6) + 5, 202, "20", true, &sony_18);
+    text(BAR_X(9) - 8, 176, "RF", true, &sony_18);
+    text_c(BAR_X(14) + 5, 176, "5", true, &sony_18);
+    text_c(BAR_X(19) + 5, 176, "10", true, &sony_18);
+    text_c(BAR_X(12) + 5, 202, "ALC", true, &sony_18);
+    line(BAR_X(9), 192, BAR_X(9), 204, 2, true);
+    line(BAR_X(9), 204, BAR_X(10), 204, 2, true);
+    line(BAR_X(14) + 11, 204, BAR_X(15), 204, 2, true);
+    line(BAR_X(15), 192, BAR_X(15), 204, 2, true);
 }
 
-static void plus_filter(const lcd_state_t *st) {
-    int lo = LV_MIN(abs(st->lo), abs(st->hi)), hi = LV_MAX(abs(st->lo), abs(st->hi));
+/* The filter graphic: 12 slanted stripes over 0..4 kHz of audio, the passband's lit; NTCH and the
+ * arrows with the X6100's notch (DNF, set by hand) */
+static void filter(const lcd_state_t *st) {
+    int  lo = LV_MIN(abs(st->lo), abs(st->hi)), hi = LV_MAX(abs(st->lo), abs(st->hi));
+    bool ntch = st->icons & 1 << I_NTCH;
 
-    for (int i = 0; i < 10; i++) {
-        int        x = 46 + i * 15, hz = (i * 2 + 1) * 4000 / 20;
-        lv_point_t p[4] = {{x + 8, 280}, {x + 19, 280}, {x + 11, 312}, {x, 312}};
+    text(33, 236, "NTCH", ntch, &sony_18);
+    tri(52, 266, 7, 2, ntch);
+    tri(68, 266, 7, 3, ntch);
+    for (int i = 0; i < 12; i++) {
+        int        x = 117 + i * 18, hz = (i * 2 + 1) * 4000 / 24;
+        lv_point_t p[4] = {{x + 6, 218}, {x + 18, 218}, {x + 12, 258}, {x, 258}};
         poly(p, 4, hz >= lo && hz <= hi);
     }
-    line(17, 332, 47, 321, 2, true);
-    line(47, 321, 183, 321, 2, true);
-    line(183, 321, 217, 332, 2, true);
-    tri(66, 328, 3, 0, true);
-    tri(172, 328, 3, 0, true);
+    line(113, 264, 330, 264, 3, true);
+    line(93, 282, 113, 264, 3, true);
+    line(330, 264, 348, 282, 3, true);
+    tri(155, 274, 5, 0, true);
+    tri(286, 274, 5, 0, true);
 }
 
-static void plus_icons(const lcd_state_t *st) {
-    static const char agc[] = {'-', 'S', 'F', 'A'};   /* radio_agc_t order */
-    char s[8];
+static void icons(const lcd_state_t *st) {
+    bool on[16];
+    int  x;
 
-    line(220, 283, 220, 309, 2, true);
-    snprintf(s, sizeof(s), "AGC-%c", agc[st->agc & 3]);
-    text(245, 300, s, st->agc != radio_agc_off, &sony_22);
-    text(328, 300, "PRE", st->icons & 1 << I_PRE, &sony_22);
-    text(380, 300, "ATT", st->icons & 1 << I_ATT, &sony_22);
-    line(228, 326, 296, 326, 2, true);
-    text(299, 326, "XFIL", true, &sony_20);
-    line(341, 326, 377, 326, 2, true);
-    line(228, 326, 228, 333, 2, true);
-    line(377, 326, 377, 333, 2, true);
-    text(232, 338, "FL1", true, &sony_16);
+    for (int i = 0; i < 16; i++) on[i] = st->icons & 1 << i;
+    text(403, 168, "VOX", on[I_VOX], &sony_20);
+    text(683, 168, "ATU", on[I_ATU], &sony_20);
+    boxed(758, 818, 168, "RIT", on[I_RIT]);
+    boxed(836, 896, 168, "XIT", on[I_XIT]);
+    boxed(1001, 1081, 168, "SPLT", on[I_SPLT]);
 
-    /* the VFOs, the mode */
-    bool b = param_i_get(cfg_band_current_vfo) == RADIO_VFO_B;
-    frame(546, 9, 590, 42, 4, true);
-    text_c(568, 25, b ? "B" : "A", true, &sony_24);
-    frame(730, 58, 774, 89, 4, true);
-    text_c(752, 73, b ? "A" : "B", true, &sony_24);
-    frame(546, 58, 629, 88, 4, st->flags & 2);
-    text_c(587, 73, "SPLT", st->flags & 2, &sony_22);
-    text_c(668, 73, "TX", st->flags & 1, &sony_22);
-    text_r(774, 27, info_params_mode_label_get(), true, &sony_36);
+    /* AGC-S slow, AGC-F fast, AGC alone auto */
+    x = text(403, 200, "AGC", st->agc != radio_agc_off, &sony_20);
+    x = text(x, 200, "-", st->agc == radio_agc_slow || st->agc == radio_agc_fast, &sony_20);
+    x = text(x, 200, "S", st->agc == radio_agc_slow, &sony_20);
+    text(x, 200, "F", st->agc == radio_agc_fast, &sony_20);
+    text(538, 200, "ATT", on[I_ATT], &sony_20);
+    text(608, 200, "PRE", on[I_PRE], &sony_20);
+
+    text(403, 237, "NB", on[I_NB], &sony_20);
+    text(403, 268, "NR", on[I_NR], &sony_20);
+    /* XFIL FL1: the one filter of the X6100, always */
+    line(461, 237, 525, 237, 2, true);
+    line(600, 237, 663, 237, 2, true);
+    line(461, 237, 461, 249, 2, true);
+    line(663, 237, 663, 249, 2, true);
+    text_c(562, 237, "XFIL", true, &sony_18);
+    text(463, 268, "FL1", true, &sony_16);
+}
+
+/* The current VFO on the big display, the other on the small one; the TX arrow to the one that sends */
+static void vfo_icons(const lcd_state_t *st) {
+    bool split = st->flags & 2, b = param_i_get(cfg_band_current_vfo) == RADIO_VFO_B;
+
+    lock_icon(1115, 75, st->flags & 4);
+    frame(1100, 100, 1130, 130, 15, true);
+    text_c(1115, 115, b ? "B" : "A", true, &sony_18);
+    tri(1115, 146, 8, 0, !split);
+    text_c(1115, 168, "TX", true, &sony_20);
+    tri(1115, 190, 8, 1, split);
+    frame(1100, 208, 1130, 238, 15, true);
+    text_c(1115, 223, b ? "A" : "B", true, &sony_18);
+}
+
+static void mode_icons(const lcd_state_t *st) {
+    int8_t m = st->mode;
+    int    x;
+
+    text(1148, 47, "LSB", m == radio_mode_lsb || m == radio_mode_lsb_dig, &sony_20);
+    text(1148, 77, "USB", m == radio_mode_usb || m == radio_mode_usb_dig, &sony_20);
+    text(1148, 107, "CW", m == radio_mode_cw || m == radio_mode_cwr, &sony_20);
+    text(1148, 138, "REV", m == radio_mode_cwr, &sony_20);
+    text(1148, 168, "DATA", m == radio_mode_lsb_dig || m == radio_mode_usb_dig, &sony_20);
+    x = text(1148, 198, "AM", m == radio_mode_am || m == radio_mode_sam, &sony_20);
+    text(x, 198, "-S", m == radio_mode_sam, &sony_20);
+    text(1148, 228, "FM", m == radio_mode_nfm || m == radio_mode_wfm, &sony_20);
 }
 
 static void plus_info(const lcd_state_t *st) {
@@ -442,7 +503,7 @@ static void plus_info(const lcd_state_t *st) {
 static void plus_cw(const lcd_state_t *st) {
     char       t[sizeof(cw_line)];
     const int  x1 = LCD_PLUS_STRIP_W / 2 + 8, x2 = 792, pitch = (x2 - x1) / CW_CELLS;
-    const int  y1 = LCD_PLUS_STRIP_Y + 13, y2 = LCD_PLUS_STRIP_Y + LCD_PLUS_STRIP_H - 13;
+    const int  y1 = LCD_PLUS_STRIP_Y + (LCD_PLUS_STRIP_H - 44) / 2, y2 = y1 + 44;   /* as VFO B's places */
 
     if (!st->cw) return;
     pthread_mutex_lock(&cw_mux);
@@ -468,13 +529,19 @@ static void plus_cw(const lcd_state_t *st) {
 static void draw_plus(void) {
     char cells[9];
 
-    plus_scales(&shown);
+    kx = KX_X;
+    ky = KX_Y;
+    bar_graph(&shown);
+    filter(&shown);
     freq_cells(shown.fa, cells);
-    digits(32, 720, 136, 258, cells, false, &plus_a);
-    plus_filter(&shown);
-    plus_icons(&shown);
+    digits(428, 1078, 37, 133, cells, false, &plus_a);
+    icons(&shown);
     freq_cells(shown.fb, cells);
-    digits(430, 782, 285, 338, cells, true, &plus_b);
+    digits(685, 1078, 203, 275, cells, true, &plus_b);
+    vfo_icons(&shown);
+    mode_icons(&shown);
+
+    kx = ky = 1;
     plus_info(&shown);
     plus_cw(&shown);
 }
@@ -500,6 +567,7 @@ static void read_state(lcd_state_t *st) {
     st->hi   = cparam_i_get(cfg_cur_filter_high);
     st->mode = cparam_i_get(cfg_cur_mode);
     st->agc  = cparam_i_get(cfg_cur_agc);
+    st->bars = s_bars(meter_get_db());
 
     float    ext, bat;
     uint8_t  cap;
@@ -507,7 +575,11 @@ static void read_state(lcd_state_t *st) {
     time_t   now = time(NULL);
     struct tm t;
 
-    if (tx) tx_info_get(&pwr, &swr);
+    if (tx) {
+        tx_info_get(&pwr, &swr);
+        st->swr_bars = LV_CLAMP(0, (int)((swr - 1.0f) * 3 + 0.5f), 7);   /* 1.0 to 3.0 on 7 bars */
+        st->rf_bars  = LV_CLAMP(0, (int)(pwr * 11 / 10 + 0.5f), 11);     /* 0 to 10 W on 11 bars */
+    }
     clock_power_get(&ext, &bat, &cap, &charge);
     gmtime_r(&now, &t);
     st->sdb     = (int16_t)meter_get_db();
@@ -525,8 +597,12 @@ static void read_state(lcd_state_t *st) {
     st->cwt    = param_i_get(cfg_cw_tune) && (st->mode == radio_mode_cw || st->mode == radio_mode_cwr);
     st->cwt_on = st->cwt && cw_tune_recent(&hz);
     st->cwt_hz = st->cwt_on ? LV_CLAMP(-99, hz, 99) : 0;
-    st->flags = tx | (param_i_get(cfg_band_split) ? 2 : 0);
-    st->icons = (cparam_i_get(cfg_cur_att) ? 1 << I_ATT : 0) | (cparam_i_get(cfg_cur_pre) ? 1 << I_PRE : 0);
+    st->flags = tx | (param_i_get(cfg_band_split) ? 2 : 0) | (main_screen_freq_locked() ? 4 : 0);
+    st->icons = (param_i_get(cfg_vox_on) ? 1 << I_VOX : 0) | (param_i_get(cfg_atu_enabled) ? 1 << I_ATU : 0) |
+                (param_i_get(cfg_rit) ? 1 << I_RIT : 0) | (param_i_get(cfg_xit) ? 1 << I_XIT : 0) |
+                (param_i_get(cfg_band_split) ? 1 << I_SPLT : 0) | (cparam_i_get(cfg_cur_att) ? 1 << I_ATT : 0) |
+                (cparam_i_get(cfg_cur_pre) ? 1 << I_PRE : 0) | (param_i_get(cfg_nb) ? 1 << I_NB : 0) |
+                (param_i_get(cfg_nr) ? 1 << I_NR : 0) | (param_i_get(cfg_dnf) ? 1 << I_NTCH : 0);
 }
 
 /* ponytail: polled 10 times a second and drawn again on a change, subscriptions when it matters */

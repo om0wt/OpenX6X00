@@ -6,10 +6,11 @@ shapes, the font and the waterfall palette.
 
 Built in: **RF.Guru** (default: near-black surfaces, gold for what is on, electric blue as the second accent), **Classic** (black, grey keys, IC-7300 style)
 **Outdoor** (light, for the sun), **Outdoor-Negative** (Outdoor with the
-lightness inverted: dark, the hues kept), **KX3Lovers Plus** (the KX3-style X6100 screen whose author agreed
-to it, on the amber glass: scales on top, a big leaning VFO A, VFO B in fourteen segments, the unlit segments as a
-faint outline, a spectrum strip (in CW the left half, the decoded text in fourteen segments in the right),
-power, IF, then the time and the voltage on the right, one-line buttons) and, not offered in the menu, Legacy. More themes are JSON files
+lightness inverted: dark, the hues kept), **KX3Lovers Plus** (amber glass laid out as the LCD in Elecraft's KX3 owner's manual: the bar
+graph with the S, SWR/CMP and RF/ALC scales and CWT, the filter graphic with NTCH, VFO A in seven segments, VOX
+ATU RIT XIT SPLT AGC ATT PRE NB NR XFIL under it, VFO B in fourteen segments, the lock, A, TX and B and the mode
+icons on the right; under it a spectrum strip (in CW the decoded text beside it), power, IF, the time and the
+voltage, one-line buttons) and, not offered in the menu, Legacy. More themes are JSON files
 on the SD card in `/mnt/themes/`, one per file: `/mnt/themes/My theme.json`
 shows up as *My theme* in Settings -> Display -> INTERFACE -> Theme. Choosing a theme
 applies it at once, without restarting the radio app (an open app closes).

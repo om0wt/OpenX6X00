@@ -14,8 +14,9 @@
 lv_obj_t *lcd_panel_init(lv_obj_t *parent, lv_coord_t height);
 
 /* Plus: where the spectrum strip is */
-#define LCD_PLUS_STRIP_Y    348
-#define LCD_PLUS_STRIP_H    66
+#define LCD_PLUS_LCD_H      286     /* the KX3 display over it */
+#define LCD_PLUS_STRIP_Y    294
+#define LCD_PLUS_STRIP_H    112
 #define LCD_PLUS_STRIP_W    800
 
 /* Plus: the spectrum strip, in CW while keying or while decoded text comes in the left half,
