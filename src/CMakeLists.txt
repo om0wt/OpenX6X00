@@ -38,6 +38,7 @@ target_sources(${PROJECT_NAME} PUBLIC
     theme.c
     freq_strip.c
     lcd_panel.c
+    tx_autocal.cpp
     freq_scale.c
     spot_marks.c
     band_plan.c

@@ -8,6 +8,8 @@
  *    {"cmd":"disp_set","text":name,"val":v}           -> {"t":"ok"} or {"t":"err","err":"..."}; "theme":name for the theme
  *    {"cmd":"eth_get"}                                -> {"t":"eth", ...}
  *    {"cmd":"eth_set","dhcp":0|1,"ip":..,"mask":..,"gw":..,"dns":..}
+ *    {"cmd":"txcal_start"} / {"cmd":"txcal_stop"}      -> {"t":"ok"}: the TX calibration (tx_autocal.cpp)
+ *    {"cmd":"txcal_get"}                              -> {"t":"txcal","running":bool,"status":"lines"}
  *  The values are checked here and applied on the LVGL thread through the scheduler, as the
  *  Settings pages apply them.
  *
@@ -32,6 +34,7 @@ extern "C" {
     #include "screen_light.h"
     #include "screen_main.h"
     #include "theme.h"
+    #include "tx_autocal.h"
     #include "walkie.h"
 
     #include "lvgl/lvgl.h"
@@ -271,6 +274,30 @@ static void eth_apply_cb(void *arg) {
     eth_apply((eth_cfg_t *)arg);
 }
 
+static void txcal_start_cb(void *arg) {
+    tx_autocal_start();
+}
+
+static void txcal_stop_cb(void *arg) {
+    tx_autocal_stop("Stopped (remote).");
+}
+
+static int txcal_get(char *out, size_t size) {
+    static char status[1500];   /* the newest lines, the answer fits in 2048 */
+    cJSON      *o = cJSON_CreateObject();
+
+    tx_autocal_status(status, sizeof(status));
+    cJSON_AddStringToObject(o, "t", "txcal");
+    cJSON_AddBoolToObject(o, "running", tx_autocal_running());
+    cJSON_AddStringToObject(o, "status", status);
+    char *s = cJSON_PrintUnformatted(o);
+    int   l = snprintf(out, size, "%s\n", s);
+
+    cJSON_free(s);
+    cJSON_Delete(o);
+    return l;
+}
+
 /* The answer to one request line */
 static int handle_line(const char *line, char *out, size_t size) {
     cJSON      *req  = cJSON_Parse(line);
@@ -292,6 +319,12 @@ static int handle_line(const char *line, char *out, size_t size) {
         eth_cfg_t cfg;
         if (!(err = eth_set(req, &cfg)) && !scheduler_put(eth_apply_cb, &cfg, sizeof(cfg)))
             err = "Busy, try again";
+    } else if (!strcmp(name->valuestring, "txcal_start")) {
+        if (!scheduler_put_noargs(txcal_start_cb)) err = "Busy, try again";
+    } else if (!strcmp(name->valuestring, "txcal_stop")) {
+        if (!scheduler_put_noargs(txcal_stop_cb)) err = "Busy, try again";
+    } else if (!strcmp(name->valuestring, "txcal_get")) {
+        l = txcal_get(out, size);
     } else {
         err = "Unknown command";
     }
