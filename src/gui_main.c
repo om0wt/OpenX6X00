@@ -9,6 +9,7 @@
  *  order they need each other, then the GUI loop.
  */
 
+#include "dialog_field.h"
 #include "msg_box.h"
 #include "board.h"
 #include "lvgl/lvgl.h"
@@ -64,6 +65,7 @@
 #include "dialog_cluster.h"
 #include "app_sstv.h"
 #include "walkie.h"
+#include "winlink.h"
 
 /* LVGL draws the areas it refreshes here, then flushes them to the panel */
 #define DISP_BUF_SIZE (BOARD_DISP_W * BOARD_DISP_H * 4)
@@ -243,6 +245,7 @@ static void services_start(void) {
     ctl_init();
     tci_server_init();
     remote_server_init();
+    winlink_init();     /* ardopcf's audio and Pat's rigctld: idle until they connect */
     birdie_init();
     gps_init();
     if (!qso_log_init()) {
@@ -326,6 +329,7 @@ int main(void) {
         main_screen_start_app(ACTION_APP_FIELD);
     }
     lv_timer_set_repeat_count(lv_timer_create(update_confirm_cb, 60000, NULL), 1);
+    dialog_field_wavelog_start();
     gui_loop();
     return 0;
 }

@@ -7,6 +7,7 @@ import csv
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -51,17 +52,22 @@ PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 bottle.TEMPLATE_PATH.append(os.path.join(PACKAGE_DIR, "views"))
 
 
-def read_callsign():
-    """Callsign from params.db for the page header, "" when missing."""
+def read_param(name):
+    """A text setting of the radio from params.db (callsign, qth), "" when missing."""
     try:
         con = sqlite3.connect(f"file:{settings.DB_PATH}?mode=ro", uri=True)
         try:
-            row = con.execute("SELECT val FROM params WHERE name = 'callsign'").fetchone()
+            row = con.execute("SELECT val FROM params WHERE name = ?", (name,)).fetchone()
         finally:
             con.close()
     except sqlite3.Error:
         return ""
     return str(row[0]) if row and row[0] else ""
+
+
+def read_callsign():
+    """Callsign from params.db for the page header, "" when missing."""
+    return read_param("callsign")
 
 
 bottle.BaseTemplate.defaults.update(callsign=read_callsign, request=bottle.request)
@@ -547,13 +553,33 @@ def tailscale_page():
     return bottle.template('tailscale')
 
 
+def local_host_ok():
+    """The page opened by an address or by the radio's own name. A page from another site that points its own
+    name at the radio (DNS rebinding) passes the cross-site guard: Tailscale is switched and its login link
+    shown (which would put the radio on that site's tailnet), and Winlink changed, only by these names. Pat's
+    mailbox on port 8080 takes the same names (tools/pat)"""
+    host = (urllib.parse.urlsplit("//" + (bottle.request.get_header("Host") or "")).hostname or "").rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    name = socket.gethostname().lower()
+    return host in ("localhost", name, name + ".local") or host.endswith(".ts.net")
+
+
 @app.get('/api/tailscale')
 def get_tailscale():
-    return tailscale_status()
+    st = tailscale_status()
+    if not local_host_ok():
+        st.pop("url", None)
+    return st
 
 
 @app.post('/api/tailscale')
 def set_tailscale():
+    if not local_host_ok():
+        return api_error(403, f"Open this page by the radio's address or {socket.gethostname()}.local to change Tailscale")
     action = (bottle.request.json or {}).get("action")
     if action not in ("on", "off", "logout"):
         return api_error(400, "action: on, off or logout")
@@ -565,6 +591,140 @@ def set_tailscale():
         msg = (r.stderr.strip().splitlines() or [f"exit code {r.returncode}"])[-1]
         return api_error(500, "Tailscale: " + (msg[6:] if msg.startswith("error ") else msg))
     return tailscale_status()
+
+
+# Winlink (rootfs/usr/sbin/x6100-winlink): Pat and ardopcf under a supervisor that keeps a status file. The page
+# writes the settings (/mnt/winlink.conf), hands a new password to the helper on stdin (it goes to the root
+# filesystem, where these pages never read it back) and runs the helper to apply them and to turn it on or off
+WINLINK_CMD = "/usr/sbin/x6100-winlink"
+WINLINK_STATUS = "/run/winlink/status"
+WINLINK_CONF = "/mnt/winlink.conf"
+WINLINK_PASSWORD = "/var/lib/winlink/password"
+WINLINK_PROGRAMS = ("/usr/bin/pat", "/usr/bin/ardopcf")
+WINLINK_PORT = 8080                                   # Pat's mailbox
+WINLINK_CALL_RE = re.compile(r"[A-Z0-9]{3,12}(-[0-9]{1,2})?")   # as x6100-winlink checks them
+WINLINK_LOCATOR_RE = re.compile(r"[A-R]{2}[0-9]{2}([A-X]{2})?", re.I)
+winlink_lock = threading.Lock()                       # one change at a time: Off may take 20 s
+
+
+def winlink_conf():
+    conf = {"enabled": "0", "mycall": "", "locator": "", "bandwidth": "500"}
+    try:
+        with open(WINLINK_CONF) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep:
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def winlink_state():
+    """The settings, the supervisor's status and the defaults; whether a password is set, never the password"""
+    st = {"state": "off", "text": "Off", "pat": "off", "ardop": "off"}
+    try:
+        with open(WINLINK_STATUS) as f:
+            for line in f:
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep:
+                    st[k] = v
+    except OSError:
+        pass
+    conf = winlink_conf()
+    try:
+        password_set = os.path.getsize(WINLINK_PASSWORD) > 0
+    except OSError:
+        password_set = False
+    st.update(enabled=conf["enabled"] == "1", mycall=conf["mycall"], locator=conf["locator"],
+              bandwidth=2000 if conf["bandwidth"] == "2000" else 500, password_set=password_set,
+              radio_mycall=max(read_callsign().upper().split("/"), key=len),   # ON6URE of ON6URE/P
+              radio_locator=read_param("qth"), installed=all(os.access(p, os.X_OK) for p in WINLINK_PROGRAMS),
+              host_ok=local_host_ok(), port=WINLINK_PORT)
+    return st
+
+
+def winlink_run(args, stdin=None):
+    """The helper; its error line, None when it went well"""
+    try:
+        r = subprocess.run([WINLINK_CMD, *args], input=stdin, capture_output=True, text=True, timeout=40)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    if r.returncode != 0:
+        msg = (r.stderr.strip().splitlines() or [f"exit code {r.returncode}"])[-1]
+        return msg[6:] if msg.startswith("error ") else msg
+    return None
+
+
+@app.route('/winlink')
+def winlink_page():
+    return bottle.template('winlink')
+
+
+@app.get('/api/winlink')
+def get_winlink():
+    return winlink_state()
+
+
+@app.post('/api/winlink')
+def set_winlink():
+    """Any of enabled, mycall, locator, bandwidth and password; what is not sent stays. An empty callsign or
+    locator is the radio's own, an empty password keeps the one set"""
+    if not local_host_ok():
+        return api_error(403, f"Open this page by the radio's address or {socket.gethostname()}.local to change Winlink")
+    try:
+        data = bottle.request.json
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return api_error(400, "Invalid request")
+    with winlink_lock:
+        conf = winlink_conf()
+        new = dict(conf)
+        if "enabled" in data:
+            if not isinstance(data["enabled"], bool):
+                return api_error(400, "enabled: true or false")
+            new["enabled"] = "1" if data["enabled"] else "0"
+        if "mycall" in data:
+            call = data["mycall"].strip().upper() if isinstance(data["mycall"], str) else None
+            if call is None or call and not WINLINK_CALL_RE.fullmatch(call):
+                return api_error(400, "Callsign: your Winlink account, letters and digits (an SSID like -5 may follow); "
+                                      "empty for the radio's")
+            new["mycall"] = call
+        if "locator" in data:
+            loc = data["locator"].strip() if isinstance(data["locator"], str) else None
+            if loc is None or loc and not WINLINK_LOCATOR_RE.fullmatch(loc):
+                return api_error(400, "Locator: 4 or 6 characters (JO20 or JO20ab); empty for the radio's QTH")
+            new["locator"] = loc[:4].upper() + loc[4:].lower()
+        if "bandwidth" in data:
+            if data["bandwidth"] not in (500, 2000) or isinstance(data["bandwidth"], bool):
+                return api_error(400, "Bandwidth: 500 or 2000")
+            new["bandwidth"] = str(data["bandwidth"])
+        password = data.get("password", "")
+        password = password.strip() if isinstance(password, str) else None
+        if password is None or len(password) > 64 or any(ord(c) < 32 or ord(c) == 127 for c in password):
+            return api_error(400, "Password: up to 64 characters")
+        if password:
+            err = winlink_run(["set-password"], password)
+            if err:
+                return api_error(500, "Winlink: " + err)
+        keys = ["enabled", "mycall", "locator", "bandwidth"]
+        if new != conf:
+            try:
+                replace_file(WINLINK_CONF, lambda f: f.write(
+                    "".join(f"{k}={new[k]}\n" for k in keys + [k for k in new if k not in keys])))
+            except OSError as e:
+                return api_error(500, f"Can't save: {e}")
+        err = None
+        if new["enabled"] == "1":
+            if password or any(new[k] != conf[k] for k in keys[1:]):
+                err = winlink_run(["apply"])          # Pat restarts with them
+            err = err or winlink_run(["on"])
+        elif conf["enabled"] == "1" or "enabled" in data:
+            err = winlink_run(["off"])
+        if err:
+            return api_error(500, "Winlink: " + err)
+    return winlink_state()
 
 
 @app.get('/api/tci')
@@ -811,6 +971,161 @@ def field_log_file(name):
     return bottle.static_file(name, root=field_path("logs"), download=True, mimetype="text/plain")
 
 
+# Wavelog routes: x6100-wavelog (rootfs/usr/sbin) talks to the user's Wavelog; the GUI runs it after each QSO.
+# <FIELD_DIR>/wavelog.conf: enabled, url, key, station_id, station_name, verify_tls, since. The key never goes
+# back to the browser, only whether one is set; wavelog.state and wavelog.queue are the helper's.
+
+WAVELOG_KEYS = ("enabled", "url", "key", "station_id", "station_name", "verify_tls", "since")
+WAVELOG_URL = r"https?://[^\s<>\"'=]{3,200}"
+
+
+def wavelog_read():
+    conf = {}
+    try:
+        with open(field_path("wavelog.conf"), errors="replace") as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and k.strip() in WAVELOG_KEYS:
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def wavelog_write(conf):
+    path = field_path("wavelog.conf")
+    os.makedirs(settings.FIELD_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        for k in WAVELOG_KEYS:
+            if conf.get(k, "") != "":
+                f.write(f"{k}={conf[k]}\n")
+    os.rename(tmp, path)
+
+
+def wavelog_json(name, default):
+    try:
+        with open(field_path(name), errors="replace") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def wavelog_state(result=None):
+    conf = wavelog_read()
+    last = wavelog_json("wavelog.state", {}).get("last") or {}
+    since = int(conf.get("since") or 0) if (conf.get("since") or "").isdigit() else 0
+    return {"enabled": conf.get("enabled") == "1", "url": conf.get("url", ""), "key": bool(conf.get("key")),
+            "station_id": conf.get("station_id", ""), "station_name": conf.get("station_name", ""),
+            "verify_tls": conf.get("verify_tls", "1") != "0",
+            "since": time.strftime("%Y-%m-%d %H:%M", time.localtime(since)) if since else "",
+            "queue": len(wavelog_json("wavelog.queue", [])), "result": result,
+            "last": {"result": last.get("result", ""),
+                     "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(last["time"])) if last.get("time") else ""}}
+
+
+def wavelog_run(cmd, form=None, timeout=330):
+    """x6100-wavelog's line; form: URL, key and certificate check typed on the page, not saved yet"""
+    env = dict(os.environ, X6100_FIELD_DIR=settings.FIELD_DIR)
+    if form:
+        env.update(X6100_WAVELOG_URL=form["url"], X6100_WAVELOG_VERIFY="1" if form["verify_tls"] else "0")
+        if form["key"]:
+            env["X6100_WAVELOG_KEY"] = form["key"]
+    try:   # the helper gives up after 300 s (its RUN_LIMIT): a little longer here, to hear why
+        r = subprocess.run([settings.WAVELOG_CMD, cmd], capture_output=True, text=True, timeout=timeout, env=env)
+        lines = r.stdout.strip().splitlines()
+        return lines[-1] if lines else f"error exit code {r.returncode}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"error {e}"
+
+
+def wavelog_form(body):
+    """URL, key and certificate check of the page's form, checked; None and the reason when wrong"""
+    url = str(body.get("url", "")).strip()
+    key = str(body.get("key", "")).strip()
+    if url and not re.fullmatch(WAVELOG_URL, url):
+        return None, "The URL starts with http:// or https://, no spaces"
+    if key and not re.fullmatch(r"[!-~]{1,128}", key):
+        return None, "A key is 1-128 printable characters, no spaces"
+    return {"url": url, "key": key, "verify_tls": body.get("verify_tls", True) is not False}, None
+
+
+@app.route('/wavelog')
+def wavelog_page():
+    return bottle.template('wavelog')
+
+
+@app.get('/api/wavelog')
+def get_wavelog():
+    return wavelog_state()
+
+
+@app.post('/api/wavelog')
+def set_wavelog():
+    """{"enabled", "url", "key" ("": the one stored stays), "station_id", "station_name", "verify_tls"},
+    or {"remove": true}: the key goes and the upload stops. Switched on, QSOs from now on are sent."""
+    body = bottle.request.json or {}
+    conf = wavelog_read()
+    if body.get("remove"):
+        conf.pop("key", None)
+        conf["enabled"] = "0"
+    else:
+        form, why = wavelog_form(body)
+        if not form:
+            return api_error(400, why)
+        sid = str(body.get("station_id", "")).strip()
+        if sid and not (sid.isdigit() or sid == "auto"):   # auto: the profile with the QSO's station callsign
+            return api_error(400, "No such station profile")
+        name = "" if sid == "auto" else re.sub(r"[\r\n=]", " ", str(body.get("station_name", "")))[:60].strip()
+        enabled = bool(body.get("enabled"))
+        key = form["key"] or conf.get("key", "")
+        if enabled and not (form["url"] and key and sid):
+            return api_error(400, "To switch it on: the URL, an API key and a station profile")
+        if enabled and conf.get("enabled") != "1":
+            conf["since"] = str(int(time.time()))   # from now on: the log from before is not sent
+        conf.update(url=form["url"], station_id=sid, station_name=name, verify_tls="1" if form["verify_tls"] else "0",
+                    enabled="1" if enabled else "0")
+        if key:
+            conf["key"] = key
+    try:
+        wavelog_write(conf)
+    except OSError as e:
+        return api_error(500, f"Can't save: {e}")
+    if conf.get("enabled") == "1":   # what waits goes now, not at the next QSO
+        threading.Thread(target=wavelog_run, args=("sync",), daemon=True).start()
+    return wavelog_state()
+
+
+@app.post('/api/wavelog/stations')
+def wavelog_stations():
+    form, why = wavelog_form(bottle.request.json or {})
+    if not form:
+        return api_error(400, why)
+    line = wavelog_run("stations", form, timeout=40)
+    if not line.startswith("ok "):
+        return api_error(502, "Wavelog: " + line.partition(" ")[2])
+    try:
+        return {"stations": json.loads(line[3:])}
+    except ValueError:
+        return api_error(502, "Wavelog: an answer the page can't read")
+
+
+@app.post('/api/wavelog/test')
+def wavelog_test():
+    form, why = wavelog_form(bottle.request.json or {})
+    if not form:
+        return api_error(400, why)
+    line = wavelog_run("test", form, timeout=40)
+    if not line.startswith("ok "):
+        return api_error(502, "Wavelog: " + line.partition(" ")[2])
+    return {"version": line[3:]}
+
+
+@app.post('/api/wavelog/sync')
+def wavelog_sync():
+    return wavelog_state(wavelog_run("sync"))
+
+
 def field_active_log():
     """The log of the activation running on the radio ("" when none), from the GUI's state file."""
     try:
@@ -835,6 +1150,13 @@ def adif_set(rec, name, value):
     if not m:
         return rec.rstrip() + " " + new + " "
     return rec[:m.start()] + new + rec[m.end() + int(m.group(1)):]
+
+
+def adif_get(rec, name):
+    """One field of rec, found by its own tag. For the ASCII fields: the radio writes lengths in bytes (flog.c), and
+    adif_fields, counting characters, runs over the next tag after a value such as "Łódź" """
+    m = re.search(r'<%s:(\d+)(?::\w)?>' % name, rec, re.I)
+    return rec[m.end():m.end() + int(m.group(1))] if m else ""
 
 
 def adif_del(rec, name):
@@ -897,8 +1219,7 @@ def set_ref(rec, ref):
     """The other station's reference (its programme by its form, ref_prog); "" removes it. Written as the
     radio writes it (src/field/flog.c): SOTA_REF; SIG and SIG_INFO, with POTA_REF for a park and GRIDSQUARE for a
     tile."""
-    old = adif_fields(rec)
-    if old.get("sig", "").upper() == "TILES" and old.get("gridsquare", "").upper() == old.get("sig_info", "").upper():
+    if adif_get(rec, "SIG").upper() == "TILES" and adif_get(rec, "GRIDSQUARE").upper() == adif_get(rec, "SIG_INFO").upper():
         rec = adif_del(rec, "GRIDSQUARE")         # the tile they gave goes with it
     for name in ("SOTA_REF", "POTA_REF", "SIG", "SIG_INFO"):
         rec = adif_del(rec, name)
