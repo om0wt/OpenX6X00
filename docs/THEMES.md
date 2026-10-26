@@ -6,7 +6,11 @@ shapes, the font and the waterfall palette.
 
 Built in: **RF.Guru** (default: near-black surfaces, gold for what is on, electric blue as the second accent), **Classic** (black, grey keys, IC-7300 style)
 **Outdoor** (light, for the sun), **Outdoor-Negative** (Outdoor with the
-lightness inverted: dark, the hues kept) and, not offered in the menu, Legacy. More themes are JSON files
+lightness inverted: dark, the hues kept), **KX3Lovers Plus** (amber glass laid out as the LCD in Elecraft's KX3 owner's manual: the bar
+graph with the S, SWR/CMP and RF/ALC scales and CWT, the filter graphic with NTCH, VFO A in seven segments, VOX
+ATU RIT XIT SPLT AGC ATT PRE NB NR XFIL under it, VFO B in fourteen segments, the lock, A, TX and B and the mode
+icons on the right; under it a spectrum strip (in CW the decoded text beside it), power, IF, the time and the
+voltage, one-line buttons) and, not offered in the menu, Legacy. More themes are JSON files
 on the SD card in `/mnt/themes/`, one per file: `/mnt/themes/My theme.json`
 shows up as *My theme* in Settings -> Display -> INTERFACE -> Theme. Choosing a theme
 applies it at once, without restarting the radio app (an open app closes).
@@ -40,7 +44,7 @@ Every key is optional: what a file does not set comes from its `base`.
 
 | Key | Meaning |
 |---|---|
-| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor` or `Outdoor-Negative` (default RF.Guru) |
+| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor`, `Outdoor-Negative`, `VISION`, `Black Metal`, `Total Black` or `KX3Lovers Plus` (default RF.Guru) |
 | `colors` | role -> `#rrggbb`, roles below |
 | `radius`, `radius_btn`, `radius_popup` | corners of the boxes (top bar, strip, windows), of the bottom buttons, of menus and panels in the apps |
 | `border` | border width of boxes and buttons (3 or more: high contrast boxes) |

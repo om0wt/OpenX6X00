@@ -54,3 +54,4 @@ __pycache__/
 
 # The PC build (host/build.sh)
 build-host/
+shots/

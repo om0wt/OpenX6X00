@@ -550,7 +550,7 @@ What they do: see [DX Cluster](#dx-cluster).
 
 | Card | Options |
 |---|---|
-| TX CALIBRATION | IQ offsets, band output gain, codec gain |
+| TX CALIBRATION | IQ offsets, band output gain, codec gain, Auto (all bands: the band output gain of 160 m to 6 m set by itself so the radio's own meter reads the PWR setting; FM carriers of 2.5 s, stops on SWR over 2; into a dummy load only) |
 | CESSB | on, level |
 | TX PROTECTION | SWR protection |
 | S-METER | Preamp, Attenuator, RF gain a step, Measure |
