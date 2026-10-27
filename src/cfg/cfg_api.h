@@ -73,6 +73,7 @@ extern ParamInt         *cfg_walkie_mem;         // p_walkie_mem
 extern ParamInt         *cfg_walkie_ch;          // p_walkie_ch
 extern ParamInt         *cfg_walkie_mic;         // p_walkie_mic
 extern ParamInt         *cfg_band_plan;          // p_band_plan
+extern ParamInt         *cfg_wr12;               // p_wr12 (the X6200: the WR12 on HOST)
 extern ParamInt         *cfg_speaker_off;        // p_speaker_off
 extern ParamInt         *cfg_smeter_needle;      // p_smeter_needle
 extern ParamInt         *cfg_smeter_color;       // p_smeter_color
@@ -116,6 +117,7 @@ extern ParamInt *cfg_spot_snap_slow; // p_spot_snap_slow
 extern ParamInt *cfg_freq_accel_onset; // p_freq_accel_onset
 extern ParamInt *cfg_wspr_tx_freq;   // p_wspr_tx_freq
 extern ParamInt *cfg_wspr_upload;    // p_wspr_upload
+extern ParamInt *cfg_wspr_dbm;       // p_wspr_dbm
 extern ParamInt *cfg_pskreporter;    // p_pskreporter
 extern ParamInt *cfg_field_boot;     // p_field_boot
 extern ParamInt *cfg_field_respot;   // p_field_respot
@@ -186,6 +188,7 @@ extern ParamFloat *cfg_band_dac_offset;   // p_band_dac_offset
 extern ParamInt   *cfg_band_grid_min;     // p_band_grid_min
 extern ParamInt   *cfg_band_grid_max;     // p_band_grid_max
 extern ParamInt   *cfg_band_split;        // p_band_split
+extern ParamInt   *cfg_band_tx_shift;     // p_band_tx_shift (Hz, 0 off)
 extern ParamInt   *cfg_band_tx_i_offset;  // p_band_tx_i_offset
 extern ParamInt   *cfg_band_tx_q_offset;  // p_band_tx_q_offset
 extern ParamInt   *cfg_band_vfoa_mode;    // p_band_vfoa_mode

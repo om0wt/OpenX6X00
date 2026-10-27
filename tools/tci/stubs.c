@@ -14,6 +14,7 @@
 #include "cfg/cfg_api.h"
 #include "radio.h"
 #include "scheduler.h"
+#include "screen_light.h"
 #include "screen_main.h"
 #include "smeter.h"
 #include "tci_server.h"
@@ -34,7 +35,7 @@ struct ComputedParamInt { int32_t v; };
 
 static struct ParamInt         rit;
 static struct ParamFloat       pwr = {5.0f};
-static struct ComputedParamInt freq = {7074000}, mode = {x6100_mode_lsb}, agc = {x6100_agc_fast}, flo = {300},
+static struct ComputedParamInt freq = {7074000}, mode = {radio_mode_lsb}, agc = {radio_agc_fast}, flo = {300},
                                fhi = {2700};
 ParamInt         *cfg_rit = &rit;
 ParamFloat       *cfg_pwr = &pwr;
@@ -47,6 +48,7 @@ float   param_f_get(const ParamFloat *p) { return p->v; }
 int32_t cparam_i_get(const ComputedParamInt *p) { return p->v; }
 void    cparam_i_set(ComputedParamInt *p, int32_t v) { p->v = v; }
 bool    cfg_is_valid_hw_freq(int32_t f) { return f >= 100000 && f <= 55000000; }
+void    cfg_pwr_set(float w) { pwr.v = w; fprintf(stderr, "[stub] power %.1f W\n", w); }
 
 /* ---- the radio ---- */
 static bool ptt, modem;
@@ -55,16 +57,21 @@ void radio_set_ptt(bool tx) { ptt = tx; fprintf(stderr, "[stub] ptt %d\n", tx); 
 void radio_set_modem(bool tx) { modem = tx; fprintf(stderr, "[stub] modem %d\n", tx); }
 bool radio_get_modem(void) { return modem; }
 void radio_set_pwr(float d) { fprintf(stderr, "[stub] power %.1f W\n", d); }
+void radio_set_tci_mute(bool on) { fprintf(stderr, "[stub] tci mute %d\n", on); }
+uint32_t radio_caps(void) { return 0; }     /* an X6100: no SAM, no WFM */
 
 /* ---- the scheduler: no LVGL thread here, the work is done at once ---- */
-void scheduler_put(scheduler_fn_t fn, void *arg, size_t arg_size) {
+bool scheduler_put(scheduler_fn_t fn, void *arg, size_t arg_size) {
     void *copy = arg_size ? malloc(arg_size) : NULL;
     if (copy) memcpy(copy, arg, arg_size);
     fn(copy);
     free(copy);
+    return true;
 }
+bool scheduler_put_urgent(scheduler_fn_t fn, void *arg, size_t arg_size) { return scheduler_put(fn, arg, arg_size); }
 
 /* ---- the main screen ---- */
+bool backlight_tick(void) { return false; }
 bool main_screen_freq_locked(void) { return false; }
 bool main_screen_mode_locked(void) { return false; }
 void main_screen_set_freq(uint64_t f) { freq.v = (int32_t)f; }
@@ -83,13 +90,30 @@ bool tx_info_refresh(uint8_t *seen, float *alc, float *p, float *s) {
     return true;
 }
 
-/* ---- the audio out: counted ---- */
+/* ---- the audio out: what each transmission played, counted, and kept in the file
+ * TCI_TEST_PLAYED (int16 at AUDIO_PLAY_RATE) for the client test to read ---- */
 static size_t played;
+static FILE  *played_f;
 void audio_play_wait(void) {}
 void audio_play_flush(void) {}
-bool audio_play_lowlat_begin(void) { return true; }
-void audio_play_lowlat_end(void) { fprintf(stderr, "[stub] played %zu samples\n", played); }
-bool audio_play_if_room(int16_t *buf, size_t n) { (void)buf; played += n; return true; }
+bool audio_play_lowlat_begin(void) {
+    const char *path = getenv("TCI_TEST_PLAYED");
+    played   = 0;
+    played_f = path ? fopen(path, "wb") : NULL;
+    return true;
+}
+void audio_play_lowlat_end(void) {
+    if (played_f) {
+        fclose(played_f);
+        played_f = NULL;
+    }
+    fprintf(stderr, "[stub] played %zu samples\n", played);
+}
+bool audio_play_if_room(int16_t *buf, size_t n) {
+    played += n;
+    if (played_f) fwrite(buf, sizeof(*buf), n, played_f);
+    return true;
+}
 
 /* ---- PulseAudio: a 1 kHz tone, paced like a real stream ---- */
 struct pa_simple { uint32_t rate; double phase; };
@@ -115,11 +139,12 @@ int pa_simple_read(pa_simple *s, void *data, size_t bytes, int *error) {
 void pa_simple_free(pa_simple *s) { free(s); }
 
 int main(int argc, char **argv) {
+    const char *port = getenv("TCI_TEST_PORT");
     (void)argc; (void)argv;
     /* The conf: enabled on the test port */
     FILE *f = fopen(TCI_CONF, "w");
     if (f) {
-        fputs("enabled=1\nport=50001\n", f);
+        fprintf(f, "enabled=1\nport=%s\n", port ? port : "50001");
         fclose(f);
     }
     tci_server_init();

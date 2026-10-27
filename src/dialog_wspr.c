@@ -7,7 +7,8 @@
  *  recorded (wspr/wspr.c) and decoded at 114 s, after the 110.6 s signal;
  *  the spots go to the table and, when Upload is on, to WSPRnet. A TX cycle
  *  (chosen at random with the TX % chance, or "TX next") sends the beacon
- *  from 1 s: call, 4-character locator and power, at most 7 W.
+ *  from 1 s: call, 4-character locator and power. The power is WSPR's own
+ *  (0.1 to 5 W, 0.2 W at first): the radio's power setting is left alone.
  *
  *  Threads: the cycle thread keeps the time and transmits (tx_player blocks
  *  for the whole beacon); each decode runs in a thread of its own, with a
@@ -57,7 +58,6 @@
 #define TX_LATE_S       2.0     /* later than this the beacon waits a cycle */
 #define DECODE_S        114.0   /* the signal ends at 111.6 s (+ drift) */
 #define PREPARE_S       116.0   /* next cycle chosen and synthesised */
-#define MAX_PWR         TX_PLAYER_MAX_PWR_W
 
 #define MAX_ROWS        60
 #define MAX_SPOTS       32
@@ -68,6 +68,12 @@ typedef enum {
     ST_TX,
     ST_STOP,
 } wspr_state_t;
+
+enum {              /* tx_next_subj: the look of the TX next button */
+    NEXT_OFF,
+    NEXT_ARMED,
+    NEXT_ON_AIR,    /* Stop TX */
+};
 
 typedef struct {
     time_t      cycle;          /* UTC start */
@@ -95,10 +101,12 @@ static void rotary_cb(int32_t diff);
 static const char *tx_pct_label(void);
 static const char *upload_label(void);
 static const char *tx_next_label(void);
+static const char *pwr_label(void);
 static void tx_pct_cb(button_data_t *b);
 static void upload_cb(button_data_t *b);
 static void tx_next_cb(button_data_t *b);
 static void clear_cb(button_data_t *b);
+static void pwr_cb(button_data_t *b);
 
 static buttons_page_t btn_page_1, btn_page_2;
 
@@ -109,13 +117,14 @@ static button_data_t btn_tx_next = {.type = BTN_TEXT_FN, .label_fn = tx_next_lab
 static button_data_t btn_upload  = {.type = BTN_TEXT_FN, .label_fn = upload_label, .press = upload_cb};
 static button_data_t btn_clear   = {.type = BTN_TEXT, .label = "Clear", .press = clear_cb};
 static button_data_t btn_tx_pct2 = {.type = BTN_TEXT_FN, .label_fn = tx_pct_label, .press = tx_pct_cb};  /* TX % seen on page 2 too */
+static button_data_t btn_pwr     = {.type = BTN_TEXT_FN, .label_fn = pwr_label, .press = pwr_cb};  /* WSPR's own, not the radio's */
 
 static buttons_page_t btn_page_1 = {
     .items = {&btn_page, &btn_tx_pct, &btn_tx_next, &btn_upload, &btn_clear},
 };
 
 static buttons_page_t btn_page_2 = {
-    .items = {&btn_page2, &btn_dig_pwr, &btn_tx_pct2},
+    .items = {&btn_page2, &btn_pwr, &btn_tx_pct2},
 };
 
 static dialog_t dialog = {
@@ -147,11 +156,11 @@ static atomic_int           state = ST_STOP;
 static atomic_uint          gen;            /* bumped on close and band change */
 static atomic_bool          tx_next;
 static bool                 tx_by_next;    /* the prepared beacon is there for TX next, not the TX % pick */
+static float                tx_w;           /* its power, fixed with the dBm it reports */
 static atomic_int           uploaded;
 static atomic_int           upload_failed;
 static atomic_int           decoding;
 static uint32_t             dial_hz;        /* of the cycle being recorded */
-static float                base_gain_offset;
 static char                 my_call[16], my_grid[8];
 static pthread_t            cycle_thread;
 static bool                 cycle_thread_run;
@@ -163,6 +172,11 @@ static double now_s(void) {
 
     clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* A WSPR level in W, in the radio's 0.1 W steps: 20 dBm 0.1 W, 23 dBm 0.2 W, 27 0.5, 30 1, 33 2, 37 5 */
+static float wspr_w(int dbm) {
+    return roundf(powf(10.0f, dbm / 10.0f) / 100.0f) / 10.0f;
 }
 
 /* Decode thread */
@@ -230,34 +244,50 @@ static void start_decode(time_t cycle) {
 
 /* Cycle thread */
 
+/* Polled every block (about 46 ms): Stop TX or a close ends the beacon there, and what is queued for the sound card
+ * goes too, off the air at once instead of after its 0.8 s (as Winlink) */
 static bool tx_abort_cb(void *ctx) {
     (void)ctx;
-    return atomic_load(&state) != ST_TX;
+    if (atomic_load(&state) == ST_TX) {
+        return false;
+    }
+    audio_play_flush();
+    return true;
 }
 
-static void tx_next_clear_cb(void *arg) {
+/* The TX next button's look from where the cycle is: Stop TX while a beacon is due or on the air. Scheduled by the
+ * cycle thread when that changes, run on the LVGL thread with the state as it is then */
+static void tx_next_look_cb(void *arg) {
     (void)arg;
-    subject_i_set(tx_next_subj, false);
+    subject_i_set(tx_next_subj, atomic_load(&state) == ST_TX ? NEXT_ON_AIR
+                                : atomic_load(&tx_next)       ? NEXT_ARMED
+                                                              : NEXT_OFF);
 }
 
 static void tx_off_cb(void *arg) {
     (void)arg;
     param_i_set(cfg_wspr_tx_pct, 0);
-    subject_i_set(tx_next_subj, false);
+    tx_next_look_cb(NULL);
 }
 
-/* The beacon for the next cycle, or NULL for RX */
+/* The beacon for the next cycle, or NULL for RX. Its power goes with it (tx_w): a Power press before it goes out
+ * cannot make it report one and send another */
 static int16_t *prepare_tx(uint32_t *n) {
     uint8_t sym[WSPR_SYMBOLS];
     int     pct = param_i_get(cfg_wspr_tx_pct);
-    float   pwr = fminf(param_f_get(cfg_pwr), MAX_PWR);
+    int     dbm = param_i_get(cfg_wspr_dbm);
 
     tx_by_next = atomic_load(&tx_next);
     if (!tx_by_next && (pct == 0 || rand() % 100 >= pct)) {
         return NULL;
     }
-    if (!wspr_encode(my_call, my_grid, wspr_dbm(pwr), sym)) {
-        msg_schedule_text_fmt("WSPR TX: \"%s %.4s\" can't be sent (plain call and locator only)", my_call, my_grid);
+    tx_w = wspr_w(dbm);
+    if (!wspr_encode(my_call, my_grid, dbm, sym)) {
+        if (strlen(my_grid) < 4) {
+            msg_schedule_text_fmt("WSPR TX: set the QTH locator in Settings");
+        } else {
+            msg_schedule_text_fmt("WSPR TX: \"%s %.4s\" can't be sent (plain call and locator only)", my_call, my_grid);
+        }
         atomic_store(&tx_next, false);
         scheduler_put_noargs(tx_off_cb);
         return NULL;
@@ -283,8 +313,9 @@ static void *cycle_thread_cb(void *arg) {
             if (!prepared) {
                 free(tx);
                 tx = prepare_tx(&tx_n);
-            } else if (tx && tx_by_next && !atomic_load(&tx_next)) {
-                /* Prepared at 116 s for TX next, then TX next was turned off: no beacon */
+            } else if (tx && (tx_by_next ? !atomic_load(&tx_next) : param_i_get(cfg_wspr_tx_pct) == 0)) {
+                /* Prepared at 116 s, then what it was for turned off (TX next, TX % to 0, Stop TX): no beacon.
+                 * One the TX % had chosen used to go out all the same */
                 free(tx);
                 tx = NULL;
             }
@@ -302,6 +333,7 @@ static void *cycle_thread_cb(void *arg) {
             if (old == ST_STOP) {
                 break;
             }
+            scheduler_put_noargs(tx_next_look_cb);      /* Stop TX for a beacon due in this cycle */
         }
 
         int st = atomic_load(&state);
@@ -309,13 +341,17 @@ static void *cycle_thread_cb(void *arg) {
         if (st == ST_TX && t >= TX_START_S) {
             if (t <= TX_LATE_S) {
                 atomic_store(&tx_next, false);
-                scheduler_put_noargs(tx_next_clear_cb);
                 tx_info_set_length(CYCLE_S);    /* the strip counts the cycle */
-                tx_player_play(tx, tx_n, param_i_get(cfg_wspr_tx_freq), base_gain_offset, tx_abort_cb, NULL);
+                /* WSPR's own power, on this thread: the radio's setting back after the beacon */
+                tx_player_set_pwr(tx_w);
+                tx_player_play(tx, tx_n, param_i_get(cfg_wspr_tx_freq), tx_player_base_gain_offset(), tx_abort_cb,
+                               NULL);
+                tx_player_set_pwr(0.0f);
             }
             free(tx);
             tx = NULL;
             atomic_compare_exchange_strong(&state, &st, ST_WAIT);
+            scheduler_put_noargs(tx_next_look_cb);      /* back to TX next */
             continue;
         }
         if (st == ST_RX && t >= DECODE_S) {
@@ -428,7 +464,7 @@ static void timer_cb(lv_timer_t *t) {
     double now = now_s();
     double s   = fmod(now, CYCLE_S);
     int    st  = atomic_load(&state);
-    float  pwr = fminf(param_f_get(cfg_pwr), MAX_PWR);
+    int    dbm = param_i_get(cfg_wspr_dbm);
 
     lv_label_set_text_fmt(frame.head_left, "%s   %.4f MHz", cfg_digital_label_get(), cparam_i_get(cfg_fg_freq) / 1e6);
 
@@ -464,7 +500,7 @@ static void timer_cb(lv_timer_t *t) {
         snprintf(last, sizeof(last), "Last: %d spot%s (%.1f s)   ", last_n, last_n == 1 ? "" : "s", last_secs);
     }
     lv_label_set_text_fmt(frame.status, "%sTX %d%% at %d Hz, %.1f W = %d dBm   %s", last, param_i_get(cfg_wspr_tx_pct),
-                          param_i_get(cfg_wspr_tx_freq), pwr, wspr_dbm(pwr), up);
+                          param_i_get(cfg_wspr_tx_freq), wspr_w(dbm), dbm, up);
 }
 
 static const char *tx_pct_label(void) {
@@ -472,6 +508,20 @@ static const char *tx_pct_label(void) {
 
     snprintf(buf, sizeof(buf), "TX\n%d%%", param_i_get(cfg_wspr_tx_pct));
     return buf;
+}
+
+/* A beacon needs the callsign and 4 characters of locator: said at the press. TX next used to show armed and drop
+ * at 1:56, when the beacon is made, with a message easy to miss (a radio with no QTH set and no GPS fix) */
+static bool tx_possible(void) {
+    if (!my_call[0]) {
+        msg_update_text_fmt("WSPR TX: set the callsign in Settings");
+        return false;
+    }
+    if (strlen(my_grid) < 4) {
+        msg_update_text_fmt("WSPR TX: set the QTH locator in Settings");
+        return false;
+    }
+    return true;
 }
 
 static void tx_pct_cb(button_data_t *b) {
@@ -482,27 +532,72 @@ static void tx_pct_cb(button_data_t *b) {
     while (k < sizeof(steps) / sizeof(steps[0]) && steps[k] <= cur) {
         k++;
     }
-    param_i_set(cfg_wspr_tx_pct, k < sizeof(steps) / sizeof(steps[0]) ? steps[k] : 0);
+    int next = k < sizeof(steps) / sizeof(steps[0]) ? steps[k] : 0;
+
+    if (cur == 0 && next > 0 && !tx_possible()) {
+        return;
+    }
+    param_i_set(cfg_wspr_tx_pct, next);
+}
+
+static const char *pwr_label(void) {
+    static char buf[24];
+
+    snprintf(buf, sizeof(buf), "Power\n%g W", wspr_w(param_i_get(cfg_wspr_dbm)));
+    return buf;
+}
+
+/* WSPR's own power: the next level up, round to the lowest. The levels the 0.1 W steps reach exactly, to 5 W. The
+ * shared Power button set the radio's power, for SSB and the other apps afterwards too */
+static void pwr_cb(button_data_t *b) {
+    static const int levels[] = {20, 23, 27, 30, 33, 37};
+    int              cur = param_i_get(cfg_wspr_dbm);
+    size_t           k   = 0;
+
+    while (k < sizeof(levels) / sizeof(levels[0]) && levels[k] <= cur) {
+        k++;
+    }
+    param_i_set(cfg_wspr_dbm, k < sizeof(levels) / sizeof(levels[0]) ? levels[k] : levels[0]);
 }
 
 static const char *tx_next_label(void) {
-    return subject_i_get(tx_next_subj) ? "TX next\n(armed)" : "TX next";
+    switch (subject_i_get(tx_next_subj)) {
+        case NEXT_ON_AIR:
+            return "Stop TX";
+        case NEXT_ARMED:
+            return "TX next\n(armed)";
+        default:
+            return "TX next";
+    }
 }
 
+/* Stop TX: the beacon off the air within a block, and none after it until TX % or TX next is pressed again. The rest
+ * of the cycle is idle */
+static void stop_tx(void) {
+    int st = ST_TX;
+
+    atomic_store(&tx_next, false);
+    param_i_set(cfg_wspr_tx_pct, 0);
+    atomic_compare_exchange_strong(&state, &st, ST_WAIT);   /* tx_abort_cb ends it */
+    tx_next_look_cb(NULL);
+    msg_update_text_fmt("WSPR: TX stopped, TX %% off");
+}
+
+/* While a beacon is due or on the air the button is Stop TX (page 1 has no room for one more). Before, a press
+ * there armed another beacon for the next cycle: TX next is cleared as a beacon starts */
 static void tx_next_cb(button_data_t *b) {
+    if (atomic_load(&state) == ST_TX) {     /* also in the second before the audio starts */
+        stop_tx();
+        return;
+    }
+
     bool on = !atomic_load(&tx_next);
 
-    if (on && !my_call[0]) {
-        msg_update_text_fmt("WSPR TX: set the callsign in Settings");
+    if (on && !tx_possible()) {
         return;
     }
     atomic_store(&tx_next, on);
-    subject_i_set(tx_next_subj, on);
-    if (!on) {
-        int st = ST_TX;
-
-        atomic_compare_exchange_strong(&state, &st, ST_WAIT);  /* stops the beacon on the air */
-    }
+    tx_next_look_cb(NULL);
 }
 
 static const char *upload_label(void) {
@@ -585,14 +680,15 @@ static void construct_cb(lv_obj_t *parent) {
     lv_obj_add_event_cb(dialog.obj, band_cb, EVENT_BAND_DOWN, NULL);
 
     if (!tx_next_subj) {
-        tx_next_subj    = subject_i_create(false);
+        tx_next_subj    = subject_i_create(NEXT_OFF);
         btn_tx_next.subj = (Subject *)tx_next_subj;
     }
     btn_tx_pct.subj = (Subject *)cfg_wspr_tx_pct;
     btn_tx_pct2.subj = (Subject *)cfg_wspr_tx_pct;
     btn_upload.subj = (Subject *)cfg_wspr_upload;
+    btn_pwr.subj = (Subject *)cfg_wspr_dbm;
     atomic_store(&tx_next, false);
-    subject_i_set(tx_next_subj, false);
+    subject_i_set(tx_next_subj, NEXT_OFF);
     buttons_load_page(&btn_page_1);
 
     app_frame_create(&frame, dialog.obj);
@@ -627,12 +723,6 @@ static void construct_cb(lv_obj_t *parent) {
     main_screen_lock_freq(true);
     main_screen_lock_band(true);
     freq_strip_set_offset(param_i_get(cfg_wspr_tx_freq));
-
-    if (param_f_get(cfg_pwr) > MAX_PWR) {
-        radio_set_pwr(MAX_PWR);
-        msg_update_text_fmt("Power limited to %.0f W", MAX_PWR);
-    }
-    base_gain_offset = tx_player_base_gain_offset();
 
     /* Uppercase call, 6-character locator (WSPRnet), 4 of them go on the air */
     snprintf(my_call, sizeof(my_call), "%s", call ? call : "");
@@ -679,6 +769,5 @@ static void destruct_cb(void) {
     main_screen_lock_freq(false);
     main_screen_lock_band(false);
     freq_strip_set_offset(-1);
-    radio_set_pwr(param_f_get(cfg_pwr));
     table = NULL;
 }

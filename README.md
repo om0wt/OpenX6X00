@@ -46,7 +46,11 @@ these; please give:
    the `app_logs` folder, from the card in a PC or from the web configurator's
    Files page. Each run of the radio software leaves one `x6100_log_*.txt`.
    From v0.3.4 a power-off with the POWER key saves the running one too, so
-   switch off right after the problem.
+   switch off right after the problem. For a start that stops at the boot
+   logo or a dark screen, attach `app_logs/start_trace.txt`: how far each
+   start got, from power-on (on the card's DATA partition in a PC when the
+   radio does not start far enough for the web configurator; see the manual's
+   Troubleshooting).
 6. **WiFi**: from v0.3.4 a failed join writes `app_logs/wifi.txt`, with no
    password in it. Add the exact message on the screen, the router's security
    (WPA2, WPA2/WPA3, WPA3 only), its 2.4 GHz channel, and whether a phone
@@ -58,7 +62,7 @@ these; please give:
 
 Open a [feature request](https://github.com/Guru-RF/OpenX6X00/issues/new?template=feature.yml)
 whose title starts with **Feature:** and names it in a few words
-(`Feature: Winlink over HF`), one feature per issue. Look at the open ones
+(`Feature: SOTA spots`), one feature per issue. Look at the open ones
 first: if the feature is there, add what you would use it for to that issue.
 Please give:
 
@@ -137,22 +141,22 @@ The patched X6100 base comes with its own instructions.
 | | |
 |---|---|
 | **Digital modes** | FT8, FT4 and FT2 (CQ, reply, auto sequence, Hound, POTA tag, ADIF log), JS8 (JS8Call compatible, all four speeds at once, inbox, relays, heartbeats, APRS), WSPR (decode and beacon, WSPRnet upload), PSK31, PSK63, Olivia, JTTY, RTTY, SSTV (receive with VIS, transmit with templates, denoise), WeFax, and NavTex with DSC (receive only). FT8, FT4, FT2, JS8, PSK, Olivia and JTTY decodes go to PSK Reporter (on by default), and the FT8 app sends WSJT-X UDP for GridTracker and loggers. No PC, no sound card cable: APP > Modes. |
-| **CW** | A decoder that copies down to about 0 dB SNR with Parse splitting run-together words, a CW keyboard with a send queue and Live mode, messages with `{CALL}` and `{HIS}`, USB and Bluetooth paddles, a CW trainer. |
-| **DX Cluster** | Spots on the waterfall, in a column beside it and in a full app that follows the VFO; filters by mode, band and activity (POTA, SOTA, WWBOTA, HOTA), alerts on calls and prefixes, spot snap when turning slowly; fifteen public servers built in, DXFUN by default. One login, a Link switch, and a login of its own if you set one (your call with `-2`, on the web Cluster page) so a logger can use the call at the same time. |
+| **CW** | A decoder that copies down to about 0 dB SNR with Parse splitting run-together words, CW as you type (a line on the main screen from a USB or Bluetooth keyboard, and the [CW Keyboard](docs/MANUAL.md#cw-keyboard) app, APP > CW Keyboard, with one or with the on-screen keyboard) with a send queue and Live mode that keys each letter as it is typed, messages with `{CALL}` and `{HIS}`, USB and Bluetooth paddles, a CW trainer. |
+| **DX Cluster** | Spots on the waterfall, in a column beside it and in a full app that follows the VFO; filters by mode, band, activity (POTA, SOTA, WWBOTA, HOTA) and the spotter's country (only the spots heard in PA and ON, say), alerts on calls and prefixes, spot snap when turning slowly; fifteen public servers built in, DXFUN by default. One login, a Link switch, and a login of its own if you set one (your call with `-2`, on the web Cluster page) so a logger can use the call at the same time. |
 | **Field Ops** | A second interface for SOTA, POTA, WWBOTA, HOTA, WWFF, TOTA, WCA, MOTA and lighthouse (LH, ARLHS) activations with big tiles for gloves: the summit or park found from the GPS or the locator, the references of the whole world offline after one Update list with internet, CQ, a log straight to ADIF with the references, self-spots to pota.app, wwbota.org, cqhota.app and the WWFF Spotline (the last two with your own key) and to the DX cluster (the only spot for SOTA, TOTA, WCA, MOTA and LH), QRZ Logbook upload. Tiles on the Air: the 6-character locator square you are in, from the GPS, with the eight around it. |
 | **Wavelog** | Every QSO the radio logs, in every mode, goes to your own [Wavelog](https://github.com/wavelog/wavelog) a few seconds later: a queue on the SD card while there is no network, the station profile chosen by the radio's callsign (DF8MH, DF8MH/P), the result on the display. |
-| **Winlink** | In the next release: Winlink email over HF from the radio alone, no computer and no internet: [Pat](https://getpat.io) is the mail program, its mailbox a web page on a phone or a laptop, and ARDOP the modem, through the radio's own audio. When Pat calls a gateway the radio tunes there in USB-D and keys itself. Turned on in the web configurator, Operating > Winlink, with your callsign, locator and Winlink password ([manual](docs/MANUAL.md#winlink)). |
+| **Winlink** | Winlink email over HF from the radio alone, no computer and no internet: [Pat](https://getpat.io) is the mail program, its mailbox a web page on a phone or a laptop, and ARDOP the modem, through the radio's own audio. When Pat calls a gateway the radio tunes there in USB-D and keys itself. Turned on in the web configurator, Operating > Winlink, with your callsign, locator and Winlink password ([manual](docs/MANUAL.md#winlink)). |
 | **Bands** | A live picture of 160 to 6 m from the cluster and the Reverse Beacon Network, and a test beacon that shows who hears you from your own antenna. |
-| **Radio** | IARU Region 1 band plan strip (60 m too, and a strip for each band you add), Birdie Cal (the radio's own carriers found, marked, notched), S-meter in bars or a needle, long-press actions on every key, editable bands, memories and channels, the broadcast bands in AM, transverters, RX recorder, screen recording and screenshots, voice messages, SWR scan, Walkie Talkie portrait mode, PRE and ATT on the VOL 2:2 page, local time on screen with UTC in the logs. |
-| **X6200** | SAM and WFM on the AM key, zoom 1 to 4 over the base's 384 kHz, the two-ring MFK, FM broadcast (87.5-108 MHz) and the airband (118-137 MHz) to receive after 6 m on the band keys, PRE and ATT on the VOL 2:2 page since it has no PRE key, the volume over the base's whole range (0 to 100). |
+| **Radio** | IARU Region 1 band plan strip (60 m too, and a strip for each band you add), 60 m on the band keys, which step over a band the radio cannot tune (4 m), a TX shift per band for FM repeaters and a QO-100 IF (split kept by itself, REV on the VFO key), Birdie Cal (the radio's own carriers found, marked, notched), S-meter in bars or a needle, long-press actions on every key, editable bands, memories and channels, the broadcast bands in AM, transverters, RX recorder, screen recording and screenshots, voice messages, SWR scan, Walkie Talkie portrait mode, PRE and ATT on the VOL 2:2 page, local time on screen with UTC in the logs. |
+| **X6200** | SAM and WFM on the AM key, zoom 1 to 4 over the base's 384 kHz, the two-ring MFK, FM broadcast (87.5-108 MHz) and the airband (118-137 MHz) to receive after 6 m on the band keys, a WR12 switch for Xiegu's 54 MHz-1 GHz receiver on the HOST port (2 m and 70 cm to receive; not yet tried with a WR12, [manual](docs/MANUAL.md#wr12-receiver-x6200)), transverters off by default (they put 2 m on 10 m), PRE and ATT on the VOL 2:2 page since it has no PRE key, the volume over the base's whole range (0 to 100). |
 | **Screen** | DRM/KMS output with the GUI on a transparent layer over a waterfall drawn one line at a time, about half the CPU of the old path; a main knob with every detent timed in its own thread and acceleration that grows with the speed. |
-| **Themes** | Every colour, corner, font and waterfall palette comes from the theme. RF.Guru, Classic, Outdoor, Outdoor-Negative, VISION, Black Metal, Total Black and RS come with the image; Holo and Material 3 are in [themes/](themes) to copy to the card; your own go on the card too ([docs/THEMES.md](docs/THEMES.md)). |
+| **Themes** | Every colour, corner, font and waterfall palette comes from the theme. RF.Guru, Classic, Outdoor, Outdoor-Negative, VISION, Black Metal and Total Black come with the image; Holo and Material 3 are in [themes/](themes) to copy to the card; your own go on the card too ([docs/THEMES.md](docs/THEMES.md)). |
 | **Wireless** | WiFi (a failed join says why on the screen), a USB Ethernet adapter with DHCP or a fixed address, USB tethering, a network name of your own; Bluetooth CAT for three clients, headphones and keyboards with pairings that survive a new image. |
 | **Browser panel** | `http://x6100.local/panel` (`x6200.local` on an X6200): the radio worked natively from a phone, a tablet or a PC, portrait or landscape: the spectrum and the waterfall live (tap or drag to tune, pinch to zoom), the frequency, band, mode, step and zoom, every switch and level, the S-meter, the DX spots (tap to tune), the FT8 app (decodes, tap to answer, CQ, auto, hold), the CW decoder's text, a log entry, RX audio and the browser's microphone for TX, a light theme for the sun. What the closed phone app does, as a web page. |
 | **Browser remote** | `http://x6100.local/remote` (Remote > Screen in the web menu): the radio's screen live in any browser (up to three browsers at a time, the Panel and Screen pages together), every key and knob, RX audio and the browser's microphone for TX, a Picture choice (Sharp, Balanced, Fast) for a slow link, for the radio's own menus and apps. |
 | **Remote station** | A browser watches until it is paired with a six-digit code from the radio; one holds the control at a time (a browser, a TCI client or the radio itself). Sound and Mic go over the TCI server; the microphone needs the https page. A key pressed without the control offers Take control, and Speaker always off (Settings > Audio) keeps the speaker silent. |
 | **Tailscale** | The radio on your own tailnet, so a laptop or a phone with Tailscale reaches it from anywhere (the configurator, the Panel and Screen pages, TCI) with nothing opened on the router. Turned on in Settings > Wireless or Remote > Tailscale; the login is a code on the radio's screen or a link on the web page. Tailscale's own build is downloaded once (37 MB) and checked against a pinned checksum ([manual](docs/MANUAL.md#tailscale)). |
-| **Web configurator** | `http://x6100.local/` (mDNS, `x6200.local` on an X6200, or the radio's IP): bands, digital frequencies, memories, cluster, Field Ops, Wavelog, CW messages, macros, logs, files, a gallery, backup and restore, display, time, network name, Ethernet, TCI, the update. No login; pages from other sites are refused. |
+| **Web configurator** | `http://x6100.local/` (mDNS, `x6200.local` on an X6200, or the radio's IP): bands, digital frequencies, memories, cluster, Field Ops, Wavelog, CW messages, macros, logs, files, a gallery, backup and restore, display, time, network name, Ethernet, TCI, the SSH keys (SSH takes keys only, no password), the update. No login; pages from other sites are refused. |
 | **TCI server** | The VFO-Knob and any TCI client on the network: tune, mode, filter, AGC, PTT, the meters and the audio both ways; the clients may be set to Listen only, all of them together. |
 
 ## Screenshots
@@ -318,10 +322,12 @@ Added:
   System > TCI on the web page. It carries `vfo`, `modulation`,
   `rx_filter_band`, `agc_mode`, RIT, `drive`, `trx` (PTT, with `,tci` for the
   client's audio as the microphone), the S-meter and the TX meters, the RX
-  audio stream (int16 mono, 24 kHz) and the TX audio frames. No login: set
-  Clients to Listen only, or turn it off, on a network you don't trust (the
-  browser pages' Sound and Mic go over it). Config in `/mnt/tci.conf`
-  (`enabled=0|1`, `port=50001`, `trust=operate|view`);
+  audio stream (in the format each client asks for: TCI's 48 kHz float32
+  stereo by default, 24 kHz int16 mono for the VFO-Knob and the browser
+  pages) and the TX audio frames. No login: set Clients to Listen only, or
+  turn it off, on a network you don't trust (the browser pages' Sound and Mic
+  go over it). Config in `/mnt/tci.conf` (`enabled=0|1`, `port=50001`,
+  `trust=operate|view`);
 - the **browser panel and remote**, local only, on the radio's own WebSocket
   (port 50002, no outside server), with pairing and one control holder, in
   place of the Link's;
@@ -331,7 +337,12 @@ Added:
   network name (mDNS);
 - the RF.Guru default theme and the OpenX6X00 boot logo;
 - a local configurator socket (`/tmp/x6100_cfg.sock`) for the web pages that
-  set the display and the Ethernet port, in place of the remote socket.
+  set the display and the Ethernet port, in place of the remote socket;
+- **SSH with keys only**: every radio had the same root password, so password
+  logins are off. Add your computer's public key on the web configurator,
+  System > SSH (`ssh-keygen -t ed25519` makes one; paste the line of
+  `~/.ssh/id_ed25519.pub`), then `ssh root@x6100.local`
+  ([manual](docs/MANUAL.md#ssh)).
 
 ## Build
 
@@ -391,10 +402,10 @@ rootfs/                  init scripts, helper scripts (x6100-update, x6100-field
                          x6100-broadcast-update, x6100-hostname, x6100-tailscale, x6100-wifilog,
                          btcat-ctl, btaudio-ctl), data files
 btcat/ bootanim/         Bluetooth CAT bridge, boot animation
-boot/ u-boot/            boot logo, the U-Boot binary written over buildroot's (X6100 image)
+boot/                    boot logo
 sql/                     the default params.db
-themes/                  the RS theme (installed, copied to the card at the first start),
-                         the Holo and Material 3 JSON themes to copy by hand
+themes/                  the Holo and Material 3 JSON themes to copy by hand; make_rs.py, an
+                         RS-BA1 look cut from a screenshot (personal use, not installed)
 buildroot/               local-build.sh and Dockerfile (the image), br2_external/ and x6200/
                          (what it adds to and patches in the buildroot trees),
                          build.sh (the GUI alone with the buildroot toolchain)

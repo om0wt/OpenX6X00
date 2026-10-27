@@ -23,6 +23,7 @@ closed v0.129, finds the same things under these names:
 | SWR Scan, "Sweep, transmits" | SWR scan, "SWR sweep, transmits" | |
 | Recorder, "RX audio" | Recorder, "Record and play RX" | the RX recorder |
 | CW Trainer, "Learn CW" | CW Trainer, "Learn CW" | |
+| CW Keyboard, "CW as you type" | - | the CW Keyboard app: with Live each letter is keyed as it is typed |
 | GPS, "Position, time" | GPS, "Position and time" | |
 | Screen Rec, "Screen and audio" | Screen Rec, "Record screen and audio" | starts or stops a screen recording |
 | Walkie, "Portrait screen" | Settings > Walkie | the Walkie Talkie screen |
@@ -40,7 +41,7 @@ of text for NavTex.
 
 | Here | There (v0.129) |
 |---|---|
-| General (station, date and time, controls, transverters, TCI server) | Station, "Call, clock" |
+| General (station, date and time, controls, transverters, WR12 on the X6200, TCI server) | Station, "Call, clock" |
 | Display (backlight, spectrum, waterfall, main screen, interface) | Display, "Screen, theme" |
 | Audio (RX and TX audio, microphone, VOX, AGC) | Audio, "Mic, VOX, AGC" |
 | Wireless (WiFi, Ethernet) | Wireless |

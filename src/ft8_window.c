@@ -36,6 +36,7 @@
 #include "gui_events.h"
 #include "flags.h"
 #include "freq_strip.h"
+#include "gps.h"
 #include "ft8_udp.h"
 #include "js8_map.h"
 #include "key_input.h"
@@ -452,18 +453,25 @@ static void clear_view(void) {
     lv_event_send(table_view_obj(), LV_EVENT_KEY, &up);
 }
 
-/* The decoder again from the start: after a change of dial frequency or mode */
-static void decoder_restart(void) {
+/* The decoder again from the start: after a change of dial frequency or mode. The queued
+ * message goes with it, and TX CQ with a CQ: left on, it called nothing, and took two presses
+ * to call again (#28). Returns whether a CQ ended */
+static bool decoder_restart(void) {
+    bool cq = subject_i_get(cq_enabled);
+
+    subject_i_set(cq_enabled, false);
     decoder_stop();
     decoder_start();
     clear_view();
+    return cq;
 }
 
-/* After any change of dial frequency */
+/* After any change of dial frequency. A CQ that ended says so after the band's label: the
+ * band keys work from any button page, TX CQ may not be in view */
 static void retuned(void) {
     hound_stop(&hound);
     js8_map_heard_clear();
-    decoder_restart();
+    if (decoder_restart()) msg_schedule_text_fmt("CQ off: press TX CQ to call on this frequency");
 }
 
 static void band_cb(lv_event_t *e) {
@@ -618,8 +626,7 @@ static void mode_cb(button_data_t *btn) {
 
     param_i_set(cfg_ft8_protocol, next);
     freq_strip_set_app(ftx_protocol_name(next));
-    subject_i_set(cq_enabled, false);
-    decoder_restart();
+    decoder_restart();      /* a CQ ends with no note: TX CQ is next to Mode */
     if (params.ft8_custom_on.x) params_bool_set(&params.ft8_custom_on, false); /* FT4/FT2 elsewhere */
     if (next != FTX_PROTOCOL_FT8) hound_on = false;
     load_band(0);
@@ -718,20 +725,50 @@ static void cq_modifier_cb(button_data_t *btn) {
     kb_open = true;
 }
 
-/* The system clock to the nearest slot start: for a clock off by a few seconds */
-static void time_sync_cb(button_data_t *btn) {
-    time_t now  = time(NULL);
-    float  slot = ftx_slot_time(cur_proto());
-    float  off  = fmodf((uint8_t)(now % 60) + slot / 2, slot) - slot / 2;
+/* Time Sync, pressed as a slot starts: the system clock to the nearest slot start, for a clock
+ * off by a few seconds with nothing to set it. A clock that ntpd keeps (WiFi, or the GPS through
+ * it) is right already, and moved to where the press fell it would be off by up to half a slot:
+ * it is left alone. The step is taken from the time to the nanosecond (FT4's and FT2's slots
+ * start on fractions of a second, whole seconds missed them), and only a clock that moved goes
+ * into the RTC */
+#define SYNC_GPS_AGE_S  10      /* a GPS fix this recent: gpsd feeds ntpd */
+#define SYNC_ON_SLOT_NS 50000000
 
-    struct timespec ts = {.tv_sec = now - (int)off};
+static void time_sync_cb(button_data_t *btn) {
+    struct timespec now;
+    double          lat, lon;
+    int             err_ms, age;
+    int64_t         off, t;
+
+    if (ftx_clock_synced(&err_ms)) {
+        msg_update_text_fmt("Clock in sync (NTP, within %d ms): no Time Sync needed", err_ms);
+        return;
+    }
+    if (gps_last_fix(&lat, &lon, &age) && age <= SYNC_GPS_AGE_S) {
+        msg_update_text_fmt("The GPS keeps the clock: no Time Sync needed");
+        return;
+    }
+    clock_gettime(CLOCK_REALTIME, &now);
+    off = ftx_slot_offset_ns(now.tv_sec, now.tv_nsec, ftx_slot_time(cur_proto()));
+    if (llabs(off) < SYNC_ON_SLOT_NS) {
+        msg_update_text_fmt("Clock on the slot already (%+.2f s)", off / 1e9);
+        return;
+    }
+    clock_gettime(CLOCK_REALTIME, &now);    /* the step on the time as it is now: nothing lost */
+    t = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec - off;
+
+    struct timespec ts = {.tv_sec = t / 1000000000LL, .tv_nsec = t % 1000000000LL};
 
     if (clock_settime(CLOCK_REALTIME, &ts)) {
-        LV_LOG_ERROR("Can't set system time: %s\n", strerror(errno));
+        const char *why = strerror(errno);
+
+        LV_LOG_ERROR("Can't set system time: %s\n", why);
+        msg_update_text_fmt("Time Sync: the clock can't be set (%s)", why);
         return;
     }
     /* into the RTC too, in UTC as the kernel reads it at boot: kept across a power-off */
     sh_run("hwclock -w -u -f /dev/rtc1", NULL, NULL);
+    msg_update_text_fmt("Clock moved %+.2f s to the slot start", -off / 1e9);
 }
 
 static void map_cb(button_data_t *btn) {
@@ -1013,6 +1050,9 @@ static void list_pressed(const cell_data_t *cd) {
         return;
     }
 
+    char was[sizeof(tx_msg.msg)];
+
+    snprintf(was, sizeof(was), "%s", tx_msg.msg);
     ftx_qso_processor_start_qso(qso, (ftx_msg_meta_t *)&cd->meta, &tx_msg);
     if (!tx_msg.msg[0]) {
         msg_schedule_text_fmt("Invalid message");
@@ -1023,6 +1063,10 @@ static void list_pressed(const cell_data_t *cd) {
     if (!param_i_get(cfg_ft8_hold_freq)) set_tx_freq(cd->meta.freq_hz);
     tx_odd = !cd->odd;
     subject_i_set(tx_enabled, true);
+    /* The answer took the CQ's place: CQ off, as when the sequence answers (#28). Told by a change
+     * of the message, as add_rx_text does, not by a "CQ" at its start: a call can begin with CQ
+     * (CQ7X). A 73 addressed to me leaves the message as it was, and the CQ goes on */
+    if (strcmp(was, tx_msg.msg)) subject_i_set(cq_enabled, false);
 
     cell_data_t row = {.cell_type = CELL_START_QSO};
 
@@ -1498,7 +1542,8 @@ bool ft8_window_remote(ft8_rc_t what, int32_t arg, const cell_data_t *cell) {
     switch (what) {
         case FT8_RC_CQ:     tx_cq_cb(NULL); break;
         case FT8_RC_STOP:
-            if (subject_i_get(cq_enabled)) tx_cq_cb(NULL);     /* off, and the message dropped */
+            /* CQ off here, not through tx_cq_cb: that does nothing while a keyboard is open on the radio */
+            subject_i_set(cq_enabled, false);
             tx_call_off();
             tx_msg.msg[0] = '\0';
             msg_schedule_text_fmt("Stopped: nothing transmits until TX Call, CQ or a call is pressed");

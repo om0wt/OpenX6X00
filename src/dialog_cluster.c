@@ -69,6 +69,7 @@
 #define ALERT_REPEAT_S  600  /* the same call on the same band: once per 10 min */
 #define ALERT_SEEN      64
 #define ALERTS_SEEN_FILE "/tmp/cluster_alerts_seen" /* pattern|freq_hz|utc_min, for the web page */
+#define LINK_FILE        "/tmp/cluster_link"        /* state|host:port|text: the status line, for the web page */
 
 static void construct_cb(lv_obj_t *parent);
 static void destruct_cb(void);
@@ -87,6 +88,7 @@ static void server_cb(button_data_t *data);
 static bool popup_key(uint32_t key);
 static void use_server(int i);
 static void alert_scan(void);
+static void link_write(void);
 
 static buttons_page_t btn_page_1, btn_page_2;
 
@@ -149,6 +151,7 @@ static uint16_t now_min;
 static char     server[128];
 static int      server_port;
 static time_t   conf_mtime;
+static bool     link_on; /* the Link switch as load_server() last read it: what the client was told */
 static char     client_call[sizeof(params.callsign.x)];
 static bool     wifi_was_up;
 
@@ -161,7 +164,8 @@ static void load_server(void) {
     cluster_config_load(server, sizeof(server), &server_port);
     snprintf(client_call, sizeof(client_call), "%s", params.callsign.x);
     cluster_config_login(login, sizeof(login), client_call);
-    if (client_call[0] && login[0] && cluster_config_enabled()) cluster_client_start(server, server_port, login);
+    link_on = cluster_config_enabled();
+    if (client_call[0] && login[0] && link_on) cluster_client_start(server, server_port, login);
     else cluster_client_stop();
 }
 
@@ -174,6 +178,7 @@ static void background_cb(lv_timer_t *t) {
     if (up && !wifi_was_up) cluster_client_retry();
     wifi_was_up = up;
     alert_scan();
+    link_write();
 }
 
 void dialog_cluster_start_client(void) {
@@ -460,7 +465,7 @@ static void update_header(void) {
     lv_label_set_text_fmt(head_mid, "#%06x %s# - VFO #%06x %d.%03d.%02d#", theme_hex(TC_text),
                           showing_all() ? "All" : cluster_band_name(vfo_band()), theme_hex(TC_text), vfo / 1000000,
                           (vfo / 1000) % 1000, (vfo % 1000) / 10);
-    bool conf_filtered = flt && (flt->modes != CLUSTER_FM_ALL || flt->max_age || flt->skip[0]);
+    bool conf_filtered = flt && (flt->modes != CLUSTER_FM_ALL || flt->max_age || flt->skip[0] || flt->spotter_dxcc[0]);
     if (view_mode || conf_filtered) {
         static const char *const names[] = {"Filtered", "CW only", "SSB only", "", "DIG only"};
         lv_label_set_text_fmt(head_right, "%s - %d/%d - %02d:%02dZ", names[view_mode], view_count,
@@ -470,38 +475,76 @@ static void update_header(void) {
     }
 }
 
-static void update_status(void) {
+/* The link in words, as the status line says it, and its colour; *word names the state for the web page: nocall,
+ * off, nonet, connecting, connected, failed or stopped. On or off is what the client was told, not cluster.conf
+ * read again: the web page's "stale" compares the two, so it shows a change the radio missed */
+static uint32_t link_status(char *text, size_t size, const char **word) {
     char            detail[64];
     cluster_state_t st = cluster_client_state(detail, sizeof(detail));
 
     if (!params.callsign.x[0]) {
-        lv_label_set_text_fmt(status_right, "#%06x Set your callsign: Settings > General#", theme_hex(TC_err));
-        return;
+        *word = "nocall";
+        snprintf(text, size, "Set your callsign: Settings > General");
+        return theme_hex(TC_err);
     }
-    if (!cluster_config_enabled()) {
-        lv_label_set_text(status_right, "Cluster link off");
-        return;
+    if (!link_on) {
+        *word = "off";
+        snprintf(text, size, "Cluster link off");
+        return COLOR_DIM;
     }
     if (!net_connected()) {
-        lv_label_set_text_fmt(status_right, "#%06x No network: WiFi or Ethernet#", theme_hex(TC_err));
-        return;
+        *word = "nonet";
+        snprintf(text, size, "No network: WiFi or Ethernet");
+        return theme_hex(TC_err);
     }
     switch (st) {
         case CLUSTER_CONNECTED:
-            lv_label_set_text_fmt(status_right, "#%06x %s - cluster connected#", theme_hex(TC_ok), wifi_eth_active() ? "Ethernet" : "WiFi");
-            break;
+            *word = "connected";
+            if (strncmp(detail, "logged in as ", 13) == 0) {
+                snprintf(text, size, "Logged in as %s", detail + 13);
+                return theme_hex(TC_ok);
+            }
+            snprintf(text, size, "%s - logging in...", wifi_eth_active() ? "Ethernet" : "WiFi");
+            return theme_hex(TC_warn);
         case CLUSTER_CONNECTING:
-            lv_label_set_text_fmt(status_right, "#%06x Connecting...#", theme_hex(TC_warn));
-            break;
+            *word = "connecting";
+            snprintf(text, size, "Connecting...");
+            return theme_hex(TC_warn);
         case CLUSTER_FAILED:
-            lv_label_set_text_fmt(status_right, "#%06x %s, %s#", theme_hex(TC_err), detail[0] ? detail : "Cluster error",
-                                  strncmp(detail, "refused", 7) == 0 || strncmp(detail, "logged in", 9) == 0
-                                      ? "retry in 30 min" : "retrying");
-            break;
+            *word = "failed";
+            snprintf(text, size, "%s, %s", detail[0] ? detail : "Cluster error",
+                     strncmp(detail, "refused", 7) == 0 || strncmp(detail, "logged in", 9) == 0 ? "retry in 30 min"
+                                                                                               : "retrying");
+            return theme_hex(TC_err);
         default:
-            lv_label_set_text(status_right, "Stopped");
-            break;
+            *word = "stopped";
+            snprintf(text, size, "Stopped");
+            return COLOR_DIM;
     }
+}
+
+static void update_status(void) {
+    char        text[96];
+    const char *word;
+    uint32_t    color = link_status(text, sizeof(text), &word);
+
+    lv_label_set_text_fmt(status_right, "#%06x %s#", color, text);
+}
+
+/* LINK_FILE when the status line changed, also while the app is closed: the web page's Link card shows how the
+ * login goes and whether the radio took up a change made there (issue #23) */
+static void link_write(void) {
+    static char last[320];
+    char        text[96], line[sizeof(last)];
+    const char *word;
+
+    link_status(text, sizeof(text), &word);
+    snprintf(line, sizeof(line), "%s|%s:%d|%s\n", word, server, server_port, text);
+    if (strcmp(line, last) == 0) return;
+    FILE *f = fopen(LINK_FILE ".tmp", "w");
+    if (!f) return;
+    fputs(line, f);
+    if (fclose(f) == 0 && rename(LINK_FILE ".tmp", LINK_FILE) == 0) memcpy(last, line, sizeof(last));
 }
 
 static void timer_cb(lv_timer_t *t) {

@@ -59,8 +59,8 @@ bool cluster_enabled_save(bool on);
  * one login to the cluster), else `callsign` */
 void cluster_config_login(char *out, size_t size, const char *callsign);
 
-/* Modification time of CLUSTER_CONF, 0 when missing: the app reloads the
- * server when the file changes (e.g. from the web configurator). */
+/* A stamp of CLUSTER_CONF (its mtime, inode and size), 0 when missing: the app reloads the server when it changes
+ * (e.g. from the web configurator). Not a time: compare it, nothing else. */
 time_t cluster_config_mtime(void);
 
 /* Filters and alerts, from the same file (the web page writes them):
@@ -69,6 +69,8 @@ time_t cluster_config_mtime(void);
  *   skip_spotters=K1TTT-#,*-3     spotter calls hidden, * matches any run
  *   filter_bands=40,20,6          bands shown (missing: all)
  *   filter_activity=POTA,SOTA,WWBOTA,HOTA   only these activations (missing: all spots)
+ *   filter_spotter_dxcc=PA,ON     only spots heard in these countries: the spotter's call, by cty.dat (missing or
+ *                                 no prefix it knows: all). The client drops the others as they come in
  *   alert=PATTERN|bands|mode      e.g. VP8*|20,17,15|CW (bands, mode: empty = any)
  *   alert_off=PATTERN|bands|mode  an alert turned off: kept in the list, not used
  *   alert_popup=1, alert_beep=1
@@ -98,6 +100,7 @@ typedef struct {
     uint8_t         activity; /* CLUSTER_ACT_* bits, 0 = all spots */
     uint16_t        max_age;
     char            skip[128];
+    char            spotter_dxcc[128]; /* filter_spotter_dxcc= as written: the client applies it, "" = none */
     cluster_alert_t alerts[CLUSTER_MAX_ALERTS];
     int             alert_count;
     bool            popup, beep;
@@ -148,6 +151,8 @@ void cluster_client_retry(void);
  * the count, or -1 when nothing changed. */
 int cluster_client_snapshot(cluster_spot_t *out, int max, uint32_t *gen);
 
+/* The state, and its detail: why it failed, or while connected "logging in", then "logged in as CALL" once the
+ * call was sent (a node that refuses it says so next: CLUSTER_FAILED) */
 cluster_state_t cluster_client_state(char *detail, size_t size);
 
 

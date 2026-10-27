@@ -10,6 +10,7 @@
  *    {"cmd":"eth_set","dhcp":0|1,"ip":..,"mask":..,"gw":..,"dns":..}
  *    {"cmd":"txcal_start"} / {"cmd":"txcal_stop"}      -> {"t":"ok"}: the TX calibration (tx_autocal.cpp)
  *    {"cmd":"txcal_get"}                              -> {"t":"txcal","running":bool,"status":"lines"}
+ *    {"cmd":"band_use","lo":hz,"hi":hz}               -> {"t":"band_use","use":0|1|2} (none, receive, transmit)
  *  The values are checked here and applied on the LVGL thread through the scheduler, as the
  *  Settings pages apply them.
  *
@@ -82,6 +83,10 @@ static const struct {
     {"indep_vfo", &cfg_sm.p_indep_vfo, 0, 1},           /* Station: independent VFOs */
     {"mode_from_plan", &cfg_sm.p_mode_from_plan, 0, 1}, /* Station: the mode follows the band plan */
     {"birdie_marks", &cfg_sm.p_birdie_marks, 0, 2},     /* Main screen: Birdie Cal's carriers */
+    {"zoom_step_per_mode", &cfg_sm.p_zoom_step_per_mode, 0, 1},   /* Main screen: live, zoom_step_scope follows it */
+#ifdef BOARD_X6200
+    {"wr12", &cfg_sm.p_wr12, 0, 1},                     /* live: screen_main.c follows it; the X6100 has no row */
+#endif
 };
 
 static const struct {
@@ -298,6 +303,20 @@ static int txcal_get(char *out, size_t size) {
     return l;
 }
 
+/* What the radio can do somewhere in [lo, hi] Hz (band_use: HF, the transverters that are on, the X6200's receive
+ * ranges): the web Bands page checks a TX shift with it. Read only, answered from this thread */
+static const char *band_use_get(cJSON *req, char *out, size_t size, int *l) {
+    cJSON *lo = cJSON_GetObjectItemCaseSensitive(req, "lo");
+    cJSON *hi = cJSON_GetObjectItemCaseSensitive(req, "hi");
+
+    if (!cJSON_IsNumber(lo) || !cJSON_IsNumber(hi) || lo->valuedouble < -2e9 || hi->valuedouble > 2e9 ||
+        lo->valuedouble > hi->valuedouble)
+        return "Invalid range";
+    *l = snprintf(out, size, "{\"t\":\"band_use\",\"use\":%d}\n",
+                  (int)cfg_sm.band_use((int32_t)lo->valuedouble, (int32_t)hi->valuedouble));
+    return NULL;
+}
+
 /* The answer to one request line */
 static int handle_line(const char *line, char *out, size_t size) {
     cJSON      *req  = cJSON_Parse(line);
@@ -325,6 +344,8 @@ static int handle_line(const char *line, char *out, size_t size) {
         if (!scheduler_put_noargs(txcal_stop_cb)) err = "Busy, try again";
     } else if (!strcmp(name->valuestring, "txcal_get")) {
         l = txcal_get(out, size);
+    } else if (!strcmp(name->valuestring, "band_use")) {
+        err = band_use_get(req, out, size, &l);
     } else {
         err = "Unknown command";
     }

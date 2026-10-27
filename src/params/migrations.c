@@ -247,6 +247,79 @@ static int _9_vhf_rx_bands() {
     return 0;
 }
 
+/* 60 m, WRC-15 (5351.5-5366.5 kHz), for the band keys: the list had none, they went from 80 m to 40 m (issue #22).
+ * Opens at 5.360 MHz in USB, the sideband used there. Not where a band already covers part of it (a "60m CW" added
+ * on the web page), nor on a new database, which has it from sql/params.sql */
+static int _10_band_60m() {
+    if (sqlite3_exec(db,
+                     "INSERT OR IGNORE INTO bands SELECT 13, '60m', 5351500, 5366500, 1 WHERE NOT EXISTS "
+                     "(SELECT 1 FROM bands WHERE start_freq < 5366500 AND stop_freq > 5351500);"
+                     /* its opening frequency and mode only when the row is this band, not a user's band with the id */
+                     "INSERT OR IGNORE INTO band_params SELECT 13, 'vfoa_freq', 5360000 WHERE EXISTS "
+                     "(SELECT 1 FROM bands WHERE id = 13 AND name = '60m');"
+                     "INSERT OR IGNORE INTO band_params SELECT 13, 'vfoa_mode', 2 WHERE EXISTS "
+                     "(SELECT 1 FROM bands WHERE id = 13 AND name = '60m');",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        printf("Cannot add 60 m: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    return 0;
+}
+
+/* The X6200's two transverters are off by default now (a shift of 0, settings_manager.h): its 2 m and 70 cm are the
+ * WR12's, to receive. One set up before (a row saved for it) keeps its shift, the old default where only its edges
+ * were changed. The X6100 keeps its transverters as they were */
+static int _11_x6200_transverters_off() {
+#ifdef BOARD_X6200
+    if (sqlite3_exec(db,
+                     "INSERT OR IGNORE INTO transverter SELECT DISTINCT id, 'shift', "
+                     "CASE id WHEN 0 THEN 116000000 ELSE 404000000 END FROM transverter WHERE id IN (0, 1);",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        printf("Cannot keep the transverters: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+/* Settings > Audio's Play and Rec gain sliders wrote their dB value into the Line-in too, as a whole number (0 at
+ * 0 dB and below), and it was saved: on the X6200 the apps' audio then reached the base at next to nothing and FT8
+ * went out at 0 W, across updates (#16). Back to the default 10 where the Line-in is still what one of those sliders
+ * put there; one set on its own row afterwards stays */
+static int _12_line_in_restore() {
+    if (sqlite3_exec(db,
+                     "UPDATE params SET val = 10 WHERE name = 'line_in' AND val < 10 AND val IN "
+                     "(SELECT MAX(0, CAST(g.val AS INTEGER)) FROM params AS g "
+                     "WHERE g.name IN ('play_gain_db_f', 'rec_gain_db_f'));",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        printf("Cannot restore the Line-in: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    return 0;
+}
+
+/* gdyuldin's stock X6200 GUI saves three transverters of its own, all nine values: 70-72 MHz shift 42 MHz (4 m),
+ * 144-150 shift 116 and 432-438 shift 404, all through a 28 MHz IF. A radio that ran it before ours kept them: _11
+ * took them for the user's and left them on, and our transverter 1 is its first row, 4 m. Exactly those nine rows and
+ * nothing else are the stock GUI's, not the user's: they go, and the transverters are off as on a new radio. Any
+ * other row or value keeps them all (the bench X6200, 2026-10-26) */
+static int _13_x6200_stock_transverters() {
+#ifdef BOARD_X6200
+    if (sqlite3_exec(db,
+                     "DELETE FROM transverter WHERE (SELECT count(*) FROM transverter) = 9 AND 9 = "
+                     "(SELECT count(*) FROM transverter AS t JOIN (VALUES "
+                     "(0, 'from', 70000000), (0, 'to', 72000000), (0, 'shift', 42000000), "
+                     "(1, 'from', 144000000), (1, 'to', 150000000), (1, 'shift', 116000000), "
+                     "(2, 'from', 432000000), (2, 'to', 438000000), (2, 'shift', 404000000)) AS s "
+                     "ON t.id = s.column1 AND t.name = s.column2 AND t.val = s.column3);",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        printf("Cannot remove the stock transverters: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+#endif
+    return 0;
+}
+
 static int (*migrations[])() = {
     _0_init_migrations,
     _1_create_ftx_table,
@@ -258,6 +331,10 @@ static int (*migrations[])() = {
     _7_add_ft2_presets,
     _8_fix_comp_offsets,
     _9_vhf_rx_bands,
+    _10_band_60m,
+    _11_x6200_transverters_off,
+    _12_line_in_restore,
+    _13_x6200_stock_transverters,
 };
 
 int migrations_apply(void) {

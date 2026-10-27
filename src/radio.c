@@ -50,6 +50,8 @@
 #include "base_guard.h"
 #include "audio.h"
 #include "bat_est.h"
+#include "bat_watch.h"
+#include "start_trace.h"
 #include "clock.h"
 #include "wifi.h"
 
@@ -62,15 +64,12 @@
 #define KEEPALIVE_MS        1000    /* HW_CAP_KEEPALIVE: as gdyuldin's X6200 GUI, in TX too */
 #define RESYNC_RETRY_MS     200     /* the register block again, after one that didn't get through */
 #define MORSE_HANG_MS       3000    /* the base holds TX for the QSK time after the GUI's CW key */
+#define ATU_START_MS        3000    /* the base keys for the tuner within this, or the tune is given up */
+#define ATU_NO_MATCH_MS     1000    /* back in RX this long without the tuner's done flag: no match */
 
 #define FILTER_2_OFFSET 60
 #define FILTER_2_OFFSET_IN 20
 #define FILTER_2_OFFSET_OUT (FILTER_2_OFFSET - FILTER_2_OFFSET_IN)
-
-/* Battery voltage in 0.1 V units; LOW + HYSTERESIS = HIGH (upstream 21c2b93) */
-#define LOW_BATTERY_VBAT_LOW     60
-#define LOW_BATTERY_HYSTERESIS   2
-#define LOW_BATTERY_VBAT_HIGH    (LOW_BATTERY_VBAT_LOW + LOW_BATTERY_HYSTERESIS)
 
 /**********************
  *      MACROS
@@ -100,6 +99,7 @@ static void radio_lock();
 static void radio_unlock();
 
 static void on_vfo_freq_change(Subject *subj, void *user_data);
+static void on_transverter_change(Subject *subj, void *user_data);
 static void on_vfo_mode_change(Subject *subj, void *user_data);
 static void on_vfo_agc_change(Subject *subj, void *user_data);
 static void on_cw_agc_cond_change(Subject *subj, void *user_data);
@@ -171,14 +171,16 @@ static uint8_t          pack_vbat, pack_vext;   /* its voltages, 0.1 V */
 static volatile int8_t  bat_pct = -1;   /* the battery %, -1 on external power or not measured yet */
 static bool             mute = false;
 static bool             tci_mute = false;   /* a TCI client transmits: the speaker and the monitor off */
-static bool             rec_moni = false;   /* a screen recording takes the TX audio: the monitor at 30 at least */
+static bool             rec_moni = false;   /* a screen recording takes the TX audio: the monitor at 30 at least (X6100) */
 static bool             digi_cap;       /* a digital app is open: never above its cap */
 
 static tx_watch_t       tx_watch;
 static bool             resync_due;     /* resend the whole register block (base_guard.h) */
 static uint64_t         resync_time;
+static uint64_t         block_time;     /* the whole register block last sent (resend_all), radio thread only */
 static volatile bool    morse_on;
 static volatile uint32_t morse_ms;      /* the GUI's CW key last changed */
+static uint64_t         atu_time;       /* the tune asked, then the base last seen in TX for it */
 
 static void power_key_cb(void *arg) {
     keypad_power_set(*(bool *)arg);
@@ -200,31 +202,49 @@ void radio_bb_reset() {
 }
 
 void radio_init() {
-    if (!hw_init())
+    if (!hw_init()) {
+        start_trace("base: its pins or its line could not be opened");
         return;
+    }
 
     /* Back off (0.1 .. 25.6 s) and, once, after about 6 s without an answer,
      * pulse the baseband reset pin instead of waiting forever (upstream 37f3894) */
-    uint8_t cnt = 0;
+    uint8_t  cnt = 0;
+    unsigned tries = 0;
 
     while (!hw_control_init()) {
+        start_trace("base: no answer (try %u)", ++tries);
         usleep(100000 << cnt);
         if (cnt < 8) cnt++;
         if (cnt == 6) {
             fprintf(stderr, "Baseband not answering, reset\n");
+            start_trace("base: reset");
             radio_bb_reset();
             usleep(1000000);
         }
     }
+    start_trace("base answered");
 }
 
 void radio_start() {
 
     hw_start();
     base_ver = hw_base_ver();
+    start_trace("base: version %s", hw_base_ver_str());
+    /* What the digital TX level comes from, for a report of an app at 0 W (#16); the base version was nowhere */
+    fprintf(stderr, "radio: base %s, line_in %u, line_out %u, play %.1f dB, rec %.1f dB, digital level %.1f dB\n",
+            hw_base_ver_str(), params.line_in, params.line_out, params.play_gain_db_f.x, params.rec_gain_db_f.x,
+            params.ft8_output_gain_offset.x);
 
     subject_subscribe_and_notify((Subject*)cfg_band_vfoa_freq, on_vfo_freq_change, (void*)RADIO_VFO_A);
     subject_subscribe_and_notify((Subject*)cfg_band_vfob_freq, on_vfo_freq_change, (void*)RADIO_VFO_B);
+
+    subject_subscribe((Subject*)cfg_transverter_0_from, on_transverter_change, NULL);
+    subject_subscribe((Subject*)cfg_transverter_0_to, on_transverter_change, NULL);
+    subject_subscribe((Subject*)cfg_transverter_0_shift, on_transverter_change, NULL);
+    subject_subscribe((Subject*)cfg_transverter_1_from, on_transverter_change, NULL);
+    subject_subscribe((Subject*)cfg_transverter_1_to, on_transverter_change, NULL);
+    subject_subscribe((Subject*)cfg_transverter_1_shift, on_transverter_change, NULL);
 
     subject_subscribe_and_notify((Subject*)cfg_band_vfoa_mode, on_vfo_mode_change, (void*)RADIO_VFO_A);
     subject_subscribe_and_notify((Subject*)cfg_band_vfob_mode, on_vfo_mode_change, (void*)RADIO_VFO_B);
@@ -378,6 +398,53 @@ bool radio_check_freq(int32_t freq) {
     return cfg_is_valid_hw_freq(freq);
 }
 
+/* With a TX shift the frequency the shift asks for, not the other VFO's: that VFO is held to 100 kHz and up, so a
+ * shift below 0 Hz left it at 100 kHz, which can transmit and keyed there. This one is refused (tx_refused) and red
+ * on the screen instead */
+int32_t radio_tx_freq(void) {
+    int32_t shift = param_i_get(cfg_band_tx_shift);
+    int32_t fg = cparam_i_get(cfg_fg_freq);
+
+    if (!param_i_get(cfg_band_split)) {
+        return fg;
+    }
+    if (shift) {
+        return param_i_get(cfg_band_current_vfo) == RADIO_VFO_A ? fg + shift : fg - shift;
+    }
+    return cparam_i_get(cfg_bg_freq);
+}
+
+/* The base's split bit off while the active VFO carries the TX frequency (radio_set_tx_freq) */
+static atomic_bool split_held;
+
+/* The VFO the radio transmits on to `freq`. In split that is the active VFO, with the base's split bit off until
+ * radio_set_tx_freq(0): the X6200's base (1.0.8) sent the apps' tone from VFO A whatever B said, an FT8 CQ at
+ * 1200 Hz with a +700 Hz TX shift on 14.074 heard at 14.075325 (A + 1325, PSK Reporter, 2026-10-26); moving the
+ * active VFO without split is the path both bases take. radio_set_freq moved the active one in split, so FT8 and the
+ * other apps sent their tone at B + 1325 Hz, and never restored the IF shift (the X6100's VFO stayed off by it) */
+void radio_set_tx_freq(int32_t freq) {
+    radio_vfo_t vfo = param_i_get(cfg_band_current_vfo);
+
+    if (freq == 0) {
+        /* Both VFOs on their own frequency, transverter and IF shift as tuned: the one that transmits can have
+         * changed since (split off during an SWR scan left B on a sweep point); one that did not move is not resent */
+        on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
+        on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
+        if (atomic_exchange(&split_held, false)) {
+            WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, param_i_get(cfg_band_split)));
+        }
+        return;
+    }
+    if (!cfg_is_tx_freq(freq)) {
+        LV_LOG_ERROR("TX freq %i incorrect", freq);
+        return;
+    }
+    if (param_i_get(cfg_band_split) && !atomic_exchange(&split_held, true)) {
+        WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, false));
+    }
+    WITH_RADIO_LOCK(hw_vfo_set_freq(vfo, freq - cfg_transverter_shift_for(freq)));
+}
+
 uint16_t radio_change_vol(int16_t df) {
     int32_t vol = param_i_get(cfg_volume);
     if (df == 0) {
@@ -405,13 +472,20 @@ void radio_change_mute() {
 
 /* Speaker AF and TX monitor together: both 0 when muted, with Speaker always off (a remote station), when btaudio
  * silences the speaker (headphones connected) or while a TCI client transmits; the monitor 0 at AF 0 too, which otherwise still played FT8's
- * tones (issue #1). A screen recording keeps the monitor at 30 at least, but not under a TCI client's PTT */
+ * tones (issue #1). A screen recording keeps the monitor at 30 at least on the X6100, but not under a TCI client's PTT */
 void radio_vol_refresh() {
     bool    muted = mute || tci_mute || btaudio_speaker_muted() || param_i_get(cfg_speaker_off);
     int32_t vol   = param_i_get(cfg_volume);
     int32_t moni  = param_i_get(cfg_moni);
+#ifdef BOARD_X6200
+    /* A screen recording leaves the monitor alone here: the X6200's speaker shares the case with the
+     * built-in microphone, and a monitor at 30 rang back into the transmission (issue #15) */
+    bool    rec_raise = false;
+#else
+    bool    rec_raise = rec_moni && !tci_mute;
+#endif
 
-    if (rec_moni && !tci_mute) moni = LV_MAX(moni, 30);
+    if (rec_raise) moni = LV_MAX(moni, 30);
     else if (muted || vol == 0) moni = 0;
     radio_lock();
     hw_set_i(HW_RXVOL, muted ? 0 : vol);
@@ -450,11 +524,13 @@ void radio_start_atu() {
     state_move(RADIO_RX, RADIO_ATU_START);
 }
 
-bool radio_start_swrscan() {
+/* Nothing moves before the scan is known to start: the VFO that transmits goes to `from` only then */
+bool radio_start_swrscan(int32_t from) {
     if (tx_refused() || !state_move(RADIO_RX, RADIO_SWRSCAN)) {
         return false;
     }
 
+    radio_set_tx_freq(from);
     cparam_i_set(cfg_cur_mode, radio_mode_am);
     radio_lock();
     /* 1 W is enough to read the SWR; less if PWR is set lower.
@@ -536,6 +612,10 @@ void radio_poweroff() {
     }
     cfg_api_flush_all();
     cfg_db_shutdown();
+    /* Onto the card before the base cuts the power: the settings are written with synchronous=OFF (params/db.c), the
+     * FAT keeps its table and folder changes in memory, and the kernel writes them out some 30 s later. Cut before,
+     * params.db and its WAL can be left half written on the card, and the files written last lost */
+    sync();
     state = RADIO_POWEROFF;
 }
 
@@ -543,20 +623,25 @@ void radio_set_charger(bool on) {
     WITH_RADIO_LOCK(hw_set_i(HW_CHARGER, on));
 }
 
-/* Keying from the GUI on a receive-only frequency (the X6200's FM broadcast and airband) is refused, with a word on
- * the screen; the base's own TX permit covers its hand-mic PTT and paddle */
+/* Keying from the GUI where the radio does not transmit is refused, with a word on the screen: the X6200's FM
+ * broadcast and airband, what the WR12 receives, anything above HF that no transverter covers. Where it transmits:
+ * radio_tx_freq, the other VFO in split, wherever a TX shift put it. PTT, the modem
+ * (the apps), CW, the tuner and the SWR scan come through here; the base's own TX permit covers its hand-mic PTT
+ * and paddle */
 static bool tx_refused(void) {
-    /* the frequency the radio transmits on: the other VFO's in split */
-    int32_t freq = param_i_get(cfg_band_split) ? cparam_i_get(cfg_bg_freq) : cparam_i_get(cfg_fg_freq);
+    int32_t freq = radio_tx_freq();
 
     static uint64_t said;
 
-    if (!cfg_is_rx_only_freq(freq)) {
+    if (cfg_is_tx_freq(freq)) {
         return false;
     }
     if (get_time() - said > 3000) {     /* once, not for every CW element */
+        int32_t f = freq < 0 ? -freq : freq;    /* a TX shift below 0 Hz */
+
         said = get_time();
-        msg_schedule_text_fmt("No TX on %d.%03d MHz: receive only", freq / 1000000, freq / 1000 % 1000);
+        msg_schedule_text_fmt("No TX on %s%d.%03d MHz: receive only", freq < 0 ? "-" : "", f / 1000000,
+                              f / 1000 % 1000);
     }
     return true;
 }
@@ -581,12 +666,25 @@ int radio_get_mic(void) {
 
 static bool modem_on;
 
+/* In split the audio goes out on the TX frequency through radio_set_tx_freq, as the apps' tone does (TCI's audio,
+ * the voice messages): the active VFO moved before keying and back after; an app that moved it for its tone keeps
+ * its own */
 void radio_set_modem(bool tx) {
+    static bool moved;
+
     if (tx && tx_refused()) {
         return;
     }
+    if (tx && param_i_get(cfg_band_split) && !atomic_load(&split_held)) {
+        radio_set_tx_freq(radio_tx_freq());
+        moved = true;
+    }
     modem_on = tx;
     WITH_RADIO_LOCK(hw_set_i(HW_MODEM, tx));
+    if (!tx && moved) {
+        moved = false;
+        radio_set_tx_freq(0);
+    }
 }
 
 bool radio_get_modem(void) {
@@ -718,6 +816,14 @@ static void on_vfo_freq_change(Subject *subj, void *user_data) {
     if (changed) {
         LV_LOG_USER("Radio set vfo %i freq=%i (%i)", vfo, new_val, new_val - shift);
     }
+}
+
+/* A transverter's range or shift changed (Settings > General > TRANSVERTERS): both VFOs again with the shift that
+ * now applies. A shift set to 0 (off) left the base on the IF until the next retune, and the hand mic's PTT, which
+ * the base keys by itself, went out there: 29.500 MHz on 10 m for a 2 m 145.500 */
+static void on_transverter_change(Subject *subj, void *user_data) {
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
 }
 
 static void on_vfo_mode_change(Subject *subj, void *user_data) {
@@ -964,6 +1070,29 @@ static void battery_warn_cb(void *arg) {
     }
 }
 
+/* The model, and the log fed again, once at the base's first reading, whatever it says: the stretch on battery goes
+ * on across a GUI restart (the model learns only what is newer than it); no model yet, it learns from the old log
+ * too. During the start, as before the readings had to settle (bat_watch.h): 15 s into a running GUI the replay of
+ * a full log would hold the radio thread, and with it the spectrum, the S-meter and the X6200's register keepalive */
+static void battery_model_load(void) {
+    static bool done;
+
+    if (done) {
+        return;
+    }
+    done = true;
+
+    uint64_t t0 = get_time();
+
+    if (!bat_est_load(BATTERY_MODEL)) {
+        bat_est_replay(BATTERY_LOG ".1");
+    }
+    bat_est_replay(BATTERY_LOG);
+    bat_est_save(BATTERY_MODEL);
+    fprintf(stderr, "battery: model and log read at %llu ms, in %llu ms\n", (unsigned long long)(now_time - start_time),
+            (unsigned long long)(get_time() - t0));
+}
+
 static void battery_log(const hw_pack_t *p) {
     static time_t   last;
     static uint64_t prev_ms;
@@ -985,15 +1114,6 @@ static void battery_log(const hw_pack_t *p) {
     prev_ms = now_time;
     if (t - last < 60) {
         return;
-    }
-    /* At start the log is fed again: the stretch on battery goes on across a GUI restart (the
-     * model learns only what is newer than it). No model yet: learn from the old log too */
-    if (!last) {
-        if (!bat_est_load(BATTERY_MODEL)) {
-            bat_est_replay(BATTERY_LOG ".1");
-        }
-        bat_est_replay(BATTERY_LOG);
-        bat_est_save(BATTERY_MODEL);
     }
     last = t;
     if ((f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r"))) {
@@ -1053,12 +1173,49 @@ static void battery_log(const hw_pack_t *p) {
     fclose(f);
 }
 
+/* On the GUI thread: the trace syncs the card, which the flow must not wait for */
+static void start_trace_cb(void *arg) {
+    start_trace("%s", (const char *)arg);
+}
+
+/* The base's supply readings until they count, into the run's log: what it sends at power-on, for a
+ * report (#17). A line for each change, then one when they count */
+static void battery_startup_log(const bat_watch_t *w, const hw_pack_t *p) {
+    static bool     done;
+    static uint16_t shown = UINT16_MAX;     /* vbat, batcap */
+    static uint8_t  shown_ext;
+
+    if (done) {
+        return;
+    }
+    if (w->counts) {
+        char line[96];
+
+        snprintf(line, sizeof(line), "battery: readings count from %llu ms: %.1f V %u%%, external %.1f V",
+                 (unsigned long long)(now_time - start_time), p->vbat * 0.1f, p->batcap, p->vext * 0.1f);
+        fprintf(stderr, "%s\n", line);
+        scheduler_put(start_trace_cb, line, sizeof(line));  /* the card's write off this thread */
+        done = true;
+        return;
+    }
+    if (shown == (p->vbat << 8 | p->batcap) && shown_ext == p->vext) {
+        return;
+    }
+    shown = p->vbat << 8 | p->batcap;
+    shown_ext = p->vext;
+    fprintf(stderr, "battery: start-up reading at %llu ms: %.1f V %u%%, external %.1f V (flag %u, charging %u)\n",
+            (unsigned long long)(now_time - start_time), p->vbat * 0.1f, p->batcap, p->vext * 0.1f, p->vext_flag,
+            p->charging);
+}
+
 static swr_guard_t swr_guard;
 static atomic_uint swr_trips;
+static atomic_bool swr_trip_queued;     /* a trip's job waits in the queue: one stops TX, more add nothing */
 
 /* SWR protection, on the GUI thread: what the GUI keys lets go (a PTT held on the radio or the
  * mic, VOX and the radio's own keyer are the base's: they may key again) */
 static void swr_trip_cb(void *arg) {
+    atomic_store(&swr_trip_queued, false);  /* out of the queue: a trip from now on is posted again */
     atomic_fetch_add(&swr_trips, 1);    /* before the modem bit drops: whoever sees it gone can tell why */
     cw_encoder_stop();
     paddle_keyer_stop();
@@ -1077,6 +1234,37 @@ unsigned radio_swr_trips(void) {
     return atomic_load(&swr_trips);
 }
 
+/* The base never keyed for the tuner, or ended a tune without its done flag (no match: more likely on 10 and 15 m
+ * with a real antenna). The GUI stayed in the tuner's state for good with the tune bit set: no new tune, the SWR
+ * scan refused, CAT and TCI reporting TX (#25). Now the tune bit off, back to RX, a word on the screen and a line in
+ * the base log with what the base reported */
+static void atu_give_up(radio_state_t from, const char *why) {
+    WITH_RADIO_LOCK(hw_set_i(HW_ATU_TUNE, false));
+#ifndef BOARD_X6200
+    if (from == RADIO_ATU_RUN) {
+        recover_processing_audio_inputs();      /* as after a tune that found its network */
+    }
+#endif
+    if (!state_move(from, RADIO_RX)) {
+        return;     /* powering off meanwhile */
+    }
+    if (from == RADIO_ATU_RUN && notify_rx_tx) {
+        notify_rx_tx(false);
+    }
+    base_guard_log("ATU: %s (tx %d, atu_status %d, atu_params %08x)", why, pack->tx, pack->atu_status,
+                   (unsigned)pack->atu_params);
+    msg_schedule_text_fmt("%s", why);
+}
+
+/* What the base reports by a change alone goes to the GUI thread once: the low battery, the POWER key, a hand mic
+ * key, the tuner's network. Nothing posts it again, so a job dropped by a full queue was lost for good: a POWER
+ * release lost let the hold timer turn a tap into a power-off, a low battery lost never started the 30 s
+ * power-off, a network lost was not kept (#33's start: the DSP's redraws held all 64 places for seconds). Such a
+ * job takes the urgent reserve, and the change counts as told only once its job is in: if even the reserve is
+ * full, the next packet (for the battery, the next reading) tries again */
+static uint32_t atu_network;        /* the tuner's network, for atu_done_cb */
+static bool     atu_network_due;    /* found, its job not in the queue yet */
+
 static bool radio_tick() {
     if (now_time < prev_time) {
         prev_time = now_time;
@@ -1094,25 +1282,24 @@ static bool radio_tick() {
 
         if (delay++ > 10) {
             delay = 0;
-            clock_update_power(pack->vext * 0.1f, pack->vbat*0.1f, pack->batcap, pack->charging);
-            battery_log(pack);
-            /* Only on a change, with hysteresis: around 6.0 V the 30 s
-             * power-off timer was started and stopped over and over */
-            /* External power: the flag alone is not enough, charging an
-             * empty battery it stayed clear with 11.7 V on the jack and the
-             * radio switched itself off on the charger */
-            bool ext = pack->vext_flag || pack->charging || pack->vext >= 90;
-            /* At power-on the base sends a few packets before it has measured anything (0 V on both):
-             * one of them alone started "Low battery!" with a full battery on the charger. Low only
-             * after 3 readings in a row (about 1.2 s), and never on a reading of nothing */
-            static uint8_t low_reads;
-            bool           measured = pack->vbat > 0 || pack->vext > 0;
+            /* The base's first readings after power-on are not the battery's (bat_watch.h): the top bar,
+             * the battery log and time left, its warnings and the power-off wait until they count */
+            static bat_watch_t bat_watch;
+
+            bat_watch_reading(&bat_watch, pack->vbat, pack->vext, pack->vext_flag, pack->charging, now_time);
+
+            battery_startup_log(&bat_watch, pack);
+            battery_model_load();
+            if (bat_watch.counts) {
+                clock_update_power(pack->vext * 0.1f, pack->vbat * 0.1f, pack->batcap, pack->charging);
+                battery_log(pack);
+            }
 
             /* The % sags under the TX current and comes back slowly: the last RX reading holds
              * while transmitting and for 30 s after (also in the top bar, clock.c) */
             static uint64_t hold_until;
             static int8_t   held_cap = -1;
-            int8_t          cap = measured && !ext ? pack->batcap : -1;
+            int8_t          cap = bat_watch.counts && !bat_watch.ext ? pack->batcap : -1;
 
             if (radio_get_state() == RADIO_TX) hold_until = now_time + 30000;
             if (now_time < hold_until && held_cap >= 0 && cap >= 0) cap = held_cap;
@@ -1121,13 +1308,13 @@ static bool radio_tick() {
             if (cap >= 0 && cap != pack->batcap)
                 clock_update_power(pack->vext * 0.1f, pack->vbat * 0.1f, cap, pack->charging);
 
-            low_reads = measured && !ext && pack->vbat <= LOW_BATTERY_VBAT_LOW ? (low_reads < 3 ? low_reads + 1 : 3) : 0;
-            bool enter_low = low_reads >= 3;
-            bool leave_low = ext || (pack->vbat >= LOW_BATTERY_VBAT_HIGH);
+            /* low_power: what the GUI was told (the note above radio_tick) */
+            if (bat_watch.low != low_power) {
+                bool low = bat_watch.low;
 
-            if ((!low_power && enter_low) || (low_power && leave_low)) {
-                low_power = !low_power;
-                scheduler_put(low_power_ui_cb, &low_power, sizeof(low_power));
+                if (scheduler_put_urgent(low_power_ui_cb, &low, sizeof(low))) {
+                    low_power = low;
+                }
             }
         }
         if (pack->psd) {
@@ -1136,12 +1323,19 @@ static bool radio_tick() {
             dsp_samples((cfloat *)pack->samples, pack->n_samples, pack->tx, pack->lo_freq, pack->vary_freq, pack->fft_dec);
         }
 
-        /* The POWER key where the base reports it (the X6200): to the GUI thread as a key */
+        /* The POWER key where the base reports it (the X6200): to the GUI thread as a key. power_was: what
+         * the GUI was told (the note above radio_tick) */
         static bool power_was;
 
         if (pack->power_key != power_was) {
-            power_was = pack->power_key;
-            scheduler_put(power_key_cb, &power_was, sizeof(power_was));
+            bool down = pack->power_key;
+
+            if (scheduler_put_urgent(power_key_cb, &down, sizeof(down))) {
+                power_was = down;
+            }
+        }
+        if (atu_network_due && scheduler_put_urgent(atu_done_cb, &atu_network, sizeof(atu_network))) {
+            atu_network_due = false;
         }
 
         switch (state) {
@@ -1162,14 +1356,20 @@ static bool radio_tick() {
                     // printf("%d, %d\n", pack->tx_power, pack->alc_level);
                     tx_info_update(pack->tx_power * 0.1f, pack->vswr * 0.1f, pack->alc_level * 0.1f);
                     float swr = pack->vswr * 0.1f;
-                    if (swr_guard_check(&swr_guard, pack->tx_power * 0.1f, swr, param_i_get(cfg_swr_protect) * 0.1f, now_time)) {
-                        scheduler_put(swr_trip_cb, &swr, sizeof(swr));
+                    /* A stop: the urgent reserve. Dropped even so, swr_guard trips again 300 ms on. One in the
+                     * queue at a time: with the GUI thread stalled and TX still on, a trip every ~320 ms took
+                     * the reserve in 25 s from those that do not try again (TCI's unkey, FT8's last post).
+                     * Marked before the put, the job may run before the put returns */
+                    if (swr_guard_check(&swr_guard, pack->tx_power * 0.1f, swr, param_i_get(cfg_swr_protect) * 0.1f, now_time) &&
+                        !atomic_exchange(&swr_trip_queued, true) && !scheduler_put_urgent(swr_trip_cb, &swr, sizeof(swr))) {
+                        atomic_store(&swr_trip_queued, false);
                     }
                 }
                 break;
 
             case RADIO_ATU_START:
                 WITH_RADIO_LOCK(hw_set_i(HW_ATU_TUNE, true));
+                atu_time = now_time;
                 state_move(RADIO_ATU_START, RADIO_ATU_WAIT);
                 break;
 
@@ -1178,16 +1378,20 @@ static bool radio_tick() {
                     if (notify_rx_tx) {
                         notify_rx_tx(true);
                     }
+                    atu_time = now_time;
                     state_move(RADIO_ATU_WAIT, RADIO_ATU_RUN);
+                } else if (now_time - atu_time > ATU_START_MS) {
+                    atu_give_up(RADIO_ATU_WAIT, "Tuner did not start");
                 }
                 break;
 
             case RADIO_ATU_RUN:
                 if (pack->atu_status && !pack->tx) {
                     /* The settings on the LVGL thread: their observers run where they are set, and
-                     * the delayed ones (the info bar) schedule LVGL calls, which only that thread may */
-                    uint32_t network = pack->atu_params;
-                    scheduler_put(atu_done_cb, &network, sizeof(network));
+                     * the delayed ones (the info bar) schedule LVGL calls, which only that thread may.
+                     * Not in the queue: the next packets try again (the note above radio_tick) */
+                    atu_network     = pack->atu_params;
+                    atu_network_due = !scheduler_put_urgent(atu_done_cb, &atu_network, sizeof(atu_network));
                     WITH_RADIO_LOCK(hw_set_i(HW_ATU_TUNE, false));
 #ifndef BOARD_X6200
                     /* The X6100's: it keys the modem at 0.1 W; gdyuldin's X6200 GUI dropped it */
@@ -1202,6 +1406,10 @@ static bool radio_tick() {
                     state_move(RADIO_ATU_RUN, RADIO_RX);
                 } else if (pack->tx) {
                     tx_info_update(pack->tx_power * 0.1f, pack->vswr * 0.1f, pack->alc_level * 0.1f);
+                    atu_time = now_time;
+                } else if (now_time - atu_time > ATU_NO_MATCH_MS) {
+                    /* out of TX without the done flag; the X6200 library's own example ends a tune there */
+                    atu_give_up(RADIO_ATU_RUN, "Tuner: no match");
                 }
                 break;
 
@@ -1242,11 +1450,15 @@ static bool radio_tick() {
         }
 
         /* The hand mic key to the LVGL thread: hkey_put makes and deletes LVGL timers, which
-         * only that thread may do. Posted when it changes (held down, the base repeats it) */
+         * only that thread may do. Posted when it changes (held down, the base repeats it);
+         * last_hkey: what the GUI was told (the note above radio_tick) */
         static uint32_t last_hkey;
         if (pack->hkey != last_hkey) {
-            last_hkey = pack->hkey;
-            scheduler_put(hkey_sched_cb, &last_hkey, sizeof(last_hkey));
+            uint32_t hkey = pack->hkey;
+
+            if (scheduler_put_urgent(hkey_sched_cb, &hkey, sizeof(hkey))) {
+                last_hkey = hkey;
+            }
         }
     } else {
         if (d > FLOW_RESTART_TIMEOUT) {
@@ -1296,6 +1508,7 @@ static bool resend_all() {
     radio_lock();
     bool ok = hw_resend_all();
     radio_unlock();
+    block_time = now_time;
     return ok;
 }
 
@@ -1313,9 +1526,11 @@ static void * radio_thread(void *arg) {
 
         /* Every 3 s in RX as always (every second in every state for a base that wants it, the X6200, which
          * otherwise takes the RF away about a second into TX: issues #1, #8); after a write error or an un-key
-         * at once, in TX too */
+         * at once, in TX too. The X6200's second counts from the last block, not from the last write: any write,
+         * even one the library skipped as unchanged, put it off, and a client setting a value more than once a
+         * second kept the block from going at all (#16) */
         bool keepalive = radio_caps() & HW_CAP_KEEPALIVE;
-        if ((keepalive ? idle > KEEPALIVE_MS : (idle > IDLE_TIMEOUT && state == RADIO_RX))
+        if ((keepalive ? now_time - block_time > KEEPALIVE_MS : (idle > IDLE_TIMEOUT && state == RADIO_RX))
             || (resync_due && now_time - resync_time >= RESYNC_RETRY_MS)) {
             resync_time = now_time;
             resync_due = !resend_all();

@@ -46,11 +46,18 @@ void radio_bb_reset();
 radio_state_t radio_get_state();
 
 /**
- * Set freq for radio without updating corresponding subject.
- * Useful for FT8 TX freq change and SWR scan
+ * Set freq for radio without updating corresponding subject: the active VFO, which receives
+ * (Birdie Cal's scan). The apps' tones and the SWR scan go to radio_set_tx_freq
  */
 void radio_set_freq(int32_t freq);
 bool radio_check_freq(int32_t freq);
+/* The frequency the radio transmits on: the other VFO's in split; with a TX shift the active one's + the shift
+ * (- on VFO B), also where the other VFO cannot follow (below 100 kHz), so that it is refused */
+int32_t radio_tx_freq(void);
+/* The radio transmits on `freq`, without updating a subject: a digital app's tone, the SWR scan. The active VFO
+ * moves; in split the base's split bit is off until 0, which puts both VFOs back on their own frequency, IF shift
+ * and all, and split back on */
+void radio_set_tx_freq(int32_t freq);
 
 radio_vfo_t radio_toggle_vfo();
 
@@ -75,7 +82,9 @@ void radio_set_charger(bool on);
 
 void radio_start_atu();
 
-bool radio_start_swrscan();
+/* From RX only, where the radio may transmit (else false, "No TX on ..." said): the VFO that transmits to `from`,
+ * then AM at 1 W at most */
+bool radio_start_swrscan(int32_t from);
 void radio_stop_swrscan();
 
 void radio_poweroff();

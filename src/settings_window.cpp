@@ -314,7 +314,7 @@ static void theme_apply(void *arg) {
 static void font_update_cb(lv_event_t * e) {
     uint8_choice_cb(e);
     if (theme_shape.font >= 0) {
-        msg_update_text_fmt("Font: this theme has its own");   /* RS, Black Metal, Total Black */
+        msg_update_text_fmt("Font: this theme has its own");   /* Black Metal, Total Black, a file that sets one */
         return;
     }
     params_flush();
@@ -484,7 +484,7 @@ static uint8_t make_param_choice(uint8_t row, const char *label, const char *opt
 }
 
 /* Spectrum and waterfall looks: while one of them is changed the window fades to 60% and the
- * main screen shows through. Not with a theme's window image (RS): faded, it turns see-through. */
+ * main screen shows through. Not with a folder theme's window image: faded, it turns see-through. */
 static void fade_exec(void *obj, int32_t opa) {
     lv_obj_set_style_bg_img_opa((lv_obj_t *)obj, opa, 0);
 }
@@ -515,7 +515,8 @@ static void preview_fade(lv_obj_t *obj) {
 }
 
 /* Date and time, local. A change sets the system clock at once, the RTC (in UTC) when the focus
- * comes back to a field after the edit. */
+ * comes back to a field after the edit. The fields hold the time the page was built: only what an
+ * edit changed is applied, to the clock as it is now */
 
 static struct tm dt_tm;         /* the fields */
 static struct tm dt_utc;        /* the same instant, for the RTC */
@@ -548,21 +549,29 @@ static void dt_show() {
     zone_refresh = false;
 }
 
+/* The MFK press that moves a field's edit cursor sends a change too: the whole fields went to the clock, which an
+ * edit that changed nothing set back by the time the page had been open (23 s on the bench, 2026-10-26) */
 static void dt_changed_cb(lv_event_t *e) {
-    struct timespec tp = {};
+    struct timespec tp;
+    struct tm       was = dt_tm, now;
 
     if (zone_refresh) return;
     for (int i = 0; i < 6; i++) {
         *dt_field(i) = lv_spinbox_get_value(dt_spin[i]) - dt_spec[i].base;
     }
-    dt_changed = true;
+    now = dt_tm;        /* mktime normalises (31 in a 30-day month): copies, the fields stay as shown */
+    was.tm_isdst = now.tm_isdst = -1;
 
-    dt_tm.tm_isdst = -1;
-    tp.tv_sec = mktime(&dt_tm);
+    time_t delta = mktime(&now) - mktime(&was);
+
+    if (delta == 0) return;
+    clock_gettime(CLOCK_REALTIME, &tp);
+    tp.tv_sec += delta;
     if (clock_settime(CLOCK_REALTIME, &tp) != 0) {
         LV_LOG_ERROR("Can't set system time: %s\n", strerror(errno));
         return;
     }
+    dt_changed = true;
     gmtime_r(&tp.tv_sec, &dt_utc);
 }
 
@@ -693,14 +702,15 @@ static uint8_t make_line_gain(uint8_t row) {
     return row + 1;
 }
 
-/* Play and Rec gain in dB: what the mixer took is saved and goes to the Line-in too */
+/* Play and Rec gain in dB: what the mixer took is saved. Not the Line-in, the base's own level on the row above: this
+ * wrote the dB value there too, as a whole number (0 at 0 dB and below), and on the X6200 the apps then went out at
+ * 0 W (#16; migration _12 puts it back). The stock X6200 GUI does not write it either */
 static void play_rec_gain_cb(lv_event_t *e) {
     lv_obj_t *s   = lv_event_get_target(e);
     bool      rec = lv_event_get_user_data(e) != NULL;
     float     db  = rec ? audio_set_rec_vol(lv_slider_get_value(s)) : audio_set_play_vol(lv_slider_get_value(s));
 
     params_float_set(rec ? &params.rec_gain_db_f : &params.play_gain_db_f, db);
-    radio_set_line_in(db);
     slider_text(s, "%.1f", db);
 }
 
@@ -754,6 +764,7 @@ static const key_action_t front_actions[] = {
     /* Tools */
     {" APP Cluster ", ACTION_APP_CLUSTER},
     {" APP CW Trainer ", ACTION_APP_CWTRAINER},
+    {" APP CW Keyboard ", ACTION_APP_CW_KBD},
     {" APP Field Ops ", ACTION_APP_FIELD},
     {" APP Bands ", ACTION_APP_BANDS},
     {" APP Channels ", ACTION_APP_CHANNELS},
@@ -839,7 +850,7 @@ static uint8_t make_key_rows(uint8_t row, int first, int last) {
     return row;
 }
 
-/* Transverters: the band they cover (from, to) and the shift, in MHz */
+/* Transverters: the band they cover (from, to) and the shift, in MHz; a shift of 0 is off (the X6200's default) */
 static void xvrt_cb(lv_event_t *e) {
     ((ParamInt *)lv_event_get_user_data(e))->set(lv_spinbox_get_value(lv_event_get_target(e)) * 1000000L);
 }
@@ -849,12 +860,12 @@ static uint8_t make_transverters(uint8_t row) {
         {&cfg_sm.p_transverter_0_from, &cfg_sm.p_transverter_0_to, &cfg_sm.p_transverter_0_shift},
         {&cfg_sm.p_transverter_1_from, &cfg_sm.p_transverter_1_to, &cfg_sm.p_transverter_1_shift},
     };
-    const int lo[3] = {70, 70, 42};
+    const int lo[3] = {70, 70, 0};
 
     for (auto &x : p) {
-        char label[24];
+        char label[32];
 
-        snprintf(label, sizeof(label), "%i: from, to, shift", x[0]->context_id() + 1);
+        snprintf(label, sizeof(label), "%i: from, to, shift (0 off)", x[0]->context_id() + 1);
         wl_row_label(row, label);
         for (int i = 0; i < 3; i++) {
             lv_obj_t *sb = row_spin(row, 1 + 2 * i, 2, SMALL_2, x[i]->get() / 1000000L, lo[i], 500, 3);
@@ -864,6 +875,27 @@ static uint8_t make_transverters(uint8_t row) {
         row++;
     }
     return row;
+}
+
+/* The TX shift of the band the radio is on, kHz, 0 off: split comes on with it and the other VFO stays at the
+ * active one + the shift (the input of an FM repeater, a QO-100 station's IF). Not on a band the radio cannot
+ * transmit on */
+static void tx_shift_cb(lv_event_t *e) {
+    cfg_sm.tx_shift_set(lv_spinbox_get_value(lv_event_get_target(e)) * 1000);
+}
+
+static uint8_t make_tx_shift(uint8_t row) {
+    BandInfoLoadResult band = BandsTable::get_by_id(cfg_sm.current_band_id());
+    char               label[48];
+
+    if (band.rc != SUCCESS || cfg_sm.band_use(band.value.start_freq, band.value.stop_freq) != BAND_USE_TX) {
+        return row;
+    }
+    snprintf(label, sizeof(label), "TX shift %s, kHz", band.value.name.c_str());
+    wl_row_label(row, label);
+    lv_obj_t *sb = row_spin(row, 1, 3, SMALL_3, cfg_sm.p_band_tx_shift.get() / 1000, -9999, 9999, 4);
+    lv_obj_add_event_cb(sb, tx_shift_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return row + 1;
 }
 
 /* Spectrum above the waterfall on/off; the waterfall takes its place */
@@ -2436,7 +2468,10 @@ static void wv_update() {
     wl_pill(wv.pill, name ? "connected" : NULL, theme_hex(TC_ok_bg), theme_hex(TC_ok));
     lv_label_set_text(wv.client, name ? name : "no client");
     lv_obj_set_style_text_color(wv.client, name ? TC(text) : TC(text_faint), 0);
-    if (wv.trust) {
+    /* Not while the list is open: the knob moves the dropdown's selection before the press
+     * confirms it, and putting it back to the setting every second turned a Listen only
+     * being chosen back into Operate before the press could take it (#17) */
+    if (wv.trust && !lv_dropdown_is_open(wv.trust)) {
         uint16_t want = tci_server_get_trust_operate() ? 0 : 1;
         if (lv_dropdown_get_selected(wv.trust) != want)
             lv_dropdown_set_selected(wv.trust, want);
@@ -3036,6 +3071,7 @@ static void make_general_page() {
     row = make_param_slider(row, "Accel. onset", &accel_onset_slider);
     row = make_charger(row);
     row = make_param_slider(row, "Per band S-meter cal", &smeter_cal_slider);
+    row = make_tx_shift(row);
     /* The Walkie Talkie portrait screen: on at once (walkie.c follows the setting), Settings closes */
     row = make_param_switch(row, "Walkie Talkie", cfg_sm.p_walkie);
     card_end(row);
@@ -3043,6 +3079,16 @@ static void make_general_page() {
     row = card_begin("TRANSVERTERS");
     row = make_transverters(row);
     card_end(row);
+
+#ifdef BOARD_X6200
+    /* Xiegu's WR12 on the HOST port: 54 MHz-1 GHz to receive; the band keys and the band plan follow it at once
+     * (screen_main.c). A switch until the radio can tell it is plugged in */
+    row = card_begin("WR12 RECEIVER");
+    wl_row_label(row, "WR12 on HOST");
+    param_switch(row, 1, 3, SMALL_3, cfg_sm.p_wr12);
+    lv_label_set_text(wl_note(row), "54 MHz-1 GHz, receive only");
+    card_end(row + 1);
+#endif
 
     row = card_begin("TCI SERVER");
     row = make_tci(row);
@@ -3767,6 +3813,8 @@ static void make_display_page() {
     row = make_param_switch(row, "Needle lamp", cfg_sm.p_smeter_lamp);
     /* The radio's own carriers found by Birdie Cal (APP): on the waterfall, and out of the passband */
     row = make_param_choice(row, "Birdies", " Off \n Marks \n Marks + notch ", cfg_sm.p_birdie_marks);
+    /* Off: one waterfall zoom and one tuning step for every mode, a mode change keeps them */
+    row = make_param_switch(row, "Zoom and step per mode", cfg_sm.p_zoom_step_per_mode);
     card_end(row);
 
     row = card_begin("INTERFACE");

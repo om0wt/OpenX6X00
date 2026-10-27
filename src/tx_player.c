@@ -9,6 +9,7 @@
 #include <math.h>                 /* log10f */
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>               /* the 0 W line in the log */
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,10 +17,10 @@
 #include "lvgl/lvgl.h"           /* LV_MIN, LV_MAX */
 
 #include "audio.h"               /* audio_play, audio_gain_db */
-#include "cfg/cfg_api.h"         /* cparam_i_get, param_f_get */
-#include "msg.h"                 /* the watchdog's note */
+#include "cfg/cfg_api.h"         /* param_f_get */
+#include "msg.h"                 /* the watchdog's and the 0 W notes */
 #include "params/params.h"       /* the learned gain offset */
-#include "radio.h"               /* radio_set_modem, radio_set_freq */
+#include "radio.h"               /* radio_set_modem, radio_set_tx_freq */
 #include "tx_info.h"             /* tx_info_refresh: ALC and power */
 #include "tx_level.h"
 
@@ -38,6 +39,7 @@
 
 static atomic_bool     playing;
 static atomic_uint_fast64_t last_block_ms;
+static float           own_w;      /* tx_player_set_pwr: an app's own power, 0 none */
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -88,11 +90,24 @@ bool tx_player_play(int16_t *samples, uint32_t count, int32_t offset_hz, float b
     return tx_player_stream(take_samples, &s, offset_hz, base_gain, abort, abort_ctx);
 }
 
+void tx_player_set_pwr(float w) {
+    own_w = w;
+}
+
+/* The power a transmission goes out at: the app's own, else the radio's setting; at most the cap */
+static float tx_pwr(void) {
+    return LV_MIN(own_w > 0.0f ? own_w : param_f_get(cfg_pwr), TX_PLAYER_MAX_PWR_W);
+}
+
 bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, float base_gain,
                       tx_abort_fn_t abort, void *abort_ctx) {
-    bool    over_cap = param_f_get(cfg_pwr) > TX_PLAYER_MAX_PWR_W;
+    float   pwr_w = tx_pwr();
+    bool    own = own_w > 0.0f;
+    /* The cap (RTTY and WeFax over 7 W) or an app's own power (WSPR's 0.2 W): the radio there for this transmission,
+     * its setting back after */
+    bool    pwr_set = pwr_w != param_f_get(cfg_pwr);
 
-    if (over_cap) radio_set_pwr(TX_PLAYER_MAX_PWR_W);
+    if (pwr_set) radio_set_pwr(pwr_w);
 
     /* Part of the gain goes to the codec volume (6 dB above the total), the rest is applied
      * to the samples */
@@ -100,9 +115,10 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
     float   codec = audio_set_play_vol(total + 6.0f);
     float   drive = total - codec;
 
-    int32_t dial = cparam_i_get(cfg_fg_freq);
+    /* The VFO that transmits moves for the tone: the other one in split (a TX shift), the IF shift put back after */
+    int32_t dial = radio_tx_freq();
 
-    radio_set_freq(dial + offset_hz - TX_PLAYER_AUDIO_HZ);
+    radio_set_tx_freq(dial + offset_hz - TX_PLAYER_AUDIO_HZ);
     radio_set_modem(true);      /* keyed, the audio from the GUI */
 
     /* The drive from the ALC and power readback (tx_level.c): ramped up while the ALC reads
@@ -110,7 +126,7 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
     static uint8_t  reading;        /* the last tx_info reading seen */
     tx_level_t      level;
 
-    tx_level_start(&level, LV_MIN(param_f_get(cfg_pwr), TX_PLAYER_MAX_PWR_W));
+    tx_level_start(&level, pwr_w);
     level.power_hold = radio_caps() & HW_CAP_TX_NO_ALC;
     tx_info_refresh(&reading, NULL, NULL, NULL);    /* what came before this TX is not ours */
 
@@ -121,6 +137,8 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
     int16_t block[BLOCK_SAMPLES];
     float   applied = drive;        /* gain on the previous block */
     bool    stopped = false;
+    float   peak_w = 0.0f, peak_alc = 0.0f;    /* the highest readings after the settling, and how many */
+    int     reads = 0;
 
     static pthread_t watch;
     if (!watch && pthread_create(&watch, NULL, stall_watch, NULL) == 0) pthread_detach(watch);
@@ -132,6 +150,11 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
         bool    fresh = tx_info_refresh(&reading, &alc, &pwr, NULL);
 
         drive = keep_in_range(drive + tx_level_block(&level, fresh, pwr, alc));
+        if (fresh && level.blocks > TX_LEVEL_SETTLE_BLOCKS) {
+            peak_w = LV_MAX(peak_w, pwr);
+            peak_alc = LV_MAX(peak_alc, alc);
+            reads++;
+        }
 
         size_t n = fill(block, BLOCK_SAMPLES, fill_ctx);
 
@@ -155,27 +178,50 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
      * was found; one still climbing to the setting only back up towards the default (0), where the X6200 gives 5 W
      * at once. Without that, a level knocked down once (an ALC or power reading over: a mag loop not yet tuned)
      * climbed its 8 dB a transmission, never reached the setting, was never saved, and FT8 stayed at 0 W (#16) */
-    float learned = LV_MAX(drive - base_gain + codec, LEARNED_MIN_DB);
+    float level_db = drive - base_gain + codec;
+    float learned = LV_MAX(level_db, LEARNED_MIN_DB);
 
-    if (!level.power_hold || level.held) {
+    /* No power read at all once the PA settled, a whole transmission long (#16): said on the screen and in the log
+     * with what makes the level, so that a report tells the learned level, the Line-in and the base apart. From a
+     * 0.2 W setting only: the reading is whole tenths, cut off, so at 0.1 W (FT8's lowest step, WSPR's 20 dBm) a
+     * true 0.09 W reads 0.0 a whole normal transmission long, and the X6200 lost its level each time */
+    bool no_rf = !stopped && reads > 0 && level.blocks > TX_LEVEL_SETTLE_BLOCKS + 2 * TX_LEVEL_WINDOW_BLOCKS
+              && peak_w < TX_LEVEL_PWR_STEP_W && level.target_w > 1.5f * TX_LEVEL_PWR_STEP_W;
+
+    if (no_rf) {
+        fprintf(stderr, "tx_player: 0 W the whole TX: level %.1f dB (codec %.1f, samples %.1f), line_in %u, "
+                "ALC %.1f, PWR %.1f W%s\n", level_db, codec, drive, params.line_in, peak_alc, level.target_w,
+                level.power_hold && !own ? ", the level back to 0 dB" : "");
+        msg_schedule_text_fmt("TX 0 W: level %.0f dB, Line-in %u", level_db, params.line_in);
+    }
+    if (own) {
+        /* An app's own power (a 0.2 W WSPR beacon): what it found is not kept, it would pull the level the other apps
+         * start from (FT8 at 5 W) down with it */
+    } else if (level.power_hold && no_rf) {
+        /* Nothing came out: the next transmission from the default, where the X6200 gives the setting at once, not
+         * 8 dB a transmission up from a level near the floor */
+        params_float_set(&params.ft8_output_gain_offset, 0.0f);
+    } else if (!level.power_hold || level.held) {
         params_float_set(&params.ft8_output_gain_offset, learned);
     } else if (params.ft8_output_gain_offset.x < 0.0f && learned > params.ft8_output_gain_offset.x) {
         params_float_set(&params.ft8_output_gain_offset, LV_MIN(learned, 0.0f));
     }
     audio_play_wait();          /* the last block out before unkeying */
     radio_set_modem(false);     /* unkeyed: back to the dial frequency */
-    radio_set_freq(dial);
+    radio_set_tx_freq(0);
     audio_set_play_vol(params.play_gain_db_f.x);   /* the playback volume of the settings */
-    if (over_cap) {
-        radio_set_pwr(param_f_get(cfg_pwr));   /* RTTY and WeFax left the radio at the cap, also in SSB after */
+    if (pwr_set) {
+        /* the setting back: RTTY and WeFax left the radio at the cap, also in SSB after */
+        radio_set_pwr(param_f_get(cfg_pwr));
     }
     return !stopped;
 }
 
 float tx_player_base_gain_offset(void) {
     /* A base that sets the power itself (the X6100 from rev 3 on, the X6200, whose stock GUI
-     * plays at one level too) takes the audio at one level; the OEM X6100 base scales it */
+     * plays at one level too) takes the audio at one level; the OEM X6100 base scales it, to the
+     * power this transmission goes out at */
     if (radio_caps() & HW_CAP_TX_LEVEL) return -9.4f;
 
-    return -16.4f + 10.0f * log10f(LV_MIN(param_f_get(cfg_pwr), TX_PLAYER_MAX_PWR_W));
+    return -16.4f + 10.0f * log10f(tx_pwr());
 }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <iterator>
 
 extern "C" {
 }
@@ -20,7 +21,8 @@ extern "C" {
 //     band switch. The active VFO's frequency that caused the switch is kept,
 //     but its mode/att/pre/agc are loaded from the new band.
 //   - Switch mode: the user changed the mode. Save pending mode writes and
-//     load the mode params for the new mode.
+//     load the mode params for the new mode; not the zoom and the step while
+//     every mode shares them (p_zoom_step_per_mode off, zoom_step_scope).
 //
 // All loads use Parameter::load(), which reads the context_id bound via
 // set_context_id() — no context threading through every call.
@@ -83,15 +85,9 @@ void SettingsManager::init_load(void (*on_db_error)(const char *msg)) {
         }
     }
 
-    // The starting band comes from the persisted global parameter.
-    band_id_ = p_band_id.get();
-
-    set_band_context(band_id_);
-
-    load_band_all(band_id_);
-
     // Transverter params are loaded individually (fixed context_id = the
-    // transverter number). NOT_FOUND keeps the default value.
+    // transverter number). NOT_FOUND keeps the default value. Before the band:
+    // the clamps of load_band_vfo ask band_use, which reads them.
     p_transverter_0_from.load(0);
     p_transverter_0_to.load(0);
     p_transverter_0_shift.load(0);
@@ -99,11 +95,25 @@ void SettingsManager::init_load(void (*on_db_error)(const char *msg)) {
     p_transverter_1_to.load(1);
     p_transverter_1_shift.load(1);
 
+    // The starting band comes from the persisted global parameter.
+    band_id_ = p_band_id.get();
+
+    set_band_context(band_id_);
+
+    load_band_all(band_id_);
+
     // Subscribe the VFO frequency observers that trigger an implicit band
     // switch when a frequency is tuned into a different band. Subscribed after
     // the initial load so the initial restore does not trigger a switch.
     vfoa_freq_obs_ = Subscription(p_band_vfoa_freq.subscribe(vfo_freq_change_cb, this));
     vfob_freq_obs_ = Subscription(p_band_vfob_freq.subscribe(vfo_freq_change_cb, this));
+
+    // The TX shift follows the VFOs: after the band follow above, so a tune into another band has loaded that
+    // band's shift and split when it runs
+    Subject *tx_shift_subj[] = {&p_band_vfoa_freq, &p_band_vfob_freq, &p_band_vfoa_mode, &p_band_vfob_mode,
+                                &p_band_current_vfo, &p_band_split, &p_band_tx_shift};
+    for (size_t i = 0; i < std::size(tx_shift_obs_); i++)
+        tx_shift_obs_[i] = Subscription(tx_shift_subj[i]->subscribe(tx_shift_cb, this));
 
     // Subscribe the p_band_id observer that triggers an explicit band switch
     // when p_band_id is set. Subscribed after the initial load so the restore
@@ -134,9 +144,14 @@ void SettingsManager::init_load(void (*on_db_error)(const char *msg)) {
 
     load_mode_all();
 
+    // Zoom and step of every mode (the option off): bound to their own rows after the mode's are loaded, so a
+    // row never written takes the current mode's values
+    zoom_step_scope(true);
+
     // Subscribe an observer that calls switch_mode() whenever the current mode
     // changes (e.g. from cp_cur_mode.set() or a VFO switch).
     switch_mode_obs_ = Subscription(cp_cur_mode.subscribe(switch_mode_observer_cb, this));
+    zoom_step_obs_   = Subscription(p_zoom_step_per_mode.subscribe(zoom_step_scope_cb, this));
 
     // Bind the computed current VFO att/pre/agc and the background VFO
     // frequency to their sources and recompute from the freshly loaded params.
@@ -179,6 +194,9 @@ void SettingsManager::init_load(void (*on_db_error)(const char *msg)) {
     cp_cur_filter_low.recompute();
     cp_cur_filter_high.recompute();
     cp_cur_filter_bw.recompute();
+
+    // A band left with a shift: its TX frequency as the shift has it, whatever was saved
+    tx_shift_follow();
 }
 
 void SettingsManager::on_mode_filter_low_not_found() {
@@ -189,12 +207,51 @@ void SettingsManager::on_mode_filter_high_not_found() {
     p_mode_filter_high.set_quiet(mode_group_filter_high_default((ModeGroup)p_mode_filter_high.context_id()));
 }
 
+// The rows of every mode never written: the value in use stays, and zoom_step_scope saves it there
 void SettingsManager::on_mode_freq_step_not_found() {
-    p_mode_freq_step.set_quiet(mode_group_freq_step_default((ModeGroup)p_mode_freq_step.context_id()));
+    if (p_mode_freq_step.context_id() != MODE_ALL) {
+        p_mode_freq_step.set_quiet(mode_group_freq_step_default((ModeGroup)p_mode_freq_step.context_id()));
+    }
 }
 
 void SettingsManager::on_mode_zoom_not_found() {
-    p_mode_zoom.set_quiet(mode_group_zoom_default((ModeGroup)p_mode_zoom.context_id()));
+    if (p_mode_zoom.context_id() != MODE_ALL) {
+        p_mode_zoom.set_quiet(mode_group_zoom_default((ModeGroup)p_mode_zoom.context_id()));
+    }
+}
+
+void SettingsManager::zoom_step_scope(bool at_init) {
+    Parameter<int32_t> *const zs[] = {&p_mode_zoom, &p_mode_freq_step};
+
+    if (p_zoom_step_per_mode.get()) {
+        if (p_mode_zoom.context_id() != MODE_ALL) {
+            return;
+        }
+        // Back per mode: the current mode's own values, which the shared ones never wrote over. A change made in its
+        // rows just before the option went off may still be queued, and load() reads the database
+        pending_writes_.flush_storage(StorageType::MODE, mode_group_id_);
+        for (Parameter<int32_t> *p : zs) {
+            p->set_context_id(mode_group_id_);
+            p->load();
+        }
+        return;
+    }
+    if (p_mode_zoom.context_id() == MODE_ALL) {
+        return;
+    }
+    // One zoom and one step for every mode. At a start, those saved for every mode. The option turned off now, or
+    // those rows never written: the current mode's, the ones on screen (nothing jumps), written to the rows of every
+    // mode so a restart in another mode finds them and not that mode's own
+    for (Parameter<int32_t> *p : zs) {
+        p->set_context_id(MODE_ALL);
+        if (!at_init || p->load() == NOT_FOUND) {
+            pending_writes_.write(StorageKey{StorageType::MODE, MODE_ALL, p->db_name()}, p->get());
+        }
+    }
+}
+
+void SettingsManager::zoom_step_scope_cb(Subject * /*subj*/, void *user_data) {
+    static_cast<SettingsManager *>(user_data)->zoom_step_scope(false);
 }
 
 void SettingsManager::switch_band(int new_band_id, bool implicit) {
@@ -246,14 +303,56 @@ void SettingsManager::vfo_toggle() {
     const bool    on_a  = p_band_current_vfo.get() == RADIO_VFO_A;
     const int32_t other = (on_a ? p_vfob_band : p_vfoa_band).get();
 
+    // The other VFO's band only where the radio can still use it: a 2 m left there by v0.3.5 on an X6200 with the
+    // transverters and the WR12 off is not (load_band_vfo would keep its 145.500, and the base be sent it)
+    auto usable = [this](int32_t id) {
+        BandInfoLoadResult b = BandsTable::get_by_id(id);
+        return b.rc == SUCCESS && band_use(b.value.start_freq, b.value.stop_freq) != BAND_USE_NONE;
+    };
+
     (on_a ? p_vfoa_band : p_vfob_band).set(band_id_);
     p_band_current_vfo.set(on_a ? RADIO_VFO_B : RADIO_VFO_A);
-    if (p_indep_vfo.get() && other != BAND_UNDEFINED && other != band_id_ &&
-        BandsTable::get_by_id(other).rc == SUCCESS) {
+    if (p_indep_vfo.get() && other != BAND_UNDEFINED && other != band_id_ && usable(other)) {
         p_band_id.set(other);   /* explicit switch: both VFO records of that band are loaded */
+    } else if (p_band_tx_shift.get() && p_band_split.get()) {
+        band_follow(p_band_vfoa_freq.get());    /* a TX shift: the band is A's, B = A + the shift can lie beyond it */
     } else {
         band_follow(fg_freq_get());   /* the VFO now active was tuned into another band while inactive */
     }
+}
+
+void SettingsManager::tx_shift_follow() {
+    const int32_t shift = p_band_tx_shift.get();
+
+    if (shift == 0 || !p_band_split.get() || tx_shift_busy_) {
+        return;
+    }
+    tx_shift_busy_ = true;
+    // The mode too: in split the base transmits on the other VFO in that VFO's own mode, so a B left in NFM sent
+    // FM on an SSB band (bench, 2026-10-26)
+    if (p_band_current_vfo.get() == RADIO_VFO_A) {
+        p_band_vfob_freq.set(p_band_vfoa_freq.get() + shift);
+        p_band_vfob_mode.set(p_band_vfoa_mode.get());
+    } else {
+        p_band_vfoa_freq.set(p_band_vfob_freq.get() - shift);
+        p_band_vfoa_mode.set(p_band_vfob_mode.get());
+    }
+    // Independent VFOs: the other VFO is on this band too, so a VFO switch stays here (the reverse) instead of
+    // loading the band that VFO was on before
+    Parameter<int32_t> &other = p_band_current_vfo.get() == RADIO_VFO_A ? p_vfob_band : p_vfoa_band;
+    if (other.get() != band_id_) {
+        other.set(band_id_);
+    }
+    tx_shift_busy_ = false;
+}
+
+void SettingsManager::tx_shift_cb(Subject * /*subj*/, void *user_data) {
+    static_cast<SettingsManager *>(user_data)->tx_shift_follow();
+}
+
+void SettingsManager::tx_shift_set(int32_t hz) {
+    p_band_tx_shift.set(hz);
+    p_band_split.set(hz != 0);
 }
 
 void SettingsManager::switch_mode(ModeGroup new_group_id) {
@@ -428,16 +527,19 @@ int32_t SettingsManager::clamp_to_valid_hw_freq(int32_t freq) const {
         return freq;
     }
 
-    // Boundaries of every hardware-usable frequency range.
+    // Boundaries of every hardware-usable frequency range (HF_MAX_FREQ again for one that is not there)
+    const bool    wr12 = HAS_VHF_RX && p_wr12.get();
     const int32_t bounds[] = {
         HF_MIN_FREQ,                // HF lower limit
         HF_MAX_FREQ,                // HF upper limit
         HAS_VHF_RX ? VHF_RX_MIN_FREQ : HF_MAX_FREQ,     // the X6200's FM broadcast and airband
         HAS_VHF_RX ? VHF_RX_MAX_FREQ : HF_MAX_FREQ,
-        p_transverter_0_from.get(), // transverter 0 [from, to]
-        p_transverter_0_to.get(),
-        p_transverter_1_from.get(), // transverter 1 [from, to]
-        p_transverter_1_to.get(),
+        wr12 ? WR12_MIN_FREQ : HF_MAX_FREQ,             // the WR12
+        wr12 ? WR12_MAX_FREQ : HF_MAX_FREQ,
+        p_transverter_0_shift.get() ? p_transverter_0_from.get() : HF_MAX_FREQ,    // transverter 0 [from, to], on
+        p_transverter_0_shift.get() ? p_transverter_0_to.get() : HF_MAX_FREQ,
+        p_transverter_1_shift.get() ? p_transverter_1_from.get() : HF_MAX_FREQ,    // transverter 1 [from, to], on
+        p_transverter_1_shift.get() ? p_transverter_1_to.get() : HF_MAX_FREQ,
     };
 
     int32_t nearest = bounds[0];
@@ -632,7 +734,14 @@ void SettingsManager::vfo_freq_change_cb(Subject *subj, void *user_data) {
     if (subj != active) {
         return;
     }
-    mgr->band_follow(static_cast<SubjectT<int32_t> *>(subj)->get());
+    int32_t freq = static_cast<SubjectT<int32_t> *>(subj)->get();
+
+    // REV with a TX shift: the band of VFO A, which tx_shift_follow is about to put at B - the shift. B itself can
+    // lie beyond the band (10 m + 500 kHz from 29.500), and following it went into the gap above and lost the shift
+    if (subj == &mgr->p_band_vfob_freq && mgr->p_band_tx_shift.get() && mgr->p_band_split.get()) {
+        freq = std::max(freq - mgr->p_band_tx_shift.get(), HF_MIN_FREQ);
+    }
+    mgr->band_follow(freq);
 }
 
 void SettingsManager::band_follow(int32_t freq) {
@@ -742,8 +851,11 @@ void SettingsManager::set_band_context(int band_id) {
 }
 
 void SettingsManager::set_mode_context(int mode_id) {
+    // The zoom and the step of every mode stay with every mode (zoom_step_scope)
     for (ParamBase *p : mode_params_) {
-        p->set_context_id(mode_id);
+        if (p->context_id() != MODE_ALL) {
+            p->set_context_id(mode_id);
+        }
     }
 }
 
@@ -758,8 +870,11 @@ void SettingsManager::load_band_all(int band_id) {
 }
 
 void SettingsManager::load_mode_all() {
+    // Not the zoom and step of every mode: a mode change keeps them, and their row may lag a change still queued
     for (ParamBase *p : mode_params_) {
-        p->load(p->context_id());
+        if (p->context_id() != MODE_ALL) {
+            p->load(p->context_id());
+        }
     }
 }
 
@@ -795,11 +910,12 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
 
     // VFOA frequency: skipped on an implicit switch (active: preserved, inactive: kept).
     if (!implicit) {
-        // vfoa_freq: NOT_FOUND -> band start (or the default); an out-of-range
-        // loaded value is clamped to the band start.
+        // vfoa_freq: NOT_FOUND -> band start (or the default), on what the radio can tune (4m has no opening
+        // frequency and neither radio tunes 70 MHz); an out-of-range loaded value is clamped.
         int rc = p_band_vfoa_freq.load(band_id);
         if (rc == NOT_FOUND) {
-            p_band_vfoa_freq.set_quiet(have_band ? static_cast<int32_t>(band.value.start_freq) : default_freq);
+            p_band_vfoa_freq.set_quiet(have_band ? clamp_to_valid_hw_freq(static_cast<int32_t>(band.value.start_freq))
+                                                 : default_freq);
         } else if (rc == SUCCESS && have_band) {
             const int32_t freq = p_band_vfoa_freq.get();
             if (freq < static_cast<int32_t>(band.value.start_freq) ||
@@ -868,13 +984,23 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
     }
 }
 
-/* A band (or a gap) with no mode saved yet. Broadcast bands (ids 100-199) were LSB under 10 MHz and USB above,
- * where every station is AM: it sounded garbled and hard to find (issue #9) */
-int32_t SettingsManager::resolve_default_mode(int32_t freq, int32_t band_id) {
-    if (HAS_VHF_RX && freq >= VHF_RX_MIN_FREQ && freq < 108000000) return radio_mode_wfm;
-    if (HAS_VHF_RX && freq >= 108000000 && freq <= VHF_RX_MAX_FREQ) return radio_mode_am;
-    if (band_id >= 100 && band_id < 200) return radio_mode_am;
+/* 60 m is worked in USB, though under 10 MHz (the WRC-15 band and the channels around it) */
+int32_t SettingsManager::default_mode(int32_t freq) const {
+    if (band_use(freq, freq) == BAND_USE_RX) {
+        if (freq >= VHF_RX_MIN_FREQ && freq < 108000000) return radio_mode_wfm;
+        if (freq >= 108000000 && freq <= VHF_RX_MAX_FREQ) return radio_mode_am;
+        return radio_mode_nfm;      /* the WR12: 2 m, 70 cm and the like */
+    }
+    if (freq >= 5250000 && freq <= 5450000) return radio_mode_usb;
     return freq < 10000000 ? radio_mode_lsb : radio_mode_usb;
+}
+
+/* A band (or a gap) with no mode saved yet. Broadcast bands (ids 100-199) were LSB under 10 MHz and USB above,
+ * where every station is AM: it sounded garbled and hard to find (issue #9). FM broadcast and Airband (112, 113)
+ * are receive bands of their own */
+int32_t SettingsManager::resolve_default_mode(int32_t freq, int32_t band_id) const {
+    if (band_id >= 100 && band_id < 200 && band_use(freq, freq) != BAND_USE_RX) return radio_mode_am;
+    return default_mode(freq);
 }
 
 std::string SettingsManager::make_default_encoder_bind() {

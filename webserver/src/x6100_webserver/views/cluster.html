@@ -8,6 +8,10 @@
     <div class="dp-lbl"><b>Cluster link</b><span>Off: the radio holds no cluster login</span></div>
     <div class="dp-ctl"><label class="sw" title="Cluster link"><input type="checkbox" role="switch" id="enabled" aria-label="Cluster link"><i></i></label></div>
   </div>
+  <div class="dp-row">
+    <div class="dp-lbl"><b>On the radio</b><span id="linkserver">What the link does now, as APP → Cluster shows it</span></div>
+    <div class="dp-ctl"><span class="status" id="linknow"></span></div>
+  </div>
   <div class="dp-body">
     <div class="grid">
       <div><label for="login">Login</label><input id="login" autocomplete="off" maxlength="15" pattern="[A-Za-z0-9/\-]{1,15}" placeholder="your call"></div>
@@ -79,6 +83,10 @@
         <option value="120">120 min</option>
       </select></div>
     <div><label for="skip">Skip spotters</label><input id="skip" autocomplete="off" maxlength="120" placeholder="e.g. K1TTT-# , *-3"></div>
+  </div>
+  <div class="grid" style="grid-template-columns:1fr">
+    <div><label for="spotdxcc">Heard in <small>(the spotter's country, by its prefix; empty = all. Alerts still come through)</small></label>
+      <input id="spotdxcc" autocomplete="off" maxlength="120" placeholder="e.g. PA, ON"></div>
   </div>
   <div class="actions">
     <button type="button" class="primary" id="save-filters">Save</button>
@@ -167,6 +175,7 @@ var render = function(data) {
   $("#max_age").val(String(f.max_age));
   if ($("#max_age").val() === null) $("#max_age").append($("<option>").val(f.max_age).text(f.max_age + " min")).val(String(f.max_age));
   $("#skip").val(f.skip.split(",").join(", "));
+  $("#spotdxcc").val((f.spotter_dxcc || "").split(",").join(", "));
 
   const alerts = $("#alerts>tbody").empty();
   data.alerts.forEach(function(a, i) {
@@ -204,8 +213,9 @@ var call = function(type, url, payload, st="#status", then) {
     data: payload ? JSON.stringify(payload) : undefined,
     contentType: "application/json; charset=utf-8",
     dataType: "json",
+    timeout: X6100_WAIT_MS,
     success: function(r) { render(r); showStatus("Saved", false, st); if (then) then(r); },
-    error: function(xhr) { showStatus(xhr.responseJSON ? xhr.responseJSON.msg : "The radio did not answer (HTTP " + xhr.status + ")", true, st); }
+    error: function(xhr, why) { showStatus(x6100FailText(xhr, why), true, st); }
   });
 }
 /* The filters: Unsaved until Save, what was typed kept when the radio refuses it */
@@ -223,7 +233,7 @@ $("#add").on("submit", function(e) {
 $("#save-filters").on("click", function() {
   const modes = $("#modes input:checked").map(function() { return this.value; }).get();
   call("POST", "/api/cluster/filters",
-       {modes: modes, max_age: Number($("#max_age").val()), skip: $("#skip").val().trim(),
+       {modes: modes, max_age: Number($("#max_age").val()), skip: $("#skip").val().trim(), spotter_dxcc: $("#spotdxcc").val().trim(),
         bands: $("#fbands input:checked").map(function() { return Number(this.value); }).get(),
         activity: $("#activity input:checked").map(function() { return this.value; }).get()}, "#fstatus");
 });
@@ -245,4 +255,24 @@ $("#save-link").on("click", saveLink);
 $("#popup, #beep").on("change", function() {
   call("POST", "/api/cluster/alert-options", {popup: $("#popup").prop("checked"), beep: $("#beep").prop("checked")}, "#astatus");
 });
+
+/* The link as the radio's APP Cluster shows it, every 3 s while the page is in view: the login going on, a refusal,
+ * or a change made here that the radio has not taken up */
+var linkBusy = false;
+var linkNow = function() {
+  if (document.hidden || linkBusy) return;
+  linkBusy = true;
+  $.ajax({url: "/api/cluster/link", dataType: "json", timeout: X6100_WAIT_MS,
+    success: function(r) {
+      const off = r.state === "off" || r.state === "nocall";
+      $("#linkserver").text(r.server && !off ? r.server : "What the link does now, as APP → Cluster shows it");
+      if (!r.state) showStatus("No word from the radio yet: is it starting?", false, "#linknow");
+      else if (r.stale) showStatus("Not taken up by the radio yet (" + r.text + ")", true, "#linknow");
+      else showStatus(r.text, ["nocall", "nonet", "failed"].indexOf(r.state) >= 0, "#linknow");
+    },
+    error: function(xhr, why) { showStatus(x6100FailText(xhr, why), true, "#linknow"); },
+    complete: function() { linkBusy = false; }});
+}
+linkNow();
+setInterval(linkNow, 3000);
 </script>

@@ -29,7 +29,7 @@
   <div class="dp-head"><span class="dp-ico"><svg class="i"><use href="#i-key"/></svg></span><div><h3>Good to know</h3><p>Before you turn it on</p></div></div>
   <div class="dp-body">
     <ul style="margin:0;padding-left:18px;color:var(--dim);line-height:1.5">
-      <li>Everyone on your tailnet reaches the radio as if they were on its own network: these pages have no login, TCI clients need none, and SSH asks for root's password. Share the radio's machine in Tailscale only with people you would let in at home.</li>
+      <li>Everyone on your tailnet reaches the radio as if they were on its own network: these pages have no login, TCI clients need none, and SSH takes the keys added on System &gt; SSH. Share the radio's machine in Tailscale only with people you would let in at home.</li>
       <li>The browser's microphone needs a secure page: open <b>https://</b> with the radio's name and accept its certificate, as at home.</li>
       <li>Remote and Panel still ask for pairing before they operate, exactly as on the home network.</li>
       <li>The login stays on the radio. A new card image keeps Tailscale on, but asks for a new login.</li>
@@ -96,8 +96,9 @@ var act = function(action, saying) {
     data: JSON.stringify({action: action}),
     contentType: "application/json; charset=utf-8",
     dataType: "json",
+    timeout: 45000,   /* x6100-tailscale: 30 s at most (set_tailscale) */
     success: function(r) { busy = false; render(r); showStatus("Done"); },
-    error: function(xhr) { busy = false; refresh(); showStatus(xhr.responseJSON ? xhr.responseJSON.msg : "The radio did not answer (HTTP " + xhr.status + ")", true); }
+    error: function(xhr, why) { busy = false; refresh(); showStatus(x6100FailText(xhr, why, 45000), true); }
   });
 }
 

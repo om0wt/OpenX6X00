@@ -31,6 +31,7 @@
 #include "encoder_bind_types.h"
 #include "parameter.h"
 #include "pending_writes.h"
+#include "settings_manager_api.h"
 
 extern "C" {
 }
@@ -98,7 +99,13 @@ class SettingsManager {
         StorageType::GLOBAL, pending_writes_, &global_params_};
     Parameter<int32_t> p_imic{"imic", 30, 0, 50,
         StorageType::GLOBAL, pending_writes_, &global_params_};
+#ifdef BOARD_X6200
+    /* The TX monitor off: the X6200's speaker and built-in microphone share the case, and at 30 the
+     * microphone took the monitor back into the transmission, a loud ringing on PTT in SSB (issue #15) */
+    Parameter<int32_t> p_moni{"moni", 0, 0, 100,
+#else
     Parameter<int32_t> p_moni{"moni", 30, 0, 100,
+#endif
         StorageType::GLOBAL, pending_writes_, &global_params_};
     Parameter<int32_t> p_atu_enabled{"atu", false, 0, 1,
         StorageType::GLOBAL, pending_writes_, &global_params_};
@@ -116,10 +123,18 @@ class SettingsManager {
     // sideband of the band in a phone segment (screen_main.c)
     Parameter<int32_t> p_mode_from_plan{"mode_from_plan", true, 0, 1,
         StorageType::GLOBAL, pending_writes_, &global_params_};
+    // Zoom and step per mode (Settings > Display): on, each mode group keeps its own waterfall zoom and tuning
+    // step, as it always did. Off, one zoom and one step for every mode (zoom_step_scope)
+    Parameter<int32_t> p_zoom_step_per_mode{"zoom_step_per_mode", true, 0, 1,
+        StorageType::GLOBAL, pending_writes_, &global_params_};
     // Birdies (birdie.c): 0 nothing, 1 marked on the waterfall, 2 marked and notched in the passband
     Parameter<int32_t> p_birdie_marks{"birdie_marks", 1, 0, 2,
         StorageType::GLOBAL, pending_writes_, &global_params_};
     Parameter<int32_t> p_indep_vfo{"indep_vfo", false, 0, 1,
+        StorageType::GLOBAL, pending_writes_, &global_params_};
+    // The WR12, Xiegu's receiver on the X6200's HOST port, is there (Settings > General): 54 MHz-1 GHz to receive.
+    // A setting until the radio can tell it is plugged in; read only on the X6200 (band_use)
+    Parameter<int32_t> p_wr12{"wr12", false, 0, 1,
         StorageType::GLOBAL, pending_writes_, &global_params_};
     Parameter<int32_t> p_vfoa_band{"vfoa_band", BAND_UNDEFINED, BAND_UNDEFINED, 1000000,
         StorageType::GLOBAL, pending_writes_, &global_params_};
@@ -275,6 +290,10 @@ class SettingsManager {
         StorageType::GLOBAL, pending_writes_, &global_params_};
     Parameter<int32_t> p_wspr_upload{"wspr_upload", false, 0, 1,
         StorageType::GLOBAL, pending_writes_, &global_params_};
+    // WSPR's own TX power, as the dBm the beacon reports (20 = 0.1 W, 23 = 0.2 W ... 37 = 5 W); the radio's power
+    // setting is left alone. 23 dBm: 0.2 W is a 0.1 W step of the X6200 and an exact WSPR level, 0.25 W neither
+    Parameter<int32_t> p_wspr_dbm{"wspr_dbm", 23, 20, 37,
+        StorageType::GLOBAL, pending_writes_, &global_params_};
     // Decodes (FT8 FT4 FT2 JS8 PSK31 PSK63 Olivia) to PSK Reporter, on by default
     Parameter<int32_t> p_pskreporter{"pskreporter", true, 0, 1,
         StorageType::GLOBAL, pending_writes_, &global_params_};
@@ -418,8 +437,15 @@ class SettingsManager {
         StorageType::BAND, pending_writes_, {}, &band_params_};
     Parameter<int32_t> p_band_grid_max{"grid_max", -73, {},
         StorageType::BAND, pending_writes_, {}, &band_params_};
-    Parameter<int32_t> p_band_split{"split", false, 0, 1,
-        StorageType::BAND, pending_writes_, &band_params_};
+    // Split, this band's own: a band that never saved one starts without, not with the last band's (a split a TX
+    // shift turned on stayed on in every band after)
+    Parameter<int32_t> p_band_split{"split", false, [](int32_t v) { return clip(v, 0, 1); },
+        StorageType::BAND, pending_writes_, [this] { p_band_split.set_quiet(0); }, &band_params_};
+    // TX shift of this band, Hz, 0 off (|shift| up to 10 MHz): with split on, the other VFO is kept at the active one
+    // + the shift (tx_shift_follow), so the radio transmits shifted: an FM repeater's input, a QO-100 station's IF.
+    // A band that never saved one has none, not the last band's
+    Parameter<int32_t> p_band_tx_shift{"tx_shift", 0, [](int32_t v) { return clip(v, -TX_SHIFT_MAX, TX_SHIFT_MAX); },
+        StorageType::BAND, pending_writes_, [this] { p_band_tx_shift.set_quiet(0); }, &band_params_};
     Parameter<int32_t> p_band_tx_i_offset{"tx_i_offset", 0, {},
         StorageType::BAND, pending_writes_, {}, &band_params_};
     Parameter<int32_t> p_band_tx_q_offset{"tx_q_offset", 0, {},
@@ -435,10 +461,10 @@ class SettingsManager {
         &band_params_};
     // BAND VFO params (context_id = bands_id). These are NOT in the band
     // registry: load_band_vfo() loads them in explicit dependency order so the
-    // DB restore/clamp rules can reference already-loaded siblings.
-    Parameter<int32_t> p_band_vfoa_freq{"vfoa_freq", 14'100'000, 100'000, 500'000'000,
+    // DB restore/clamp rules can reference already-loaded siblings. Up to 1 GHz: the WR12's top
+    Parameter<int32_t> p_band_vfoa_freq{"vfoa_freq", 14'100'000, 100'000, 1'000'000'000,
         StorageType::BAND, pending_writes_};
-    Parameter<int32_t> p_band_vfob_freq{"vfob_freq", 14'150'000, 100'000, 500'000'000,
+    Parameter<int32_t> p_band_vfob_freq{"vfob_freq", 14'150'000, 100'000, 1'000'000'000,
         StorageType::BAND, pending_writes_};
     Parameter<int32_t> p_band_vfoa_mode{"vfoa_mode", radio_mode_usb, (int32_t)radio_mode_lsb, (int32_t)radio_mode_last,
         StorageType::BAND, pending_writes_};
@@ -461,25 +487,30 @@ class SettingsManager {
     // context_id is the fixed transverter number (0 or 1) — never switched. NOT registered
     // in any load-all registry (group = nullptr): they are loaded individually
     // in init_load() with explicit load(0)/load(1). Values are frequencies in Hz.
+    // A shift of 0 is a transverter that is off. The X6200's are off by default: its 2 m and 70 cm are the WR12's,
+    // to receive, and the always-on transverters tuned "145.500" to 29.500 MHz and transmitted there, on 10 m.
+    // Migration _11 keeps the shift of one set up before. The X6100 keeps upstream's two, on by default
     // Transverter 0 (2m: 144-150 MHz, IF at 28 MHz)
     Parameter<int32_t> p_transverter_0_from{"from", 144'000'000, 70'000'000, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 0};
     Parameter<int32_t> p_transverter_0_to{"to", 150'000'000, 70'000'000, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 0};
-    Parameter<int32_t> p_transverter_0_shift{"shift", 116'000'000, 0, 500'000'000,
+    Parameter<int32_t> p_transverter_0_shift{"shift", HAS_VHF_RX ? 0 : 116'000'000, 0, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 0};
     // Transverter 1 (70cm: 432-438 MHz, IF at 28 MHz)
     Parameter<int32_t> p_transverter_1_from{"from", 432'000'000, 70'000'000, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 1};
     Parameter<int32_t> p_transverter_1_to{"to", 438'000'000, 70'000'000, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 1};
-    Parameter<int32_t> p_transverter_1_shift{"shift", 404'000'000, 0, 500'000'000,
+    Parameter<int32_t> p_transverter_1_shift{"shift", HAS_VHF_RX ? 0 : 404'000'000, 0, 500'000'000,
         StorageType::TRANSVERTER, pending_writes_, nullptr, 1};
 
     // --- MODE params (`mode_params` table) ---
     // Parameter<int32_t> p_mode_squelch{
     //     "squelch",    0, StorageType::MODE, pending_writes_, [](int32_t v) { return clip(v, 0, 100); }, {},
     //     &mode_params_};
+    // The step and the zoom are the current mode group's, or every mode's (context MODE_ALL) while
+    // p_zoom_step_per_mode is off: their readers and writers never see the difference
     Parameter<int32_t> p_mode_freq_step{"freq_step", 500, [](int32_t v) { return clip(v, 1, 10000); },
         StorageType::MODE, pending_writes_, [this]() { on_mode_freq_step_not_found(); }, &mode_params_};
     Parameter<int32_t> p_mode_zoom{"spectrum_factor", 1, [](int32_t v) { return clip(v, 1, 8); },
@@ -567,6 +598,10 @@ class SettingsManager {
     int current_band_id() const { return band_id_; }
     int current_mode_group_id() const { return mode_group_id_; }
 
+    // The mode_params rows of the zoom and the step every mode shares (p_zoom_step_per_mode off): no mode group's,
+    // and not -1, which load() and flush_storage() take for "the bound one" and "any"
+    static constexpr int MODE_ALL = 100;
+
     // Hardware-usable frequency range limits (in Hz). HF is the native
     // 0.1-55 MHz band; anything above must be covered by a transverter.
     static constexpr int32_t HF_MIN_FREQ = 100'000;     /* upstream f6c97fa */
@@ -580,6 +615,12 @@ class SettingsManager {
 #else
     static constexpr bool HAS_VHF_RX = false;
 #endif
+    // The WR12 on the X6200's HOST port (p_wr12): 54 MHz-1 GHz, receive only
+    static constexpr int32_t WR12_MIN_FREQ = 54'000'000;
+    static constexpr int32_t WR12_MAX_FREQ = 1'000'000'000;
+
+    // The largest TX shift, Hz (p_band_tx_shift)
+    static constexpr int32_t TX_SHIFT_MAX = 10'000'000;
 
     // -- VFO operations --
     // Copies VFO-related band parameters (freq, mode, agc, att, pre) from the
@@ -591,34 +632,51 @@ class SettingsManager {
     void vfo_toggle();
     void band_follow(int32_t freq);    // the band the active VFO's frequency lies in, implicitly
 
+    // The TX shift of the current band, Hz (Settings, the web Bands page): split comes on with a shift, off with 0
+    void tx_shift_set(int32_t hz);
+
     // Transverter shift for a frequency: the shift of the transverter whose
     // [from, to] range contains `freq`, or 0 when no transverter covers it.
+    // A transverter with a shift of 0 is off and covers nothing.
     int32_t transverter_shift_for(int32_t freq) const {
-        if (freq >= p_transverter_0_from.get() && freq <= p_transverter_0_to.get())
+        if (p_transverter_0_shift.get() && freq >= p_transverter_0_from.get() && freq <= p_transverter_0_to.get())
             return p_transverter_0_shift.get();
-        if (freq >= p_transverter_1_from.get() && freq <= p_transverter_1_to.get())
+        if (p_transverter_1_shift.get() && freq >= p_transverter_1_from.get() && freq <= p_transverter_1_to.get())
             return p_transverter_1_shift.get();
         return 0;
     }
 
-    // True when `freq` is usable by the hardware: HF 0.1-55 MHz or inside any
-    // transverter [from, to] range. Bands-table ranges are informational only.
-    bool is_valid_hw_freq(int32_t freq) const {
-        if (freq >= HF_MIN_FREQ && freq <= HF_MAX_FREQ) {
-            return true;
-        }
-        return transverter_shift_for(freq) != 0 || is_rx_only_freq(freq);
+    // What the radio can do somewhere in [lo, hi]: TX where HF 0.1-55 MHz or a transverter with a shift covers part
+    // of it, else RX where the X6200 receives (its FM broadcast and airband; 54 MHz-1 GHz with the WR12 on), else
+    // nothing. A transverter wins where they overlap. Bands-table ranges are informational only.
+    band_use_t band_use(int32_t lo, int32_t hi) const {
+        auto in = [lo, hi](int32_t a, int32_t b) { return lo <= b && hi >= a; };
+
+        if (in(HF_MIN_FREQ, HF_MAX_FREQ)
+            || (p_transverter_0_shift.get() && in(p_transverter_0_from.get(), p_transverter_0_to.get()))
+            || (p_transverter_1_shift.get() && in(p_transverter_1_from.get(), p_transverter_1_to.get())))
+            return BAND_USE_TX;
+        if (HAS_VHF_RX && (in(VHF_RX_MIN_FREQ, VHF_RX_MAX_FREQ) || (p_wr12.get() && in(WR12_MIN_FREQ, WR12_MAX_FREQ))))
+            return BAND_USE_RX;
+        return BAND_USE_NONE;
     }
 
-    // The radio receives `freq` but must not transmit there (the X6200's FM broadcast and airband range)
-    bool is_rx_only_freq(int32_t freq) const {
-        return HAS_VHF_RX && freq >= VHF_RX_MIN_FREQ && freq <= VHF_RX_MAX_FREQ && transverter_shift_for(freq) == 0;
-    }
+    // True when `freq` is usable by the hardware, to receive at least
+    bool is_valid_hw_freq(int32_t freq) const { return band_use(freq, freq) != BAND_USE_NONE; }
+    // The radio receives `freq` but must not transmit there (the X6200's FM broadcast and airband, the WR12)
+    bool is_rx_only_freq(int32_t freq) const { return band_use(freq, freq) == BAND_USE_RX; }
+    // The radio transmits on `freq`
+    bool is_tx_freq(int32_t freq) const { return band_use(freq, freq) == BAND_USE_TX; }
 
     // If `freq` is hardware-usable, return it unchanged. Otherwise clamp to the
-    // nearest boundary of any hardware-usable frequency range (HF 0.1-55 MHz or
-    // the configured transverter [from, to] ranges).
+    // nearest boundary of any hardware-usable frequency range (HF 0.1-55 MHz,
+    // the transverters that are on, the X6200's receive ranges).
     int32_t clamp_to_valid_hw_freq(int32_t freq) const;
+
+    // The mode a frequency opens in when its band has none saved: its sideband, LSB under 10 MHz and USB above
+    // (and on 60 m, where USB is used); wide FM and AM on the X6200's FM broadcast and airband, NFM where only the
+    // WR12 receives
+    int32_t default_mode(int32_t freq) const;
 
   private:
     // active VFO frequency of the current band (compute fn for cp_fg_freq).
@@ -660,6 +718,13 @@ class SettingsManager {
     // by setting p_band_id; the observer runs switch_band with implicit=false.
     static void switch_band_observer_cb(Subject *subj, void *user_data);
 
+    // The TX shift kept: while the band has one and split is on, the other VFO is the active one + the shift (on
+    // VFO A: B = A + shift; on VFO B: A = B - shift, the reverse), in the active one's mode. Run on every change of
+    // either VFO's frequency or mode, the active VFO, split and the shift, so any path that tunes (knob, memory,
+    // CAT, TCI, the apps, a band switch) brings the TX frequency along; a write to the other VFO is put back
+    void tx_shift_follow();
+    static void tx_shift_cb(Subject *subj, void *user_data);
+
     // Mode group functions
     static ModeGroup mode_group(radio_mode_t mode);
     static int32_t mode_group_filter_low_default(ModeGroup group);
@@ -681,13 +746,19 @@ class SettingsManager {
     // for new_group_id.
     void switch_mode(ModeGroup new_group_id);
 
-    // Apply the current band/mode context to every parameter in the group.
+    // Apply the current band/mode context to every parameter in the group. A mode param bound to MODE_ALL keeps it.
     void set_band_context(int band_id);
     void set_mode_context(int mode_id);
 
-    // Full group loads (used by init_load).
+    // Full group loads (used by init_load). load_mode_all, also a mode switch's, leaves the params bound to MODE_ALL.
     void load_band_all(int band_id);
     void load_mode_all();
+
+    // The zoom and the step bound as p_zoom_step_per_mode has it: to the current mode group, or to MODE_ALL. At
+    // init the values saved for every mode are read; the option turned off, the current mode's become every mode's.
+    // Back per mode, each mode's own values return: the shared ones were never written into their rows
+    void zoom_step_scope(bool at_init);
+    static void zoom_step_scope_cb(Subject *subj, void *user_data);
 
     // Switch-time band loads: never loads current_vfo; when `implicit` is true
     // also keeps the active VFO's freq+mode (loads only the inactive VFO).
@@ -705,8 +776,8 @@ class SettingsManager {
     // When `implicit` the active VFO's freq+mode is skipped (kept, not loaded).
     void load_band_vfo(int band_id, bool implicit);
 
-    // Default mode for a frequency: LSB below 10 MHz, USB at or above.
-    static int32_t resolve_default_mode(int32_t freq, int32_t band_id);
+    // Default mode for a band with none saved: default_mode(freq), AM in the broadcast bands
+    int32_t resolve_default_mode(int32_t freq, int32_t band_id) const;
 
     // Default 50-char encoder-bind string (all NONE except the documented
     // VOL/MFK positions). Static: callable from the ctor init list.
@@ -757,6 +828,9 @@ class SettingsManager {
     // RAII: unsubscribes on destruction.
     Subscription switch_mode_obs_;
 
+    // The p_zoom_step_per_mode observer: rebinds the zoom and the step (zoom_step_scope)
+    Subscription zoom_step_obs_;
+
     // Holds the p_band_id observer that triggers an explicit band switch when
     // p_band_id is set. RAII: unsubscribe on destruction.
     Subscription band_id_obs_;
@@ -766,6 +840,11 @@ class SettingsManager {
     // destruction.
     Subscription vfoa_freq_obs_;
     Subscription vfob_freq_obs_;
+
+    // The TX shift's observers (both VFO frequencies and modes, the active VFO, split, the shift) and its re-entrancy
+    // guard: tx_shift_follow writes a VFO it watches
+    Subscription tx_shift_obs_[7];
+    bool         tx_shift_busy_ = false;
 
     // Background flush thread control.
     bool                    flush_thread_running_ = false;
