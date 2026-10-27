@@ -30,6 +30,7 @@
 #include "screen_main.h"
 #include "screen_rec.h"
 #include "gui_styles.h"
+#include "mono.h"
 #include "fonts/font_select.h"
 #include "radio.h"
 #include "dsp.h"
@@ -110,8 +111,9 @@ static void display_settings_check(void) {
     fix_uint8(&params.spectrum_peak_speed);
 }
 
-#if USE_DRM
-/* SIGUSR1: the screen to /tmp/screen.raw (with DRM /dev/fb0 no longer shows it) */
+#if USE_DRM || USE_SDL
+/* SIGUSR1: the screen to /tmp/screen.raw (with DRM /dev/fb0 no longer shows it; on a PC the
+ * window's last frame, for tools/screenshots/host_shots.py) */
 static volatile sig_atomic_t dump_requested;
 
 static void dump_signal(int sig) {
@@ -141,6 +143,7 @@ static void panel_open(void) {
 #if USE_SDL
     host_panel_open();
     screen_rec_out = host_panel_flush;
+    signal(SIGUSR1, dump_signal);
     return;
 #endif
 #if USE_DRM
@@ -165,6 +168,7 @@ static void display_register(void) {
     lv_disp_drv_init(&disp_drv);
     disp_drv.draw_buf = &draw_buf;
     disp_drv.flush_cb = screen_rec_flush;
+    disp_drv.draw_ctx_init = mono_draw_ctx_init;   /* LVGL's software renderer; 1bit hooks into it */
     disp_drv.hor_res  = BOARD_DISP_W;
     disp_drv.ver_res  = BOARD_DISP_H;
 #if USE_DRM
@@ -314,6 +318,12 @@ static void gui_loop(void) {
             dump_requested = 0;
             drm_dump("/tmp/screen.raw.tmp");
             rename("/tmp/screen.raw.tmp", "/tmp/screen.raw");
+        }
+#endif
+#if USE_SDL
+        if (dump_requested) {
+            dump_requested = 0;
+            if (host_panel_dump("/tmp/screen.raw.tmp")) rename("/tmp/screen.raw.tmp", "/tmp/screen.raw");
         }
 #endif
         if (!drawn) {

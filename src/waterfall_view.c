@@ -21,6 +21,7 @@
 #include "scheduler.h"
 #include "gui_styles.h"
 #include "theme.h"
+#include "mono.h"
 #include "util.h"
 #include "lv_drivers/display/drm.h"
 
@@ -43,6 +44,7 @@ typedef struct {
     uint32_t center_freq;
     uint32_t width;     /* Hz of the data; 0: empty */
     uint8_t  floor;     /* 75th percentile: above it the row has signals */
+    uint8_t  seq;       /* 1bit: the dither row it keeps while it scrolls down */
     bool     kept;      /* the values around the data are set */
 } wf_row_t;
 
@@ -64,6 +66,7 @@ static float         level_min = TX_MIN;
 static float         level_max = TX_MAX;
 
 static uint8_t       skip_rows;         /* rows of the old frequency still coming after a retune */
+static bool          retuned;           /* since the row before (#51) */
 static int32_t       radio_center_freq; /* where the base is tuned */
 static int32_t       wf_center_freq;    /* the frequency at the centre of the picture */
 static int32_t       mode_lo_offset;
@@ -110,6 +113,11 @@ static void make_objs(void);
 /* Settings (web Display page): the theme's colours or one of these */
 static void on_palette_change(Subject *subj, void *user_data) {
     extern const uint32_t wf_palette_legacy[256], wf_palette_gauss[256];   /* styles.c */
+
+    if (theme_shape.mono) {     /* 1bit: its ink density, not the presets */
+        wf_palette = theme_waterfall();
+        return;
+    }
     static const uint32_t grey[]    = {0x000000, 0xffffff};
     static const uint32_t fire[]    = {0x000000, 0x400000, 0xa00000, 0xff4000, 0xffa000, 0xffff60, 0xffffff};
     static const uint32_t ice[]     = {0x000000, 0x001040, 0x0040a0, 0x0090ff, 0x40e0ff, 0xffffff};
@@ -151,9 +159,9 @@ static double keep_pos(uint32_t hz) {
     return ((double) hz - keep_anchor) * WATERFALL_NFFT / keep_width;
 }
 
-/* Fixed mode: a new row's data (db, its colours from min to max) into keep_db, and the
- * row's values around its data from keep_db */
-static void keep_around(wf_row_t *row, const float *db, float min, float max) {
+/* Fixed mode: a new row's data (db, its colours from min to max) into keep_db (learn: not a row
+ * that may still be of the frequency before), and the row's values around its data from keep_db */
+static void keep_around(wf_row_t *row, const float *db, float min, float max, bool learn) {
     if (row->width != keep_width || fabs(keep_pos(row->center_freq) - DATA_AT - keep_bin) >= ROW_BINS) {
         /* The first, another zoom or another band: nothing kept */
         keep_width = row->width;
@@ -179,7 +187,7 @@ static void keep_around(wf_row_t *row, const float *db, float min, float max) {
     keep_bin += move;
 
     /* The data, received now */
-    for (int32_t k = 0; k < ROW_BINS; k++) {
+    for (int32_t k = 0; learn && k < ROW_BINS; k++) {
         float   x = k - frac - DATA_AT;
         int32_t i = floorf(x);
 
@@ -213,17 +221,40 @@ static void keep_around(wf_row_t *row, const float *db, float min, float max) {
     row->kept = true;
 }
 
+static uint8_t row_seq;     /* 1bit: the next row's dither row */
+
 void waterfall_data(float *db, uint16_t size, bool tx, uint32_t base_freq, uint32_t width_hz) {
+    /* After a retune the base's next rows may still be of the frequency before: from rest, the two
+     * are dropped. With the dial turning on, every row was, and the waterfall stood still until it
+     * rested (#51): a retune within five rows of the one before is the dial turning, and then the
+     * rows come as they are, at most a step behind. A row that may be behind is drawn, not kept
+     * (Fixed mode) */
+    static uint8_t still = UINT8_MAX;   /* rows since the last retune */
+    static bool    turning;
+    bool           fresh = true;
+
+    if (retuned && base_freq == 0) {
+        retuned = false;
+        turning = still < 5;
+        still = 0;
+    } else if (still < UINT8_MAX) {
+        still++;
+    }
     if (skip_rows && base_freq == 0) {
-        skip_rows--;
-        return;
+        if (!turning) {
+            skip_rows--;
+            return;
+        }
+        skip_rows = 0;
+        fresh = false;
     }
 
     /* Speed 1 and 2 average 3 and 2 frames into one line (5 and 7.5 lines/s);
      * 4 and 5 get faster frames from the DSP */
     static const uint8_t speed_frames[] = {3, 2, 1, 1, 1};
     static float    acc[WATERFALL_NFFT];
-    static int      acc_n;
+    static int      acc_n, acc_frames;     /* the frames in the line, and since the line before */
+    static bool     acc_fresh;
     static uint32_t acc_freq;
     int             frames = speed_frames[LV_CLAMP(1, param_i_get(cfg_waterfall_speed), 5) - 1];
     /* Where the frame was taken: with no frequency from the base (the OEM X6100 base) the GUI's,
@@ -232,20 +263,25 @@ void waterfall_data(float *db, uint16_t size, bool tx, uint32_t base_freq, uint3
 
     if (frames > 1 && size <= WATERFALL_NFFT) {
         if (acc_n == 0 || at != acc_freq) {
-            /* first frame, or the radio moved: start a new line */
+            /* first frame, or the radio moved: the line again from this frame (one frequency in it) */
             memcpy(acc, db, size * sizeof(float));
             acc_n = 1;
             acc_freq = at;
+            acc_fresh = fresh;
         } else {
             liquid_vectorf_add(acc, db, size, acc);
             acc_n++;
+            acc_fresh &= fresh;
         }
-        if (acc_n < frames) {
+        /* a line every `frames` frames, the dial turning or not: restarted at each step, it came only
+         * once the dial rested (#51) */
+        if (++acc_frames < frames) {
             return;
         }
         liquid_vectorf_mulscalar(acc, size, 1.0f / acc_n, acc);
         db = acc;
-        acc_n = 0;
+        fresh = acc_fresh;
+        acc_n = acc_frames = 0;
     }
 
     /* The row is made in the slot after the newest, which is never drawn, and shown once whole.
@@ -280,13 +316,14 @@ void waterfall_data(float *db, uint16_t size, bool tx, uint32_t base_freq, uint3
     uint32_t n = 0, id = 0;
     while (id < 255 && (n += hist[id]) < size * 3 / 4) id++;
     row->floor = id;
+    row->seq = row_seq++;
 
     /* Not the picture of TX: after it the same frequencies are received again */
     row->kept = false;
     if (!param_i_get(cfg_wf_mode)) {
         keep_width = 0;
     } else if (!tx && size == WATERFALL_NFFT && width_hz) {
-        keep_around(row, db, min, max);
+        keep_around(row, db, min, max, fresh);
     }
     __atomic_store_n(&newest, next, __ATOMIC_RELEASE);
     __atomic_add_fetch(&new_rows, 1, __ATOMIC_RELEASE);
@@ -337,14 +374,27 @@ static uint32_t shown_span(void) {
 
 /* ---- Direct mode ---- */
 
+/* 1bit: the column of the dither pattern landscape pixel 0 is at; it moves with the slides, so a
+ * pixel keeps the dots it was drawn with */
+static uint8_t dither_x;
+
+/* A level's pixel: its palette colour, or in 1bit ink or paper by its ink density, dithered where
+ * the pattern stays with the picture (the row's own dither row, the column it moves with): fixed
+ * to the screen, the dots would crawl as the rows scroll */
+static inline uint32_t wf_pixel(uint8_t v, int x, const wf_row_t *row) {
+    if (!theme_shape.mono) return wf_palette[v];
+    return (mono_dither(theme_wf_density()[v], x, row->seq) ? theme_shape.ink : theme_shape.paper) | 0xff000000;
+}
+
 /* Pixels i0..i1-1 of a landscape row (age 0 the newest) into portrait column age
  * of wfp, at the image's centre */
 static void direct_column(int32_t age, uint32_t span, size_t i0, size_t i1) {
-    uint8_t px[WIDTH];
+    uint8_t         px[WIDTH];
+    const wf_row_t *row = row_at(age);
 
-    row_pixels(row_at(age), wfp_center, span, i0, i1, px);
+    row_pixels(row, wfp_center, span, i0, i1, px);
     for (size_t i = i0; i < i1; i++) {
-        wfp[(WIDTH - 1 - i) * height + (wfp_head + age) % height] = wf_palette[px[i]] | 0xff000000;
+        wfp[(WIDTH - 1 - i) * height + (wfp_head + age) % height] = wf_pixel(px[i], i + dither_x, row) | 0xff000000;
     }
 }
 
@@ -416,6 +466,7 @@ static void direct_redraw(int new_row) {
 
             /* Landscape pixel i now shows the old i + px: portrait row R the old R - px */
             wfp_center += (int64_t) px * bandwidth / WIDTH;
+            dither_x += px;
             if (px > 0) {
                 memmove(wfp + px * height, wfp, (WIDTH - px) * height * sizeof(uint32_t));
                 i0 = WIDTH - px;
@@ -444,11 +495,15 @@ static void image_redraw(void) {
     uint32_t    span = shown_span();
     lv_color_t *px = (lv_color_t *) frame->data;
     uint8_t     c[WIDTH];
+    /* 1bit: the dither column by frequency, so the dots move with the picture while tuning */
+    int         x0 = theme_shape.mono && span ? (int)((int64_t) wf_center_freq * WIDTH / span) : 0;
 
     for (int32_t y = 0; y < height; y++, px += WIDTH) {
-        row_pixels(row_at(y), wf_center_freq, span, 0, WIDTH, c);
+        const wf_row_t *row = row_at(y);
+
+        row_pixels(row, wf_center_freq, span, 0, WIDTH, c);
         for (size_t i = 0; i < WIDTH; i++) {
-            px[i] = (lv_color_t) wf_palette[c[i]];
+            px[i] = (lv_color_t) wf_pixel(c[i], x0 + i, row);
         }
     }
     lv_obj_invalidate(img);
@@ -541,7 +596,7 @@ static void image_drawn_cb(lv_event_t *e) {
 /* ---- The VFO line and the passband ---- */
 
 static void update_middle_line(void) {
-    lv_coord_t width = zoom / 2 + 3;
+    lv_coord_t width = theme_shape.mono ? 3 : zoom / 2 + 3;     /* 1bit: the paper halo of vfo_core_cb() */
     lv_coord_t vfo_x = (if_shift + waterfall_view_shift()) * zoom * WIDTH / SPAN_HZ;
 
     lv_obj_set_pos(vfo_line, vfo_x + width / 2, 0);
@@ -592,6 +647,18 @@ static void vfo_line_cb(lv_event_t *e) {
     }
 }
 
+/* 1bit: the VFO line 1 px of ink in its 3 px paper halo, readable over the dots and the carriers */
+static void vfo_core_cb(lv_event_t *e) {
+    lv_obj_t          *l = lv_event_get_target(e);
+    lv_draw_line_dsc_t d;
+    lv_point_t         a = {l->coords.x1, l->coords.y1}, b = {l->coords.x1, l->coords.y1 + height};
+
+    lv_draw_line_dsc_init(&d);
+    d.color = TC(vfo_line);
+    d.width = 1;
+    lv_draw_line(lv_event_get_draw_ctx(e), &d, &a, &b);
+}
+
 static void set_line_height(void) {
     vfo_line_points[1].y = height;
     lv_line_set_points(vfo_line, vfo_line_points, 2);
@@ -612,6 +679,7 @@ static void on_view_changed(Subject *subj, void *user_data) {
 /* A new frequency: the next rows the base sends may still be of the old one */
 static void on_if_shift_changed(Subject *subj, void *user_data) {
     skip_rows = 2;
+    retuned = true;
     if_shift = subject_i_get((SubjectInt *)subj);
     radio_center_freq = cparam_i_get(cfg_fg_freq) - if_shift;
     update_middle_line();
@@ -619,6 +687,7 @@ static void on_if_shift_changed(Subject *subj, void *user_data) {
 
 static void on_fg_freq_change(Subject *subj, void *user_data) {
     skip_rows = 2;
+    retuned = true;
     radio_center_freq = subject_i_get((SubjectInt *)subj) - if_shift;
 }
 
@@ -661,16 +730,25 @@ lv_obj_t * waterfall_init(lv_obj_t * parent) {
     lv_style_set_line_opa(&vfo_line_style, LV_OPA_COVER);
     lv_style_set_pad_all(&vfo_line_style, 0);
 
-    /* Filter passband: a light band of the VFO line colour, under the line */
+    /* Filter passband: a light band of the VFO line colour, under the line (1bit: its two edges) */
     filter_band = lv_obj_create(obj);
     lv_obj_remove_style_all(filter_band);
-    lv_obj_set_style_bg_opa(filter_band, LV_OPA_20, 0);
+    lv_obj_set_style_bg_opa(filter_band, theme_shape.mono ? LV_OPA_TRANSP : LV_OPA_20, 0);
+    if (theme_shape.mono) {
+        lv_obj_set_style_border_side(filter_band, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT, 0);
+        lv_obj_set_style_border_width(filter_band, 1, 0);
+        lv_obj_set_style_border_color(filter_band, TC(vfo_line), 0);
+    }
     lv_obj_set_height(filter_band, LV_PCT(100));
     lv_obj_clear_flag(filter_band, LV_OBJ_FLAG_CLICKABLE);
 
     vfo_line = lv_line_create(obj);
     lv_obj_add_style(vfo_line, &vfo_line_style, 0);
     lv_obj_center(vfo_line);
+    if (theme_shape.mono) {
+        lv_obj_set_style_line_color(vfo_line, TC(panel), 0);
+        lv_obj_add_event_cb(vfo_line, vfo_core_cb, LV_EVENT_DRAW_POST, NULL);
+    }
     lv_obj_add_event_cb(obj, vfo_line_cb, LV_EVENT_DRAW_POST_END, NULL);
 
     subject_subscribe_delayed_and_notify((Subject *)cfg_mode_zoom, on_zoom_changed, NULL);

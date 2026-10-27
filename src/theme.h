@@ -21,7 +21,8 @@
 extern "C" {
 #endif
 
-/* role, RF.Guru, Legacy, Outdoor, Classic (IC-7300 style) */
+/* role, RF.Guru, Legacy, Outdoor, Classic (IC-7300 style)
+ * a new role: decide its 1bit value too (theme.c onebit_paper[], ink otherwise) */
 #define THEME_COLORS(X) \
     /* screen and the shared boxes (styles.c) */ \
     X(bg,                0x08090c, 0x0040a0, 0xffffff, 0x000000) /* screen background */ \
@@ -196,7 +197,10 @@ typedef struct {
                              * frequency, the frequency edges in the spectrum, one-line flat buttons */
     bool    kx3;            /* KX3Lovers Plus: the KX3-style display (lcd_panel.c) over the screen, the layout of the
                              * X6100 KX3 screen its author agreed to, a spectrum strip, one-line buttons */
-    uint32_t waterfall[16];    /* palette stops from weak to strong signal */
+    bool     mono;          /* 1bit: every pixel ink or paper (src/mono.c): no anti-aliasing, see-through
+                             * as stipple, dithered pictures and waterfall, the pixel font */
+    uint32_t ink, paper;    /* 1bit: its two colours (0xRRGGBB) */
+    uint32_t waterfall[16];     /* palette stops from weak to strong signal */
     uint8_t  waterfall_n;       /* 0 = a built-in table (waterfall_table) */
     uint8_t  waterfall_table;   /* 0 gauss, 1 legacy */
     uint8_t  waterfall_steps;   /* 0 smooth, else that many flat bands */
@@ -215,6 +219,9 @@ void theme_init(const char *name);
 int theme_list(char names[][32], int max);
 
 const uint32_t *theme_waterfall(void);
+
+/* 1bit: the ink density (0 none .. 255 solid) of each of the 256 waterfall levels, for mono_dither() */
+const uint8_t *theme_wf_density(void);
 
 /* Filter passband colour preset (Settings > Display): 0xRRGGBB, -1 for 0 (the theme's) */
 int32_t theme_filter_color(int32_t preset);

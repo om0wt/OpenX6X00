@@ -37,6 +37,72 @@ BOARD=$EXT/board/$M/linux
 KERNEL_DEFCONFIG=$BOARD/sun8i-r16-$MODEL\_defconfig
 mkdir -p "$HOME"
 
+# The buildroot trees are our forks, github.com/Guru-RF/AetherX6100Buildroot and .../AetherX6200Buildroot, of
+# Aether Radio's (the X6100's moved from gdyuldin to OpenX6100). A change upstream reaches an image only once it
+# is merged into the fork: each build says when upstream has commits the tree here has not, at the start and
+# again at the end, and on GitHub as a warning on the run. Work on upstream's other branches (pull requests on
+# their way) newer than the tree and not in it is named too, as a note. It never stops the build
+UPSTREAM=$([ $MODEL = x6100 ] && echo OpenX6100/AetherX6100Buildroot || echo gdyuldin/AetherX6200Buildroot)
+UPSTREAM_NOTE=""
+UPSTREAM_WORK=""
+upstream_check() {
+    local new head
+    # CI checks the tree out with one commit: its own history (small, not buildroot's) for the comparison
+    if [ "$(git -C $BR rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+        git -C $BR fetch -q --unshallow 2>/dev/null || true
+    fi
+    if ! GIT_TERMINAL_PROMPT=0 git -C $BR fetch -q "https://github.com/$UPSTREAM" HEAD 2>/dev/null; then
+        echo "== Upstream $UPSTREAM: not reachable, not checked"
+        return 0
+    fi
+    head=$(git -C $BR rev-parse FETCH_HEAD)
+    upstream_branches "$head"
+    if git -C $BR merge-base --is-ancestor $head HEAD 2>/dev/null; then
+        echo "== Upstream $UPSTREAM: nothing new on its main branch (its head ${head:0:9} is in this tree)"
+        [ -n "$UPSTREAM_WORK" ] && printf '%s\n' "$UPSTREAM_WORK"
+        return 0
+    fi
+    new=$(git -C $BR log --oneline --no-decorate HEAD..$head 2>/dev/null | head -20 || true)
+    UPSTREAM_NOTE=$(printf '%s\n' \
+        "!! UPSTREAM CHANGED: $UPSTREAM has commits $BRDEF here has not:" \
+        "$(printf '%s\n' "${new:-(none listed: see https://github.com/$UPSTREAM/commits)}" | sed 's/^/!!   /')" \
+        "!! This image is built without them. Look at them, then merge them into Guru-RF/$BRDEF, or not.")
+    printf '%s\n' "$UPSTREAM_NOTE"
+    if [ -n "$GITHUB_ACTIONS" ]; then
+        echo "::warning title=Upstream $UPSTREAM changed::$(printf '%s\n' "$new" | grep -c .) commit(s) not in Guru-RF/$BRDEF; this image is built without them (see the job summary)"
+        [ -n "$GITHUB_STEP_SUMMARY" ] && printf '### Upstream %s changed\n\nNot in Guru-RF/%s, not in this image:\n\n```\n%s\n```\n' \
+            "$UPSTREAM" "$BRDEF" "$new" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    [ -n "$UPSTREAM_WORK" ] && printf '%s\n' "$UPSTREAM_WORK"
+    return 0
+}
+# Upstream's other branches ($1: its main branch's head, left out) whose newest commit is newer than this tree's
+# and not in it: UPSTREAM_WORK, and on GitHub a notice and the summary. Older ones (merged or left long ago) are
+# not named, or they would be at every build
+upstream_branches() {
+    local since sha ref work=""
+
+    GIT_TERMINAL_PROMPT=0 git -C $BR fetch -q --prune "https://github.com/$UPSTREAM" '+refs/heads/*:refs/upstream-watch/*' \
+        2>/dev/null || return 0
+    since=$(git -C $BR log -1 --format=%ct HEAD)
+    while read -r sha ref; do
+        [ "$sha" = "$1" ] && continue
+        [ "$(git -C $BR log -1 --format=%ct $sha)" -gt "$since" ] || continue
+        git -C $BR merge-base --is-ancestor $sha HEAD 2>/dev/null && continue
+        work="$work$(git -C $BR log -1 --format="${ref#refs/upstream-watch/}, %cs, %an: %s" $sha)"$'\n'
+    done < <(git -C $BR for-each-ref --format='%(objectname) %(refname)' refs/upstream-watch/)
+    [ -n "$work" ] || return 0
+    UPSTREAM_WORK=$(printf '%s\n' "== Upstream $UPSTREAM: work on other branches, newer than this tree and not in it:" \
+        "$(printf '%s' "$work" | sed 's/^/     /')")
+    if [ -n "$GITHUB_ACTIONS" ]; then
+        echo "::notice title=Upstream $UPSTREAM: work on other branches::$(printf '%s' "$work" | grep -c .) branch(es) newer than Guru-RF/$BRDEF (see the job summary)"
+        [ -n "$GITHUB_STEP_SUMMARY" ] && printf '### Upstream %s: work on other branches\n\nNewer than Guru-RF/%s and not in it (pull requests on their way):\n\n```\n%s```\n' \
+            "$UPSTREAM" "$BRDEF" "$work" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    return 0
+}
+upstream_check
+
 echo "== $M: GUI package $GUI_PKG from $GUI"
 sed -i "s,^${GUI_VAR}_SITE = .*,${GUI_VAR}_SITE = $GUI,g" $GUI_MK
 sed -i "s,^${GUI_VAR}_SITE_METHOD = git,${GUI_VAR}_SITE_METHOD = local,g" $GUI_MK
@@ -258,4 +324,6 @@ python3 $GUI/tools/update/mkbundle.py --target $BR/build/target --manifest $(ls 
 
 cp $BR/build/images/sdcard.img $BR/build/images/$OUT-local-sdcard.img
 ls -la $BR/build/images/$OUT-local-sdcard.img
+[ -n "$UPSTREAM_NOTE" ] && printf '%s\n' "$UPSTREAM_NOTE"     # again, after the long log
+[ -n "$UPSTREAM_WORK" ] && printf '%s\n' "$UPSTREAM_WORK"
 echo "== done"

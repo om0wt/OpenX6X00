@@ -150,7 +150,7 @@ The patched X6100 base comes with its own instructions.
 | **Radio** | IARU Region 1 band plan strip (60 m too, and a strip for each band you add), 60 m on the band keys, which step over a band the radio cannot tune (4 m), a TX shift per band for FM repeaters and a QO-100 IF (split kept by itself, REV on the VFO key), Birdie Cal (the radio's own carriers found, marked, notched), S-meter in bars or a needle, long-press actions on every key, editable bands, memories and channels, the broadcast bands in AM, transverters, RX recorder, screen recording and screenshots, voice messages, SWR scan, Walkie Talkie portrait mode, PRE and ATT on the VOL 2:2 page, local time on screen with UTC in the logs. |
 | **X6200** | SAM and WFM on the AM key, zoom 1 to 4 over the base's 384 kHz, the two-ring MFK, FM broadcast (87.5-108 MHz) and the airband (118-137 MHz) to receive after 6 m on the band keys, a WR12 switch for Xiegu's 54 MHz-1 GHz receiver on the HOST port (2 m and 70 cm to receive; not yet tried with a WR12, [manual](docs/MANUAL.md#wr12-receiver-x6200)), transverters off by default (they put 2 m on 10 m), PRE and ATT on the VOL 2:2 page since it has no PRE key, the volume over the base's whole range (0 to 100). |
 | **Screen** | DRM/KMS output with the GUI on a transparent layer over a waterfall drawn one line at a time, about half the CPU of the old path; a main knob with every detent timed in its own thread and acceleration that grows with the speed. |
-| **Themes** | Every colour, corner, font and waterfall palette comes from the theme. RF.Guru, Classic, Outdoor, Outdoor-Negative, VISION, Black Metal and Total Black come with the image; Holo and Material 3 are in [themes/](themes) to copy to the card; your own go on the card too ([docs/THEMES.md](docs/THEMES.md)). |
+| **Themes** | Every colour, corner, font and waterfall palette comes from the theme. RF.Guru, Classic, Outdoor, Outdoor-Negative, VISION, Black Metal, Total Black and 1bit come with the image; Holo and Material 3 are in [themes/](themes) to copy to the card; your own go on the card too ([docs/THEMES.md](docs/THEMES.md)). |
 | **Wireless** | WiFi (a failed join says why on the screen), a USB Ethernet adapter with DHCP or a fixed address, USB tethering, a network name of your own; Bluetooth CAT for three clients, headphones and keyboards with pairings that survive a new image. |
 | **Browser panel** | `http://x6100.local/panel` (`x6200.local` on an X6200): the radio worked natively from a phone, a tablet or a PC, portrait or landscape: the spectrum and the waterfall live (tap or drag to tune, pinch to zoom), the frequency, band, mode, step and zoom, every switch and level, the S-meter, the DX spots (tap to tune), the FT8 app (decodes, tap to answer, CQ, auto, hold), the CW decoder's text, a log entry, RX audio and the browser's microphone for TX, a light theme for the sun. What the closed phone app does, as a web page. |
 | **Browser remote** | `http://x6100.local/remote` (Remote > Screen in the web menu): the radio's screen live in any browser (up to three browsers at a time, the Panel and Screen pages together), every key and knob, RX audio and the browser's microphone for TX, a Picture choice (Sharp, Balanced, Fast) for a slow link, for the radio's own menus and apps. |
@@ -347,9 +347,15 @@ Added:
 ## Build
 
 The images are built by
-[AetherX6100Buildroot](https://github.com/gdyuldin/AetherX6100Buildroot) and
-[AetherX6200Buildroot](https://github.com/gdyuldin/AetherX6200Buildroot), with
-this repository as their GUI package. `buildroot/local-build.sh` patches the
+[AetherX6100Buildroot](https://github.com/Guru-RF/AetherX6100Buildroot) and
+[AetherX6200Buildroot](https://github.com/Guru-RF/AetherX6200Buildroot), our forks
+of Aether Radio's trees ([OpenX6100](https://github.com/OpenX6100/AetherX6100Buildroot),
+[gdyuldin](https://github.com/gdyuldin/AetherX6200Buildroot)), with this repository as
+their GUI package. A change upstream reaches an image only once it is merged into the
+fork: every build checks, and says at its start and end (on GitHub as a warning on the
+run) when upstream has commits the fork has not, and names upstream's other branches
+with newer work (pull requests on their way) as a note. The X6100's upstream is
+gdyuldin's tree, moved to OpenX6100. `buildroot/local-build.sh` patches the
 buildroot tree (local GUI and web server, `boost` and `fftw-single` for JS8,
 no RHVoice, the boot logo), builds it and makes the update bundle. The GitHub
 Actions workflow (`.github/workflows/main.yml`, *Build image*, run by hand,
@@ -359,7 +365,7 @@ with their bundles as workflow artifacts; run on a tag, it also attaches them
 to that release (the releases since v0.2.2 were built locally and their files
 attached by hand). Locally, the same build runs in a container: clone the
 buildroot tree with its submodule (`git clone --recurse-submodules
-https://github.com/gdyuldin/AetherX6100Buildroot`) next to this repository
+https://github.com/Guru-RF/AetherX6100Buildroot`) next to this repository
 (itself cloned with `--recurse-submodules`), then, from this repository's
 folder,
 
@@ -373,7 +379,7 @@ leaves `../AetherX6100Buildroot/build/images/OpenX6X00-x6100-local-sdcard.img` (
 an hour the first time, 20 cores; `buildroot/local-build.sh` has the patch
 steps, `buildroot/Dockerfile` the Ubuntu 22.04 host with CMake 3.28 and
 sqlite3). The X6200 is the same GUI on its own buildroot tree,
-[AetherX6200Buildroot](https://github.com/gdyuldin/AetherX6200Buildroot)
+[AetherX6200Buildroot](https://github.com/Guru-RF/AetherX6200Buildroot)
 cloned next to this repository: the same command with `-e MODEL=x6200` leaves
 `../AetherX6200Buildroot/build/images/OpenX6X00-x6200-local-sdcard.img` and the
 `OpenX6X00-x6200-v<version>-update.tar.gz` bundle (the updater on a radio takes
@@ -411,7 +417,7 @@ buildroot/               local-build.sh and Dockerfile (the image), br2_external
                          build.sh (the GUI alone with the buildroot toolchain)
 host/                    the GUI on a PC (SDL, stub radio)
 tools/                   screenshots/ (drive.py, grab.py, pull.py), update/ (the bundle),
-                         tci/ (the TCI server's host test), icons/ and logo/
+                         tci/ (the TCI server's host test), icons/, logo/ and fonts/
 assets/                  the logo's fonts and marks
 docs/                    MANUAL.md, THEMES.md, MENUS.md, UPSTREAM_README.md, audit/,
                          screenshots/ (taken by script on an X6200)
@@ -454,7 +460,8 @@ recovery, the JS8 map, the high-SWR guard and the digital-mode drive level;
 2E0JFS the Black Metal and Total Black themes. Libraries: LVGL, cJSON, FFTW,
 liquid-dsp, ft8_lib, libpng, Boost, Eigen, CRCpp, bottle, jQuery, mp4-muxer,
 PulseAudio, BlueZ. The country list is AD1C's cty.dat. Fonts:
-Roboto, DejaVu, Arial, Sony Sketch, Inter (the boot logo). The skimmer spots
+Roboto, DejaVu, Arial, Sony Sketch, Inter (the boot logo), Terminus (the 1bit theme's
+pixel font, OFL-1.1, src/fonts/LICENSE-Terminus-OFL-1.1.txt). The skimmer spots
 come from the Reverse Beacon Network and the broadcast schedule from the EiBi
 list by Eike Bierwirth. The Field Ops reference lists come from POTA, SOTA,
 WWBOTA, cqhota.app, WWFF, TOTA (OK2IH, wwtota.com), the WCA castle list as
