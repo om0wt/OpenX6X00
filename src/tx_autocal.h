@@ -24,6 +24,12 @@ bool tx_autocal_running(void);
 /* Any thread: what it does or what it did, one line per band */
 void tx_autocal_status(char *buf, size_t size);
 
+/* The config socket's commands (cfg_socket.cpp), on its thread; false when cmd is not one of them:
+ *    {"cmd":"txcal_start"} / {"cmd":"txcal_stop"}  -> {"t":"ok"}, run on the LVGL thread
+ *    {"cmd":"txcal_get"}                          -> {"t":"txcal","running":bool,"status":"lines"}
+ * The answer goes to out (*l its length), or an error to *err */
+bool tx_autocal_socket(const char *cmd, char *out, size_t size, int *l, const char **err);
+
 #ifdef __cplusplus
 }
 #endif

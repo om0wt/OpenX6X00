@@ -1317,7 +1317,7 @@ static void on_cluster_column_change(Subject *subj, void *user_data) {
 static lv_coord_t spectrum_layout(void) {
     lv_coord_t y = 0;
 
-    if (theme_shape.kx3) {   /* KX3Lovers Plus: a strip in the display, always (lcd_panel.c) */
+    if (theme_kx3) {   /* KX3Lovers Plus: a strip in the display, always (lcd_panel.c) */
         lv_obj_remove_local_style_prop(spectrum, LV_STYLE_OPA, 0);
         spectrum_height = LCD_PLUS_STRIP_H;
         lv_obj_set_y(spectrum, LCD_PLUS_STRIP_Y);
@@ -1438,7 +1438,7 @@ static void build(void) {
     meter = meter_init(obj);    /* deck: on the frequency panel */
     /* KX3Lovers Plus: the display over everything above the buttons, the spectrum strip and its edge
      * frequencies over it */
-    if (theme_shape.kx3) {
+    if (theme_kx3) {
         lcd_panel_init(obj, 480 - BUTTONS_H);
         lv_obj_set_style_border_width(spectrum, 1, 0);
         lv_obj_set_style_border_color(spectrum, TC(text), 0);

@@ -229,7 +229,7 @@ static int32_t wf_span() {
 
 /* KX3Lovers Plus shows its spectrum strip whatever Settings say */
 static bool spectrum_on() {
-    return (spectrum_shown || theme_shape.kx3) && spectrum_enabled.load(std::memory_order_relaxed);
+    return (spectrum_shown || theme_kx3) && spectrum_enabled.load(std::memory_order_relaxed);
 }
 
 /* * Panorama * */

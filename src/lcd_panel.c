@@ -672,3 +672,33 @@ void lcd_panel_cw_text(const char *text) {
     cw_ms = lv_tick_get();
     pthread_mutex_unlock(&cw_mux);
 }
+
+void lcd_panel_levels(float *min, float *max) {
+    /* ponytail: by eye on one radio, a setting if other bands or radios need another */
+    float span = *max - *min;
+
+    *min -= 0.25f * span;
+    *max -= 0.35f * span;
+}
+
+void lcd_panel_squeeze(uint32_t *strip, int h, int points, int w, uint32_t bg) {
+    if (w <= 0 || w >= points) return;
+    /* each column x takes the columns x * points / w up to the next: in place, left to right (they
+     * are never left of x), a pixel the first of them that is not bg, so the trace stays joined */
+    for (int x = 0; x < w; x++) {
+        uint32_t *dst = &strip[(points - 1 - x) * h];
+        int       a = x * points / w, b = LV_MAX((x + 1) * points / w, a + 1);
+
+        for (int y = 0; y < h; y++) {
+            uint32_t v = bg;
+
+            for (int c = a; c < b && v == bg; c++) v = strip[(points - 1 - c) * h + y];
+            dst[y] = v;
+        }
+    }
+    for (int x = w; x < points; x++) {
+        uint32_t *col = &strip[(points - 1 - x) * h];
+
+        for (int y = 0; y < h; y++) col[y] = bg;
+    }
+}

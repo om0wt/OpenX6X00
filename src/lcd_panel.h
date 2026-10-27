@@ -26,3 +26,10 @@ void lcd_panel_set_strip(lv_obj_t *spectrum);
 
 /* Any thread: CW decoder text, shown in the strip's lower half (Plus) */
 void lcd_panel_cw_text(const char *text);
+
+/* spectrum_view.c: the auto levels lifted for the short strip (the floor a quarter up, not on its edge) */
+void lcd_panel_levels(float *min, float *max);
+
+/* spectrum_view.c: its strip of points columns h high (column x at (points - 1 - x) * h) squeezed into
+ * the first w, the rest bg; nothing when w is the full width (every theme but Plus in CW) */
+void lcd_panel_squeeze(uint32_t *strip, int h, int points, int w, uint32_t bg);

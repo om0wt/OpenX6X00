@@ -87,7 +87,7 @@ static void bar_sizes(void) {
         freq_strip_h = 102;
         clock_w      = 280;
     }
-    if (theme_shape.kx3) buttons_h = 36;                       /* Plus: one line of text */
+    if (theme_kx3) buttons_h = 36;                       /* Plus: one line of text */
 }
 
 static void screen_styles(void) {
@@ -318,9 +318,9 @@ static void button_colours(void) {
     lv_style_set_border_color(&btn_active_style, TC(btn_active_border));
     lv_style_set_border_width(&btn_active_style, top_line ? 3 : LV_MAX(theme_shape.border, 2));
     lv_style_set_border_side(&btn_active_style, top_line ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
-    lv_style_set_border_side(&btn_style, theme_shape.kx3 ? LV_BORDER_SIDE_LEFT
+    lv_style_set_border_side(&btn_style, theme_kx3 ? LV_BORDER_SIDE_LEFT
                                          : theme_shape.deck ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
-    if (theme_shape.kx3) {   /* Plus: a line between the buttons, the active one plain */
+    if (theme_kx3) {   /* Plus: a line between the buttons, the active one plain */
         lv_style_set_border_side(&btn_active_style, LV_BORDER_SIDE_LEFT);
         lv_style_set_border_width(&btn_active_style, 1);
     }
@@ -421,7 +421,7 @@ static void surface_images(void) {
         lv_style_remove_prop(&btn_mark_style, LV_STYLE_BG_IMG_SRC);
         if (theme_shape.mono) lv_style_set_width(&btn_mark_active_style, 8);   /* 1bit: the knob's one twice as wide */
     }
-    if (theme_shape.kx3) lv_style_set_width(&btn_mark_style, 0);   /* Plus: no line over the buttons */
+    if (theme_kx3) lv_style_set_width(&btn_mark_style, 0);   /* Plus: no line over the buttons */
 }
 
 void styles_apply(void) {

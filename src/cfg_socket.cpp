@@ -8,8 +8,6 @@
  *    {"cmd":"disp_set","text":name,"val":v}           -> {"t":"ok"} or {"t":"err","err":"..."}; "theme":name for the theme
  *    {"cmd":"eth_get"}                                -> {"t":"eth", ...}
  *    {"cmd":"eth_set","dhcp":0|1,"ip":..,"mask":..,"gw":..,"dns":..}
- *    {"cmd":"txcal_start"} / {"cmd":"txcal_stop"}      -> {"t":"ok"}: the TX calibration (tx_autocal.cpp)
- *    {"cmd":"txcal_get"}                              -> {"t":"txcal","running":bool,"status":"lines"}
  *    {"cmd":"band_use","lo":hz,"hi":hz}               -> {"t":"band_use","use":0|1|2} (none, receive, transmit)
  *  The values are checked here and applied on the LVGL thread through the scheduler, as the
  *  Settings pages apply them.
@@ -279,30 +277,6 @@ static void eth_apply_cb(void *arg) {
     eth_apply((eth_cfg_t *)arg);
 }
 
-static void txcal_start_cb(void *arg) {
-    tx_autocal_start();
-}
-
-static void txcal_stop_cb(void *arg) {
-    tx_autocal_stop("Stopped (remote).");
-}
-
-static int txcal_get(char *out, size_t size) {
-    static char status[1500];   /* the newest lines, the answer fits in 2048 */
-    cJSON      *o = cJSON_CreateObject();
-
-    tx_autocal_status(status, sizeof(status));
-    cJSON_AddStringToObject(o, "t", "txcal");
-    cJSON_AddBoolToObject(o, "running", tx_autocal_running());
-    cJSON_AddStringToObject(o, "status", status);
-    char *s = cJSON_PrintUnformatted(o);
-    int   l = snprintf(out, size, "%s\n", s);
-
-    cJSON_free(s);
-    cJSON_Delete(o);
-    return l;
-}
-
 /* What the radio can do somewhere in [lo, hi] Hz (band_use: HF, the transverters that are on, the X6200's receive
  * ranges): the web Bands page checks a TX shift with it. Read only, answered from this thread */
 static const char *band_use_get(cJSON *req, char *out, size_t size, int *l) {
@@ -326,6 +300,7 @@ static int handle_line(const char *line, char *out, size_t size) {
 
     if (!cJSON_IsString(name)) {
         err = "Bad request";
+    } else if (tx_autocal_socket(name->valuestring, out, size, &l, &err)) {   /* txcal_*: tx_autocal.cpp */
     } else if (!strcmp(name->valuestring, "disp_get")) {
         l = disp_get(out, size);
     } else if (!strcmp(name->valuestring, "disp_set")) {
@@ -338,12 +313,6 @@ static int handle_line(const char *line, char *out, size_t size) {
         eth_cfg_t cfg;
         if (!(err = eth_set(req, &cfg)) && !scheduler_put(eth_apply_cb, &cfg, sizeof(cfg)))
             err = "Busy, try again";
-    } else if (!strcmp(name->valuestring, "txcal_start")) {
-        if (!scheduler_put_noargs(txcal_start_cb)) err = "Busy, try again";
-    } else if (!strcmp(name->valuestring, "txcal_stop")) {
-        if (!scheduler_put_noargs(txcal_stop_cb)) err = "Busy, try again";
-    } else if (!strcmp(name->valuestring, "txcal_get")) {
-        l = txcal_get(out, size);
     } else if (!strcmp(name->valuestring, "band_use")) {
         err = band_use_get(req, out, size, &l);
     } else {

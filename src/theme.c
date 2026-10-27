@@ -23,11 +23,10 @@
 #endif
 
 enum { B_RFGURU, B_LEGACY, B_OUTDOOR, B_CLASSIC, B_OUTDOOR_NEG, B_VISION, B_BLACK_METAL, B_TOTAL_BLACK, B_ONEBIT,
-       B_LCD_PLUS, B_COUNT };
+       B_COUNT };
 
 static const char *const builtin_names[B_COUNT] = {"RF.Guru", "Legacy", "Outdoor", "Classic", "Outdoor-Negative",
-                                                   "VISION", "Black Metal", "Total Black", "1bit",
-                                                   "KX3Lovers Plus"};
+                                                   "VISION", "Black Metal", "Total Black", "1bit"};
 
 /* 1bit: black on one white, as a monochrome LCD. These roles are the paper (screen, boxes, the text
  * on what is inverted), every other one the ink: what is on or selected is an ink box, and the mono
@@ -99,37 +98,6 @@ static const theme_set_t total_black_colors[] = {   /* over deck_colors */
     {TC_list, 0x000000},        {TC_frame, 0x000000},        {TC_veil, 0x000000},
 };
 
-/* KX3Lovers: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
- * than the glass (track). On Outdoor's colours for everything this table does not set */
-#define LCD_GLASS 0xe8b04c
-#define LCD_INK   0x1e1608
-#define LCD_DIM   0x5a4218
-#define LCD_OFF   0x9a7430
-#define LCD_GHOST 0xd9a240
-static const theme_set_t lcd_colors[] = {
-    {TC_bg, LCD_GLASS},         {TC_panel, LCD_GLASS},       {TC_bar, LCD_GLASS},           {TC_bar_grad, LCD_GLASS},
-    {TC_bar_border, LCD_INK},   {TC_strip, LCD_GLASS},       {TC_strip_grad, LCD_GLASS},    {TC_strip_border, LCD_INK},
-    {TC_dialog, LCD_GLASS},     {TC_dialog_grad, LCD_GLASS}, {TC_dialog_border, LCD_INK},   {TC_btn, LCD_GLASS},
-    {TC_btn_grad, LCD_GLASS},   {TC_btn_border, LCD_INK},    {TC_btn_text, LCD_INK},        {TC_btn_active, LCD_INK},
-    {TC_btn_active_grad, LCD_INK}, {TC_btn_active_border, LCD_INK}, {TC_btn_active_text, LCD_GLASS},
-    {TC_btn_page, 0xdca444},    {TC_btn_page_text, LCD_INK}, {TC_btn_off_text, LCD_OFF},    {TC_btn_off_border, LCD_OFF},
-    {TC_card, LCD_INK},         {TC_popup, 0xf0c060},        {TC_popup_border, LCD_INK},    {TC_side, LCD_GLASS},
-    {TC_chip, 0xdea648},        {TC_sel_bg, LCD_INK},        {TC_sel_text, LCD_GLASS},      {TC_sel_border, LCD_INK},
-    {TC_focus, LCD_INK},        {TC_focus_text, LCD_GLASS},  {TC_edited, LCD_DIM},          {TC_vfo, LCD_INK},
-    {TC_vfo_bg, 0xd09838},      {TC_text, LCD_INK},          {TC_text_value, LCD_INK},      {TC_text_dim, LCD_DIM},
-    {TC_text_soft, LCD_DIM},    {TC_text_mute, LCD_OFF},     {TC_text_faint, 0xc49440},     {TC_text_head, LCD_INK},
-    {TC_line, LCD_INK},         {TC_off, LCD_OFF},           {TC_track, LCD_GHOST},         {TC_icon_off, 0xcc9a42},
-    {TC_info, LCD_INK},         {TC_accent, LCD_INK},        {TC_ok, LCD_INK},              {TC_toggle_on, LCD_INK},
-    {TC_vfo_line, LCD_INK},     {TC_spot, LCD_INK},          {TC_mode_text, LCD_INK},       {TC_mode_bg, LCD_GLASS},
-    {TC_mode_border, LCD_INK},  {TC_meter_bar, LCD_INK},     {TC_meter_weak, LCD_INK},      {TC_meter_low, LCD_INK},
-    {TC_meter_high, LCD_INK},   {TC_meter_over, LCD_INK},    {TC_pill_off_text, LCD_OFF},   {TC_btn_mark, LCD_OFF},
-    {TC_btn_mark_assigned, LCD_DIM}, {TC_btn_mark_active, LCD_INK},
-    {TC_list, LCD_GLASS},       {TC_row, 0xdea648},          {TC_frame, LCD_GLASS},         {TC_veil, 0xd09838},
-    /* the band plan in shades of the glass, not in colour */
-    {TC_bp_cw, 0xc89038},       {TC_bp_dig, 0xd8a044},       {TC_bp_ssb, 0xb88430},         {TC_bp_bcn, LCD_DIM},
-    {TC_bp_text, LCD_INK},
-};
-
 static const uint32_t builtin_colors[B_OUTDOOR_NEG][TC_COUNT] = {   /* VISION and Outdoor-Negative are made from these */
 #define COL(name, a, b, c, d) a,
     {THEME_COLORS(COL)},
@@ -190,6 +158,7 @@ static int builtin_index(const char *name) {
     for (int i = 0; i < B_COUNT; i++) {
         if (name && strcasecmp(name, builtin_names[i]) == 0) return i;
     }
+    if (name && strcasecmp(name, THEME_KX3_NAME) == 0) return B_COUNT;   /* theme_kx3.inc */
     return -1;
 }
 
@@ -208,7 +177,8 @@ static void theme_set(const theme_set_t *s, size_t n) {
 
 /* Outdoor-Negative: Outdoor with every colour and the waterfall through negative() */
 static void use_builtin(int b) {
-    int src = b == B_OUTDOOR_NEG || b == B_LCD_PLUS ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
+    bool theme_kx3_use(int b); if (theme_kx3_use(b)) return;   /* KX3Lovers Plus: theme_kx3.inc */
+    int src = b == B_OUTDOOR_NEG ? B_OUTDOOR : b >= B_VISION ? B_RFGURU : b;
 
     memcpy(colors, builtin_colors[src], sizeof(colors));
     theme_shape = builtin_shapes[src];
@@ -249,21 +219,6 @@ static void use_builtin(int b) {
                                       /* ink density from the noise up (theme_wf_density): paper, then dots */
                                       .waterfall = {0xffffff, 0xffffff, 0xd8d8d8, 0xa8a8a8, 0x707070, 0x383838, 0x000000},
                                       .waterfall_n = 7};
-    }
-    if (b == B_LCD_PLUS) {
-        theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
-        theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true, .kx3 = true,
-                                      .mono_cluster = true,
-                                      /* the glass to the ink */
-                                      .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
-                                      .waterfall_n = 5};
-    }
-    if (b == B_LCD_PLUS) {   /* the buttons as text between lines, the active one not inverted */
-        static const theme_set_t plus[] = {
-            {TC_btn_active, LCD_GLASS}, {TC_btn_active_grad, LCD_GLASS}, {TC_btn_active_text, LCD_INK},
-            {TC_btn_page, LCD_GLASS},   {TC_panel, 0xf4c870},   /* the spectrum strip: lighter glass */
-        };
-        theme_set(plus, sizeof(plus) / sizeof(plus[0]));
     }
     snprintf(theme_shape.name, sizeof(theme_shape.name), "%s", builtin_names[b]);
 }
@@ -610,6 +565,7 @@ int theme_list(char names[][32], int max) {
     for (int i = 0; i < B_COUNT && n < max; i++) {
         if (i != B_LEGACY) snprintf(names[n++], 32, "%s", builtin_names[i]);
     }
+    if (n < max) snprintf(names[n++], 32, "%s", THEME_KX3_NAME);   /* theme_kx3.inc */
     d = opendir(THEMES_DIR);
     while (d && (e = readdir(d)) && n < max) {
         size_t len = strlen(e->d_name);
@@ -646,3 +602,5 @@ lv_obj_t *theme_icon_img(lv_obj_t *parent, const char *name, int size, lv_color_
     lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, 0);
     return img;
 }
+
+#include "theme_kx3.inc"

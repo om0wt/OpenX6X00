@@ -129,7 +129,7 @@ static void draw_cb(lv_event_t *e) {
 static void show_cb(Subject *subj, void *user_data) {
     radio_mode_t mode = cparam_i_get(cfg_cur_mode);
 
-    if (param_i_get(cfg_cw_tune) && (mode == radio_mode_cw || mode == radio_mode_cwr) && !theme_shape.kx3)
+    if (param_i_get(cfg_cw_tune) && (mode == radio_mode_cw || mode == radio_mode_cwr) && !theme_kx3)
         lv_obj_clear_flag(box, LV_OBJ_FLAG_HIDDEN);
     else
         lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);

@@ -23,6 +23,7 @@
 #include "rtty.h"
 #include "scheduler.h"
 #include "gui_styles.h"
+#include "lcd_panel.h"
 #include "theme.h"
 #include "util.h"
 #include "waterfall_view.h"
@@ -84,7 +85,6 @@ static bool             vfo_line_on = true;
 static bool             direct;
 static uint32_t        *strip;
 static int32_t          strip_h;
-static float            strip_sx = 1.0f;    /* the trace squeezed to a narrower spectrum (Plus, CW) */
 static int32_t          drawn_markers[12];
 
 /* Pixels from the centre of a view w wide for hz, rounded either way from 0 (half up, a VFO
@@ -118,14 +118,7 @@ static lv_coord_t trace_px(lv_coord_t w) {
 static void levels(float *min, float *max) {
     *min = data_tx ? TX_MIN : level_min;
     *max = data_tx ? TX_MAX : level_max;
-    if (theme_shape.kx3 && !data_tx) {
-        /* KX3Lovers Plus: on its short strip the floor a quarter up, not on the edge, and a little more
-         * gain (ponytail: by eye on one radio, a setting if other bands or radios need another) */
-        float span = *max - *min;
-
-        *min -= 0.25f * span;
-        *max -= 0.35f * span;
-    }
+    if (theme_kx3 && !data_tx) lcd_panel_levels(min, max);   /* KX3Lovers Plus: its short strip */
 }
 
 /* Fixed mode: a new trace into kept_db at the points it is drawn on; another view, another
@@ -491,7 +484,7 @@ static void polyline(const float *db, int from, int to, float min, float max, lv
             joined = false;
             continue;
         }
-        float x = (i + shift) * strip_sx;
+        float x = i + shift;
         float y = (1.0f - (db[i] - min) / (max - min)) * strip_h;
 
         y = LV_CLAMP(0.0f, y, (float)strip_h);
@@ -528,7 +521,7 @@ static void fill_columns(float min, float max, lv_coord_t shift) {
     int32_t    h = strip_h;
 
     for (int i = 0; i < POINTS; i++) {
-        int x = (i + shift) * strip_sx;
+        int x = i + shift;
 
         if (x < 0 || x >= POINTS) {
             continue;
@@ -573,7 +566,6 @@ static void direct_render(void) {
     lv_coord_t shift = trace_px(POINTS);
     int        from, to;
 
-    strip_sx = (float)lv_obj_get_width(obj) / POINTS;
     pthread_mutex_lock(&data_mux);
     if (params.spectrum_peak.x && !data_tx) {
         polyline(peak_db, 0, POINTS, min, max, shift, theme_shape.mono ? line : TC(off).full, false);
@@ -589,6 +581,7 @@ static void direct_render(void) {
         polyline(kept_db, from, to, min, max, 0, theme_shape.mono ? line : kept_color(trace_color(), TC(panel)).full,
                  true);
     }
+    lcd_panel_squeeze(strip, h, POINTS, lv_obj_get_width(obj), bg);   /* KX3Lovers Plus, CW: half wide */
 
 #if USE_DRM
     drm_wf_present(strip, obj->coords.y1, h);

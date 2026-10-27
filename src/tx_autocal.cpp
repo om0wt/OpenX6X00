@@ -25,9 +25,11 @@
 #include <vector>
 
 extern "C" {
+    #include "cJSON.h"
     #include "cfg/cfg_api.h"
     #include "radio.h"
     #include "radio_types.h"
+    #include "scheduler.h"
     #include "tx_info.h"
 
     #include "lvgl/lvgl.h"
@@ -254,4 +256,36 @@ void tx_autocal_status(char *buf, size_t size) {
 
     snprintf(buf, size, "%s", from == std::string::npos ? "" : status.c_str() + from + (from ? 1 : 0));
     pthread_mutex_unlock(&mux);
+}
+
+static void socket_start_cb(void *arg) {
+    tx_autocal_start();
+}
+
+static void socket_stop_cb(void *arg) {
+    tx_autocal_stop("Stopped (remote).");
+}
+
+bool tx_autocal_socket(const char *cmd, char *out, size_t size, int *l, const char **err) {
+    const bool start = !strcmp(cmd, "txcal_start");
+
+    if (start || !strcmp(cmd, "txcal_stop")) {
+        if (!scheduler_put_noargs(start ? socket_start_cb : socket_stop_cb)) *err = "Busy, try again";
+        return true;
+    }
+    if (strcmp(cmd, "txcal_get")) return false;
+
+    static char status[1500];   /* the newest lines, the answer fits in 2048 */
+    cJSON      *o = cJSON_CreateObject();
+
+    tx_autocal_status(status, sizeof(status));
+    cJSON_AddStringToObject(o, "t", "txcal");
+    cJSON_AddBoolToObject(o, "running", tx_autocal_running());
+    cJSON_AddStringToObject(o, "status", status);
+    char *s = cJSON_PrintUnformatted(o);
+
+    *l = snprintf(out, size, "%s\n", s);
+    cJSON_free(s);
+    cJSON_Delete(o);
+    return true;
 }

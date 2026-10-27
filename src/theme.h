@@ -195,8 +195,6 @@ typedef struct {
 #define VISION_FONT_STEPS 3 /* VISION: every font this many sizes up, apps and Settings too (fonts_scale) */
     bool    deck;           /* Black Metal, Total Black: two rows of state on top, S/SWR/ALC scales beside a big
                              * frequency, the frequency edges in the spectrum, one-line flat buttons */
-    bool    kx3;            /* KX3Lovers Plus: the KX3-style display (lcd_panel.c) over the screen, the layout of the
-                             * X6100 KX3 screen its author agreed to, a spectrum strip, one-line buttons */
     bool     mono;          /* 1bit: every pixel ink or paper (src/mono.c): no anti-aliasing, see-through
                              * as stipple, dithered pictures and waterfall, the pixel font */
     uint32_t ink, paper;    /* 1bit: its two colours (0xRRGGBB) */
@@ -207,6 +205,8 @@ typedef struct {
 } theme_shape_t;
 
 extern theme_shape_t theme_shape;
+extern bool theme_kx3;          /* KX3Lovers Plus (theme_kx3.inc): its display (lcd_panel.c) */
+#define THEME_KX3_NAME "KX3Lovers Plus"
 
 uint32_t theme_hex(theme_color_t c);
 #define TC(role) lv_color_hex(theme_hex(TC_##role))
