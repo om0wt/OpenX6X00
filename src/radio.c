@@ -201,10 +201,10 @@ void radio_bb_reset() {
     hw_bb_reset();
 }
 
-void radio_init() {
+bool radio_init() {
     if (!hw_init()) {
         start_trace("base: its pins or its line could not be opened");
-        return;
+        return false;
     }
 
     /* Back off (0.1 .. 25.6 s) and, once, after about 6 s without an answer,
@@ -224,6 +224,7 @@ void radio_init() {
         }
     }
     start_trace("base answered");
+    return true;
 }
 
 void radio_start() {
@@ -664,7 +665,7 @@ int radio_get_mic(void) {
     return mic_override < 0 ? param_i_get(cfg_mic) : mic_override;
 }
 
-static bool modem_on;
+static atomic_bool modem_on;    /* read on other threads (Winlink's on_air) while tx_player's thread keys */
 
 /* In split the audio goes out on the TX frequency through radio_set_tx_freq, as the apps' tone does (TCI's audio,
  * the voice messages): the active VFO moved before keying and back after; an app that moved it for its tone keeps
@@ -679,7 +680,7 @@ void radio_set_modem(bool tx) {
         radio_set_tx_freq(radio_tx_freq());
         moved = true;
     }
-    modem_on = tx;
+    atomic_store(&modem_on, tx);
     WITH_RADIO_LOCK(hw_set_i(HW_MODEM, tx));
     if (!tx && moved) {
         moved = false;
@@ -688,7 +689,7 @@ void radio_set_modem(bool tx) {
 }
 
 bool radio_get_modem(void) {
-    return modem_on;
+    return atomic_load(&modem_on);
 }
 
 /* Under the lock: the record, PTT, modem, tune and split bits share one register, and the

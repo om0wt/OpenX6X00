@@ -339,12 +339,22 @@ Where: Settings > Display > WATERFALL.
 
 | Option | What it does |
 |---|---|
-| Mode | Centered keeps the VFO in the middle; Fixed keeps the span |
+| Mode | Centered keeps the VFO in the middle; Fixed keeps the span (below) |
 | Auto level, offset | the levels follow the noise floor; the offset makes it darker or brighter |
 | Min / max | the manual levels, used when auto level is off |
 | Line, zoom | a line on the VFO; zoom with the waterfall instead of the span |
 | Smooth scroll | scrolls by pixels instead of lines |
 | Speed | 3 = 15 lines/s (default), 4 = 20, 5 = 30; 2 = 7.5 and 1 = 5 average the frames into a line: less noise and less CPU |
+
+In Fixed mode the span stays still and the VFO line moves across it. The
+spectrum comes in only for the span around the VFO, so the side you tune
+away from gets nothing new: there the waterfall goes on with the last
+picture received at those frequencies, and the spectrum shows its last line
+there, dimmed: the last one received after the dial had been still for half a
+second. When what is received is a quarter of the spectrum's span from the
+centre (25 kHz at zoom 1, 12.5 kHz at zoom 2), or the VFO 40% of it, the
+view jumps back and centres on what is received: the VFO, less any IF shift
+(with Smooth scroll on, the waterfall slides there).
 
 Over the waterfall. Where: Settings > Display > MAIN SCREEN.
 
@@ -647,9 +657,12 @@ Joining a network:
   password is in it). Attach that file to a report.
 - The saved networks, the SSH host keys and root's SSH keys are copied to
   `backups/backup.tgz` on the DATA partition at every clean shutdown, and when
-  a key is added or removed on the web configurator ([SSH](#ssh)). At boot,
-  the files missing from the system are taken back from it, so a rewritten card
-  keeps its WiFi; files already there are left alone.
+  a key is added or removed on the web configurator ([SSH](#ssh)). At the first
+  start of a rewritten card they are taken back from it, so the card keeps its
+  WiFi (a network named `Cafe [5G]` too); files already there are left alone.
+  Only regular files of those three folders come back, each written by the
+  radio itself: a link, a device, or a name the archive holds twice is left
+  out.
 
 An access point that does not answer the X6100 (#29, #32):
 
@@ -922,8 +935,12 @@ column. 0 is off; up to 10 MHz up or down (9999 kHz in Settings).
   whatever its offset, and the X6200's base sends these from VFO A in split
   (an FT8 CQ at 1200 Hz with a +700 Hz shift was heard at VFO A + 1325 Hz,
   575 Hz below where it belonged).
-- Winlink is simplex: it does not key while a shift is on (split on), and
-  says "Winlink: no TX, a TX shift is set on this band".
+- Winlink is simplex: it keys only on the frequency the radio listens on.
+  With a shift on it does not key and says "Winlink: no TX, a TX shift is set
+  on this band"; in plain split with VFO B on another frequency it says
+  "Winlink: no TX, split would send on 14.200.000, not 14.105.000". Up to
+  v0.3.6 plain split was let through, and Winlink called the gateway from B.
+  XIT and RIT are refused the same way ([Winlink](#winlink)).
 
 Two examples:
 
@@ -2199,6 +2216,20 @@ A small web server (vendored in [webserver/](../webserver/), Python/bottle) runs
 on the radio on port 80. Open `http://x6100.local/` (or `http://<radio IP>/`)
 from any browser on the same network. The radio picks up changes within a few seconds.
 
+A change is taken only from a page opened by the radio's address, its own name
+(`x6100.local`, `x6200.local`, or the [network name](#network-name) you gave
+it) or its Tailscale name (the full `*.ts.net` one, or the short one on your
+tailnet), and the same goes for the Files page and the Backup download, which
+hold the keys and passwords kept on the radio, and for the connections of the
+Panel and the Remote page (the Panel's sound too). Opened by another name (one
+your router gives it, `x6100.fritz.box`), the pages show the settings but do
+not save them, the Panel and the Remote page do not connect, and they say by
+which names they do: a web site can point a name of its own at the radio (DNS
+rebinding), and through your browser it could otherwise change settings,
+download the keys or key the transmitter. Logs > Export and the Gallery's ZIP
+download hold no secret and work by any name; TCI programs, which are not
+browsers, connect by any name as before.
+
 The menu has General and four groups:
 
 | Group | Page | Does |
@@ -2231,12 +2262,20 @@ spot, upload, band key or MEM tap; the next time the window opens on the
 radio; the screen restarts). Each row of a list (CW messages, memories and
 channels, macros, bands, digital modes) says Unsaved as soon as it is edited,
 Saving..., Saved, or Failed with the radio's reason, the typed values kept so
-they can be corrected. A row keeps its draft while another row is saved and
-while the list is read again from the radio; a bar in the card counts the
-unsaved rows and offers Save all and Discard. A row the radio changed
-meanwhile (another browser, the radio itself) says "Changed on the radio
-meanwhile": Save keeps yours, Reload takes the radio's. The browser warns
-before a page with unsaved rows is left.
+they can be corrected or saved again with Save. A row keeps its draft while
+another row is saved and while the list is read again from the radio; a bar
+in the card counts the unsaved and failed rows and offers Save all and
+Discard. A row says Saved only when it holds what the radio confirmed:
+while a row is being saved its Save is unavailable, and an edit typed
+meanwhile stays, Unsaved, for the next Save. The changes to one list go to
+the radio one at a time, each after the answer to the one before, so with
+Save all the rows waiting their turn say Saving... On the Bands and Digital
+modes pages the row's fields and Close are locked until the answer comes,
+and Add is refused, with a message, until the row being edited is saved or
+closed. A row the radio changed meanwhile (another browser, the radio
+itself) says "Changed on the radio meanwhile": Save keeps yours, Reload
+takes the radio's. The browser warns before a page is left with a row
+unsaved, failed or still saving.
 
 On the Bands, Digital modes, Memories, Cluster, CW messages, Macros, Display
 and TCI pages a save that fails says why: the radio's own reason (an invalid
@@ -2319,13 +2358,14 @@ Server options: `--host`, `--port`, `--https-port` (0 = off), `--cert-dir`,
 
 Every QSO the radio logs goes to your [Wavelog](https://github.com/wavelog/wavelog) as well, a few seconds after it is logged: FT8, FT4, FT2, JS8, voice and CW (the phone's logger, the CW keyboard) and the Field Ops activations, all that the web Logs page lists. The radio's own logs stay as they are. Where: web configurator, Operating > Wavelog.
 
-- Set up: the Wavelog URL (the address you open Wavelog with), an API key with read and write rights (Wavelog: your account menu, API Keys), then Load, choose the station profile and switch Upload to Wavelog on. Test connection asks Wavelog for its version, with what is typed, before Save.
+- Set up: the Wavelog URL (the address you open Wavelog with), an API key with read and write rights (Wavelog: your account menu, API Keys), then Load, choose the station profile and switch Upload to Wavelog on. Test connection asks Wavelog for its version, with what is typed, before Save. The saved key goes only to the server it was saved with: with the URL of another server (your Wavelog moved), type the key again for Test connection, Load and Save.
 - Station profile Automatic: each QSO goes to the Wavelog profile with the callsign the radio logged it with (Settings > General > STATION). With a profile DF8MH and one DF8MH/P in Wavelog, changing the callsign on the radio is all it takes; when several profiles have the callsign, the one Wavelog marks active. A QSO whose callsign has no profile waits, "Wavelog: no station profile for DF8MH/M, 1 QSO waiting", and the others still go; make the profile in Wavelog, then Send now.
 - From the moment it is switched on: the QSOs logged before are not sent. To send an older log, import its ADIF in Wavelog (Files, Logs page, Export).
 - The display says what happened: "Wavelog: DL1ABC uploaded", "Wavelog: DL1ABC was already there" (Wavelog found it as a duplicate), "Wavelog: no connection, 2 QSOs waiting". A failure is shown once, on the QSO that met it.
+- Each QSO goes once. The radio tells QSOs apart by the other station, the date and time to the second, the band, the mode and your station callsign: two QSOs with DL1ABC in the same minute, or one as ON6URE and one as ON6URE/P, are two, and both go. Wavelog itself takes a second QSO with the same station, band and mode within 15 minutes, under the same callsign of yours, for a duplicate.
 - Without a network, or behind a WiFi login page, the QSOs wait on the SD card (`/mnt/field/wavelog.queue`) and go at the next QSO, a minute after the next start, every 5 minutes while some wait, or with Send now on the web page.
-- A QSO Wavelog refuses (a record it can't take) goes to `/mnt/field/wavelog.failed.adi` and is not sent again. A refused key stops the upload until a new key is saved; the QSOs wait.
-- A QSO edited on the Logs page after it was sent is sent again as a new one, and one deleted there stays in Wavelog: correct it in Wavelog too.
+- A QSO Wavelog refuses (a record it can't take) goes to `/mnt/field/wavelog.failed.adi` and is not sent again unless it is edited on the Logs page. A refused key stops the upload until a new key is saved; the QSOs wait.
+- A QSO edited on the Logs page after it was sent goes again with the next upload. Wavelog adds QSOs and changes none it has. When the QSO's call, date, time, band, mode and own callsign are as they were (a report or a name corrected), Wavelog keeps its own copy, and the display says "Wavelog: DL1ABC was already there, edit it in Wavelog too". An edit of any of those reaches Wavelog as another QSO: it is added ("uploaded"), or, within 15 minutes of the old one with the same call, band and mode, found as a duplicate ("was already there"); either way the old one is to be corrected or deleted in Wavelog by hand. A QSO edited while it waits (no network) goes as it stands then, once; deleted while it waits, it does not go. A QSO deleted on the Logs page after it was sent stays in Wavelog.
 - HTTPS is checked against the radio's root certificates. Check the certificate off only for a Wavelog at home with a self-signed certificate.
 - The key is kept in `/mnt/field/wavelog.conf`. The Wavelog page never shows it again and it is not in the Backup, but like the QRZ, HOTA and WWFF keys it can be downloaded from the Files page by anyone who reaches the web configurator (your LAN, and your tailnet with Tailscale on). The upload uses Wavelog's API (`api/qso`, `api/station_info`, `api/version`); QSOs sent through it are not uploaded on to other services by Wavelog at once and get no callbook lookup there.
 - By hand: `x6100-wavelog sync`, `x6100-wavelog stations`, `x6100-wavelog test` (one line each, as the other helpers).
@@ -2377,8 +2417,37 @@ Connecting to a gateway:
 - ARDOP keys the radio the way the radio's own digital modes do, and
   identifies with your callsign in CW. The radio does not key for Winlink
   while it is already transmitting, nor for 5 minutes after a high SWR
-  stopped a Winlink transmission, nor while the band has a
-  [TX shift](#tx-shift) on; the screen says so.
+  stopped a Winlink transmission; the screen says so.
+- Winlink transmits only on the frequency the radio listens on, which is the
+  gateway's once Pat has tuned there. This is checked as each transmission
+  begins, on the band Pat's QSY brought (split and the [TX shift](#tx-shift)
+  belong to a band):
+  - Split on with VFO B on another frequency, or a TX shift on: no key,
+    "Winlink: no TX, split would send on 14.200.000, not 14.105.000" or
+    "Winlink: no TX, a TX shift is set on this band". Turn split off (AGC
+    held), or put B on the same frequency.
+  - XIT or RIT set (the XIT and RIT buttons): no key, "Winlink: no TX, XIT is
+    set (+500 Hz)" or "Winlink: no TX, RIT is set (+500 Hz)". XIT moves the
+    transmission off the gateway's frequency, RIT moves what ARDOP hears. Set
+    them to 0.
+  - Split turned on, the other VFO chosen, XIT set or the dial turned while
+    Winlink transmits: that transmission stops, "Winlink: TX stopped, it left
+    14.105.000 MHz".
+  - A QSY Pat asks while the radio transmits is made when the transmission
+    ends. A frame ARDOP sends right after that transmission goes out after the
+    QSY, as a transmission of its own, on Pat's new frequency. If the radio
+    cannot go there (an app holds the frequency): no key, "Winlink: no TX, the
+    radio could not go to Pat's 7.100.000 MHz", until the radio is on that
+    frequency or Pat tunes again.
+  - A connection keeps its frequency: the one Pat tuned last, or where ARDOP
+    last transmitted. Turn the dial or choose the other VFO between two
+    transmissions, and Winlink does not key: "Winlink: no TX, the radio left
+    14.105.000 MHz". Go back there, or connect again with the gateway's
+    frequency. A minute after Pat's last QSY and ARDOP's last try the dial
+    counts again: a connect without a frequency then transmits where you
+    listen (ARDOP hears that frequency too). Pat's tune-back after a session
+    is a QSY too, so retuning right after a session and connecting at once
+    without a frequency waits that minute.
 - Pat listens before it calls: on a busy frequency it asks in the mailbox
   whether to go ahead.
 - The gateway list: the first time, Pat fetches it from winlink.org when the
@@ -2395,7 +2464,7 @@ Good to know:
   make the radio transmit under your callsign. Turn Winlink off on a network
   you do not trust (a campsite's WiFi, a shared hotspot).
 - The mailbox answers only to the radio's address and its own names
-  (`x6100.local`, the Tailscale name), and refuses requests from the pages of
+  (`x6100.local`, the Tailscale name, the short name on your tailnet), and refuses requests from the pages of
   other sites, so a web page you happen to visit cannot use it through your
   browser. The configurator changes Winlink only when opened by those names
   too. ARDOP and the radio's frequency control for Pat listen on 127.0.0.1,
@@ -2472,8 +2541,29 @@ web page, nothing to install, any device with a browser.
   keys the radio's own microphone.
 - Light: a light theme for the sun. App: the panel alone, without the
   configurator's header, for a phone. Fullscreen.
+- Keyboard: left and right arrows tune (Shift: ten steps), `[` and `]` the
+  volume, Space is PTT while held. The keys are the radio's only when they
+  are meant for nothing else: not while a pop-up or the pairing and control
+  dialogs are open, not in a field or a list, and Space on a button reached
+  with Tab presses that button (Sound, Light, a tab), as anywhere on the web,
+  never PTT. Space on the PTT button itself is PTT. A click or a tap on a
+  button gives the keyboard back to the page, so Space after a click on
+  Sound is PTT, even when a field, the menu at the top or a button reached
+  with Tab had the keyboard before.
 - Phone in portrait: the radio on top, the Spots, Keys and Screen tabs below.
   Tablet or PC in landscape: side by side. The page follows the screen.
+
+What the page shows is the radio's state, never what it hopes. A tune or a
+level (the frequency, VOL, SQL, RF GAIN, POWER) shows at once, in faint
+italics, until the radio confirms it; the VFO line on the panorama stays
+where the radio is meanwhile. When the radio refuses it (another place has
+control, LOCK or an app holds the frequency, a frequency the radio does not
+tune, the radio busy) the status line says why and the radio's own value
+shows again; a change neither confirmed nor refused within two seconds goes
+back to the radio's value too. A browser that only watches, or does not
+have control, does not send the change at all: it says why and opens the
+pairing or Take control dialog. With LOCK on, the frequency stays and the
+status line says so.
 
 The page talks to the GUI's remote WebSocket (port 50002, the Screen page's):
 `panel 1` subscribes to the state (`state {...}` as JSON: frequency, mode,
@@ -2485,8 +2575,15 @@ centre Hz, u32 width Hz, u32 sequence}`, then one int8 dB per bin). `set NAME
 VALUE` changes the radio: `freq`, `mode` (0-7, the order of the mode list),
 `agc` (0-3), `pre`, `att`, `nb`, `nr`, `atu`, `lock` (0/1), `sql`, `rfg`
 (0-100), `vol` (0-55 on the X6100, 0-100 on the X6200), `pwr` (tenths of a watt), `step`, `zoom` (1-8), `band`
-(+1/-1), `vfo` (toggle), `filter LO HI`. The keys and knobs go as on the
-Screen page. The apps: the FT8 list's rows come as `ft8r {...}` (id, type,
+(+1/-1), `vfo` (toggle), `filter LO HI`. A `set` the radio refuses is
+answered `err ...` (`err freq: locked (LOCK, or an app holds the
+frequency)`, `err freq: not a frequency this radio tunes`, `err NAME: the
+radio is busy, try again`, `err unknown setting NAME`, the role and
+control refusals) and followed by the whole `state`, changed or not, so a
+client that showed what it asked for can show the radio's again. One the
+radio drops because an app locked the frequency, mode or band in between
+gets no `err`, but the whole `state` goes to every panel client. The keys
+and knobs go as on the Screen page. The apps: the FT8 list's rows come as `ft8r {...}` (id, type,
 text, call, grid, audio Hz, SNR, to me, worked, distance, country), the app's
 state as `ft8 {...}` (open, proto, cq, tx, auto, hold, sending, txf, next),
 the CW decoder's text as `cw "..."`; `ft8 open|close|cq|stop|auto|hold|mode`,
@@ -2495,12 +2592,15 @@ carries the timeline too (`in` ms to our next slot, `slot` its length, `rep`
 the sends left, `qso`, `hound`, `nocall`, `logged` and `logged_s`), once a
 second while a countdown runs; `log CALL|RSTS|RSTR|NAME`
 writes the day's log and is answered with `logged ok|no`. `logq ID CALL|...`
-is the same QSO with a number the client chose, answered `logged ID ok|no`
-to the clients of the session that sent it (each page counts from 1); the
-radio keeps the last 64 answers, writes a number a session sent before only
-once (the answer goes out again), and `logq? ID` asks for one again: `ok`,
-`no`, `pending` (still being written) or `unknown` (never seen, the radio
-restarted since, or no longer kept). After `size` the radio lists its keys (`keys GEN APP
+is the same QSO with a number the client chose (the Panel takes 53 random
+bits, so no two tabs or reloads of a browser pick the same), answered
+`logged ID ok|no` to the clients of the session that sent it; the radio
+keeps the last 64 answers, each bound to its QSO: a number a session sent
+before with the same QSO is written only once (the answer goes out again),
+with another QSO it is answered `logged ID conflict` and not written.
+`logq? ID CALL|...` asks for one again: `ok`, `no`, `pending` (still being
+written), `conflict` (the number holds another QSO) or `unknown` (never
+seen, the radio restarted since, or no longer kept). After `size` the radio lists its keys (`keys GEN APP
 ...`: the X6200 has no PRE, V/M, AGC or LOCK key) and, to a panel, `modes 8|10`
 (the X6200 adds SAM and WFM; `set mode` with one the radio has not is answered
 `err mode: not on this radio`) and `volmax 55|100`, the AF volume's range. The greeting `hello <version> <boot>` ends with a
@@ -2512,7 +2612,9 @@ and the radio's `ctl none|local|tci|browser NAME MINE` say who controls the
 radio (while the code shows, the screen mirror of unpaired viewers pauses:
 the code is for the eyes at the radio); an admin's `sessions` lists the paired browsers as JSON and `revoke N`
 ends one; `unpair` forgets the caller's own; `tx 0|1` goes to every client
-when the radio keys or unkeys. Settings > General > BROWSER REMOTE turns the
+when the radio keys or unkeys. `key PTT 1 N` keys the radio's own microphone,
+N the page's number for this press, and is repeated every second as the
+lease; `key PTT 0` lets go (see Transmitting from the browser). Settings > General > BROWSER REMOTE turns the
 server on and off for both pages. A page opens on a tab with `/panel#ft8`,
 `#cw`, `#log`, `#keys` or `#screen`.
 
@@ -2543,15 +2645,40 @@ Nothing is replayed: not a frequency, not a PTT, not a CQ, not a QSO. What
 the operator typed is kept: the log fields, the chosen tab, through a lost
 link and a reload.
 
+A link that stalls (connected, but the radio does not answer) counts as lost
+for everything that touches the air, because what the page sends meanwhile
+waits in the connection and would arrive late, all at once: the transmission
+ends on the page (the PTT button shows "TX ended", the status line "The radio
+does not answer: keys released, press again when it answers"), held keys are
+let go (the releases follow whatever is stuck, so they arrive too), a tune on
+its way is dropped, and a key, a knob, a setting, an FT8 command or PTT
+pressed meanwhile is not sent ("The radio does not answer: nothing is sent
+until it does"). The link counts as back when the radio answers a ping sent
+after the silence: by then everything that was on its way from the radio has
+been read, so the page shows its real state before the next press. The page
+asks again every few seconds until it is answered, so an answer the radio
+dropped on the way (its queue for the page full) does not keep it stalled.
+
 A QSO from the Log tab is the one thing that must not be lost or doubled, so
 each goes with a number of its own and shows "sending..." until the radio
 answers "logged" or "refused". One sent into a gap ("waiting for the
 connection"), or left without an answer by a reload, is asked about when the
-link is back. The radio never saw it and did not restart in between: it is
-sent once more. The radio restarted, or does not answer the question: the row
-says so and leaves it to the operator, who checks the Logs page and taps
-Send again or Forget. The page never retries by itself when a duplicate is
-possible.
+link is back, and the radio's answer settles it. When the radio has no
+record of it (it never saw it, restarted since, or no longer keeps the
+answer: it cannot tell which), the row says so and leaves it to the
+operator, who checks the Logs page and taps Send again or Forget. The page
+never retries by itself when a duplicate is possible.
+
+The number is one no other tab and no reload of the browser picks, and the
+radio's answer is bound to the QSO it was given for, so two Panel tabs open
+side by side never take each other's "logged". The QSOs waiting for an
+answer are kept in the browser one by one, so neither tab's list overwrites
+the other's and a reloaded tab still has its own (without the browser's
+storage, as in some private windows, they live as long as the page). A
+number the radio already holds for another QSO (a tab still showing a page
+from before this update, which counted from 1) is answered "not logged: the
+radio holds another QSO under this number"; Send again sends it under a new
+number.
 
 ### Pairing and control
 
@@ -2622,9 +2749,9 @@ shows what the radio did, never what the page hoped:
 - Keying... until the radio confirms it is on the air (within 1.5 s, else
   "No TX: the radio did not key"); ON AIR with the seconds counting; on
   release Unkeying... until the radio confirms RX.
-- TX ended, when the radio ended it: the link dropped, the microphone went
-  away, the page lost sight of the key (a tab switch, a call on the phone),
-  the lease ran out. The operator presses again, on purpose.
+- TX ended, when the radio ended it: the link dropped or stalled, the
+  microphone went away, the page lost sight of the key (a tab switch, a call
+  on the phone), the lease ran out. The operator presses again, on purpose.
 - TX (not this browser), while the radio is keyed from elsewhere.
 
 A held PTT is a lease. With the radio's microphone the page renews the key
@@ -2633,7 +2760,15 @@ frozen) and the radio unkeys by itself, as it does after three minutes on
 the air whatever happens; the page is told why ("ptt released: no renewal
 from the page"). With the browser microphone the TCI rules apply: the radio
 unkeys half a second after the audio stops and after three minutes. Nothing
-keys the radio across a gap: a reconnect never re-presses PTT.
+keys the radio across a gap: a reconnect never re-presses PTT, and every
+press has a number of its own that its renewals carry. A hold the radio let
+go (the lease ran out, three minutes, a release) stays over: renewals of it
+that a stalled link delivers late are ignored, only a new press keys again.
+A Panel or Screen page left open since before the update that brought the
+numbers cannot key the radio's own microphone until it is reloaded: its PTT
+button shows "No TX" and the status line "this session may not transmit
+from a page older than the radio: reload the page". With Mic on (the
+browser's microphone, through the TCI) such a page still transmits.
 
 ### What the FT8 app will do next
 
@@ -2698,7 +2833,14 @@ here it is a web page, nothing to install.
   or the - and + buttons; "push" presses the VOL or MFK knob.
 - Keyboard: F1-F5, left and right arrows turn the main knob (Shift: ten
   detents at a time), `[` and `]` the volume, PageUp and PageDown the MFK,
-  Enter pushes the MFK, Space is PTT.
+  Enter pushes the MFK, Space is PTT. As on the Panel, the keys are the
+  radio's only when they are meant for nothing else: not with a dialog open
+  or in the picture list, and Enter or Space on a button reached with Tab
+  presses that button, never the MFK or PTT (Space on the PTT button itself
+  is PTT). A click or a tap on a button gives the keyboard back to the page,
+  and so does a picture chosen with the mouse or a finger: Enter is then the
+  MFK push again. The picture list reached with Tab keeps its keys until Tab
+  moves on.
 - Sound: the RX audio to the browser, over the TCI server (so TCI must be on,
   the default). Browsers need a tap before they play: press Sound once.
 - Mic: the browser's microphone goes to the radio while PTT is held, over the
@@ -2751,6 +2893,19 @@ program on the network tunes the radio, hears it and keys it.
   unless someone is on the air; a browser that was operating sees "TCI
   client active" and takes control back on purpose (Pairing and control,
   under Browser panel).
+- One transmission at a time: the client that keyed holds it, and its unkey
+  or its leaving unkeys the radio, whoever has control by then. Another
+  operating client's key meanwhile, also one sent while the first key is
+  still on its way to the radio, is answered `trx:0,false;` and changes
+  nothing, not even who has control: the client that keyed still tunes
+  during its over. A key the radio refuses (someone on the air, TCI audio in
+  CW or DIGU) is answered `trx:0,false;` too, to the client that sent it
+  alone, and so is a PTT key that, once at the radio, does not put it on the
+  air within a second (a frequency it does not transmit on). A key still on
+  its way when its client unkeys or leaves keys nothing, and a client whose
+  key was refused or cancelled unkeys nothing: a transmission keyed
+  meanwhile with the PTT key on the radio or the browser's PTT stays on the
+  air.
 - There is no login or pairing for TCI clients: enable it only on a network
   you trust, or set Listen only, and turn it off when it is not needed.
   Anyone who reaches the port can key the transmitter when clients may
