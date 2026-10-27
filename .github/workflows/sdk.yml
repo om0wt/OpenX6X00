@@ -42,7 +42,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: true
-        repository: gdyuldin/AetherX6100Buildroot
+        repository: Guru-RF/AetherX6100Buildroot
         path: AetherX6100Buildroot
 
     - name: Prepare ccache timestamp
