@@ -35,6 +35,7 @@ extern "C" {
     #include "params/params.h"
     #include "screen_light.h"
     #include "radio.h"
+    #include "tx_autocal.h"
     #include "gui_events.h"
     #include "key_input.h"
     #include "paddle_keyer.h"
@@ -3692,6 +3693,63 @@ static uint8_t make_smeter_fe(uint8_t row) {
     return row;
 }
 
+/* Auto: tx_autocal.cpp sets the band output gain of every band to the PWR setting. It transmits:
+ * the first press says so, a second within 5 s starts it; the last line of its progress under it */
+#define TXA_ARM_MS  5000
+
+static lv_obj_t   *txa_btn, *txa_note;
+static lv_timer_t *txa_timer;
+static uint32_t    txa_armed;
+
+static void txa_refresh(lv_timer_t *t) {
+    static char buf[1500];
+
+    if (!txa_note) return;
+    tx_autocal_status(buf, sizeof(buf));
+    char *last = strrchr(buf, '\n');
+    if (buf[0]) lv_label_set_text(txa_note, last ? last + 1 : buf);
+    if (txa_btn) lv_label_set_text(lv_obj_get_child(txa_btn, 0), tx_autocal_running() ? "Stop" : "Start");
+    if (txa_armed && lv_tick_elaps(txa_armed) > TXA_ARM_MS) {
+        txa_armed = 0;
+        if (!tx_autocal_running()) lv_label_set_text(txa_note, "It transmits on every band: a dummy load on the antenna socket.");
+    }
+}
+
+static void txa_btn_cb(lv_event_t *e) {
+    if (tx_autocal_running()) {
+        tx_autocal_stop("Stopped.");
+    } else if (!txa_armed) {
+        txa_armed = lv_tick_get();
+        lv_label_set_text(txa_note, "Every band 160 m to 6 m to the PWR set, by itself, about 4 min: press again.");
+        return;
+    } else if (!tx_autocal_start()) {
+        lv_label_set_text(txa_note, "Not now (transmitting?).");
+    }
+    txa_armed = 0;
+    txa_refresh(NULL);
+}
+
+static void txa_delete_cb(lv_event_t *e) {
+    txa_note = NULL;
+    txa_btn  = NULL;
+    if (txa_timer) {
+        lv_timer_del(txa_timer);
+        txa_timer = NULL;
+    }
+}
+
+static uint8_t make_txcal_auto(uint8_t row) {
+    wl_row_label(row, "Auto, all bands");
+    txa_btn = wl_button(row, tx_autocal_running() ? "Stop" : "Start", txa_btn_cb);
+    row++;
+    txa_note = upd_line(row);
+    lv_label_set_text(txa_note, "It transmits on every band: a dummy load on the antenna socket.");
+    lv_obj_add_event_cb(txa_note, txa_delete_cb, LV_EVENT_DELETE, NULL);
+    txa_armed = 0;
+    txa_timer = lv_timer_create(txa_refresh, 500, NULL);
+    return row + 1;
+}
+
 /* TX CAL: the transmitter's calibration and CESSB, per band where the base keeps them per band */
 static void make_txcal_page() {
     uint32_t caps = radio_caps();
@@ -3708,6 +3766,9 @@ static void make_txcal_page() {
         }
         if (caps & HW_CAP_CODEC_GAIN) {
             row = make_codec_gain(row);
+        }
+        if (caps & HW_CAP_BAND_GAIN) {
+            row = make_txcal_auto(row);
         }
         card_end(row);
     }

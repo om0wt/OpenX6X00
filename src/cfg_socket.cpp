@@ -34,6 +34,7 @@ extern "C" {
     #include "screen_light.h"
     #include "screen_main.h"
     #include "theme.h"
+    #include "tx_autocal.h"
     #include "walkie.h"
 
     #include "lvgl/lvgl.h"
@@ -307,6 +308,7 @@ static int handle_line(const char *line, char *out, size_t size) {
 
     if (!cJSON_IsString(name)) {
         err = "Bad request";
+    } else if (tx_autocal_socket(name->valuestring, out, size, &l, &err)) {   /* txcal_*: tx_autocal.cpp */
     } else if (!strcmp(name->valuestring, "disp_get")) {
         l = disp_get(out, size);
     } else if (!strcmp(name->valuestring, "disp_set")) {
