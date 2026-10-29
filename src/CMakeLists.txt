@@ -20,6 +20,7 @@ target_sources(${PROJECT_NAME} PUBLIC
     olivia_rx.c olivia_tx.c
     dialog_jtty.c jtty.c jtty_rx.c jtty_tx.c
     tx_player.c tx_level.c
+    tx_autocal.cpp
     swr_guard.c
     base_guard.c
     app_sstv.c
@@ -38,7 +39,6 @@ target_sources(${PROJECT_NAME} PUBLIC
     theme.c
     freq_strip.c
     lcd_panel.c
-    tx_autocal.cpp
     freq_scale.c
     spot_marks.c
     band_plan.c
