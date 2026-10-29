@@ -59,6 +59,7 @@ void cfg_pwr_set(float watts);
 /* The highest TX power in W that can be set (BOARD_PWR_MAX; the X6200 on battery BOARD_PWR_MAX_BAT).
  * Only later settings are clipped to it: the power already set is left as it is */
 void cfg_pwr_max_set(float watts);
+float cfg_pwr_max_get(void);
 
 /* The other VFO; with independent VFOs (p_indep_vfo) its own band comes with it */
 void cfg_vfo_toggle(void);
@@ -75,6 +76,9 @@ int cfg_bands_active_ids(int32_t *ids, int32_t *start, int32_t *stop, char (*nam
  * 40m SSB and 6m still on the edges of the region before take this one's (BandsTable::follow_region). The count of
  * rows changed. LVGL thread */
 int cfg_bands_follow_region(int region);
+/* The IARU region whose edges the band list's 160m, 80m, 40m SSB and 6m were last given (1, the defaults', until
+ * another region came): the last region the band plan had, for Auto when nothing tells now */
+int cfg_bands_region(void);
 
 // Copy active VFO (freq, mode, agc, att, pre) to inactive VFO.
 void cfg_band_vfo_copy(void);

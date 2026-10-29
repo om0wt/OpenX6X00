@@ -78,6 +78,10 @@ void cfg_pwr_max_set(float watts) {
     cfg_sm.pwr_max_.store(watts);
 }
 
+float cfg_pwr_max_get(void) {
+    return cfg_sm.pwr_max_.load();
+}
+
 void cfg_vfo_toggle(void) {
     cfg_sm.vfo_toggle();
 }
@@ -114,6 +118,10 @@ int cfg_bands_follow_region(int region) {
     int changed = BandsTable::follow_region(from, region);
     cfg_sm.p_band_edges_region.set(region);
     return changed;
+}
+
+int cfg_bands_region(void) {
+    return cfg_sm.p_band_edges_region.get();
 }
 
 void cfg_band_vfo_copy(void) {

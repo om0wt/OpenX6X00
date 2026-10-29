@@ -335,9 +335,10 @@ def funnel():
     """Issue #58: a funnel made by hand ("tailscale funnel 50001") put TCI, which has no login, on the
     internet. Over Funnel (tailscaled's header) only the browser Panel's own sound and microphone go:
     nothing before "auth TOKEN" of a browser paired at home, within 5 s; then the audio commands and a
-    key with its audio for a session that may transmit; one at a time; closed when its session is
-    revoked; wrong keys pause Funnel. A request from the tailnet (Tailscale's proxy, no Funnel header)
-    is taken as before"""
+    key with its audio for a session that may transmit; one at a time, the same browser's key taking
+    the place of its connection left silent (a phone gone from the WiFi to its mobile data); closed
+    when its session is revoked; wrong keys pause Funnel. A request from the tailnet (Tailscale's
+    proxy, no Funnel header) is taken as before"""
     ws = WS(headers=FUNNEL)
     t0 = time.time()
     got = nothing_for(ws, 2)
@@ -360,6 +361,23 @@ def funnel():
     print(f"funnel: the key of a browser paired at home: the greeting ({len(greeting)} lines)")
     assert funnel_refused("198.51.100.2"), "a second over Funnel was taken"
     print("funnel: a second one over Funnel refused")
+    # Its page sends nothing while it only listens, but answers the radio's pings (a browser does so itself, also
+    # in a background tab): heard from, it keeps the sound past the 6 s after which a page may be gone, and the
+    # other tab of the same browser (the Panel and the Screen page share its key) is refused at the handshake
+    pings, end = 0, time.time() + 7
+    ws.s.settimeout(0.05)
+    while time.time() < end:
+        try:
+            op, p = ws.frame()
+        except (socket.timeout, TimeoutError):
+            continue
+        if op == 9:
+            ws.send(10, p)
+            pings += 1
+    ws.s.settimeout(5)
+    assert pings >= 2, f"over Funnel, silent 7 s: {pings} pings from the radio"
+    assert funnel_refused("198.51.100.3"), "its page answering the radio's pings 7 s: another connection taken"
+    print(f"funnel: its page answering the radio's pings ({pings} in 7 s): another one still refused")
     ws.text("vfo:0,0,14250000;modulation:0,cw;drive:0,100;")
     got = nothing_for(ws, 0.6)
     assert not [p for op, p in got if op == 1 and p.startswith((b"vfo:", b"modulation:", b"drive:"))], got
@@ -376,6 +394,17 @@ def funnel():
         ws.send(2, struct.pack("<8I", 0, 24000, 0, 0, 0, 512, 2, 1) + bytes(32) + bytes(1024))
     ws.text("trx:0,false;")
     print("funnel: unkeyed:", ws.wait_text("trx:0,false;"))
+    time.sleep(6.5)     # its page gone without a word: nothing from it, the radio's pings unanswered
+    ws2 = WS(headers=FUNNEL.replace("203.0.113.7", "198.51.100.3"))
+    ws2.text("auth " + LISTENER)
+    assert closed_within(ws2, 1), "another browser's key, the first one silent: not closed"
+    print("funnel: the first one silent 6 s, another browser's key: closed")
+    ws2 = WS(headers=FUNNEL.replace("203.0.113.7", "198.51.100.3"))
+    ws2.text("auth:" + TOKEN + ";")
+    ws2.wait_text("ready;")
+    assert closed_within(ws, 2), "the same browser from another network: its connection from before not closed"
+    print("funnel: the same browser from another network: greeted, its connection from before closed")
+    ws = ws2
     open(REVOKED, "w").close()
     t0 = time.time()
     assert closed_within(ws, 3.5), "over Funnel, its session revoked: not closed"
