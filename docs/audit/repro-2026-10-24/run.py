@@ -98,7 +98,11 @@ def main():
             "the admin's away key: admin",
             "from the internet: err an away link is made at home",
             "unpaired: err pair this browser first",
-            "with its away key at home: err this browser has its away link already")).strip())
+            "with its away key at home: err this browser has its away link already",
+            'two browsers named alike for 24 characters: "Club station field lapto (away)", both away keys good=1',
+            "the first one asks again: its own replaced=1, the other's kept=1",
+            "a file from before the home column: 2 sessions, its away key replaced=1, the new one knows its browser=1",
+            "revoked at home and paired again: its away key from before replaced=1, sessions 2")).strip())
         print("#58 session tokens kept hashed:\n" + command([binary, "tokens"], env, contains=(
             "a file from before: 2 sessions loaded, the tokens in the file now=0",
             "3eb1bd439947eb762998e566ccc2e099c791118b2f40579cc4f7da2b5061b7f9\tShack PC\t2\t1",
@@ -143,6 +147,16 @@ def main():
         command([*CC, *cflags, *san, HERE / "ws-handshake.c", *gc, "-o", binary], env)
         print("C08 WebSocket names (26 October audit, fixed), and Tailscale Funnel's requests (#58):\n" + command(
             [binary], env, contains=("29 of 29 cases as they should be",)).strip())
+
+        binary = work / "mic-keys"
+        command([*CC, *cflags, *san, HERE / "mic-keys.c", "src/mic_keys.c", *gc, "-o", binary], env)
+        print("#56 hand mic keys, every code into the log:\n" + command([binary], env, contains=(
+            "main screen, 0xE4: press 3, release 3; log: hand mic: key 0xE4 (3)",
+            "main screen, 0x53: nothing; log: hand mic: key 0x53 (unknown)",
+            "a list focused, 0xE2: typed 2; log: hand mic: key 0xE2 (2)",
+            "a text window open, 0xE1: typed 1 into the text window; log: nothing",
+            "a text window open, 0x53: nothing; log: nothing",
+            "codes 0x01-0xFF: logged 255, known 25, unknown 230")).strip())
 
         fixture = work / "truncated.adi"
         fixture.write_bytes(b"<CALL:5")
