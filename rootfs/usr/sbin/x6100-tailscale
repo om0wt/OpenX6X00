@@ -12,6 +12,8 @@
 #   x6100-tailscale logout     forget the login (while it is on, a new one is asked for)
 #   x6100-tailscale hostname   give Tailscale the radio's network name (x6100-hostname calls it)
 #   x6100-tailscale funnel on|off   the browser Panel on the internet through Tailscale Funnel, or not
+#   x6100-tailscale funnel-clear [s]   Funnel off and out of tailscaled, waited for (x6100-update, before it goes
+#                              back to a version without Funnel): "ok ..." when sure, an error when not
 #   x6100-tailscale status     the state as key=value lines: state, text, url, name, ip, version, and
 #                              funnel (off, starting, enable, on, error), funnel_text, funnel_url, public
 #   x6100-tailscale run        the supervisor itself, started by the commands above
@@ -30,13 +32,17 @@
 # serves itself (no Python on the internet), and their two sockets, which take nothing over Funnel before
 # the token of a browser paired at home. Nothing else: the web pages, TCI programs, Pat, SSH. It is set
 # through tailscaled's local API, as Tailscale's own command does (that command is not installed), and kept
-# in tailscaled's state: at every start, when the name or a port changes, and once a minute it is set again.
+# in tailscaled's state while Tailscale runs: at every start, when the name or a port changes, and once a
+# minute it is set again. Stopping tailscaled (off, the shutdown, a start that failed) takes it out first,
+# so a stopped Tailscale keeps no funnel in its state for a version without Funnel to start with; the
+# setting stays, and the next start sets it again.
 # The radio owns Funnel: a funnel made by hand (tailscale funnel 50001, from a forum) is taken off the
 # internet; serving to the tailnet alone stays. While Funnel is on, port 443 on the tailnet is its own: the
 # Panel there has a real certificate, the configurator stays on http://<name>/.
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Copyright (c) 2026 Joeri Van Dooren ON6URE / Guru-RF
+import base64
 import fcntl
 import hashlib
 import http.client
@@ -60,6 +66,7 @@ CONF = "/mnt/tailscale.conf"          # enabled=0|1, funnel=0|1: on the DATA par
 DIR = "/mnt/tailscale"                # the program (and the download while it runs)
 BIN = os.path.join(DIR, "tailscaled")
 STATE = "/var/lib/tailscale"          # the login: root filesystem only
+STATE_FILE = os.path.join(STATE, "tailscaled.state")    # tailscaled's own (--statedir): the serve config too
 DROP = os.path.join(STATE, "files")   # Taildrop's inbox: a tmpfs of TS_DROP_KB on it
 RUN = "/run/tailscale"                # socket, status, lock, log
 SOCK = os.path.join(RUN, "tailscaled.sock")
@@ -82,6 +89,7 @@ REMOTE_CONF = "/mnt/remote.conf"      # the browser remote's port= (src/remote_s
 TCI_CONF = "/mnt/tci.conf"            # TCI's port= (src/tci_server.c), 50001
 FUNNEL_CHECK = 60                     # s between looks at the serve config while nothing changed
 FUNNEL_ASK = 300                      # s between asks for the link that enables Funnel on the tailnet
+FUNNEL_CLEAR_WAIT = 30                # s funnel-clear waits at most to be sure no funnel is left
 
 
 class Stopped(Exception):
@@ -267,6 +275,8 @@ def api_full(method, path, body=None, headers=None):
         c.request(method, "/localapi/v0/" + path, body=data, headers=hdr)
         r = c.getresponse()
         out = r.read()
+    except http.client.HTTPException as e:   # neither OSError nor ValueError: an answer cut off (tailscaled stopping)
+        raise Fail(f"tailscaled: {path.split('?')[0]}: its answer broke off ({type(e).__name__})")
     finally:
         c.close()
     if r.status >= 300:
@@ -483,6 +493,75 @@ def funnel_idle():
     return {"funnel": "starting", "funnel_text": "Funnel waits for Tailscale"} if funnel_wanted() else {"funnel": "off"}
 
 
+def funnel_left(sc):
+    """A serve config that still puts something on the internet: an AllowFunnel, a foreground session's too"""
+    sc = sc or {}
+    fgs = [fg for fg in (sc.get("Foreground") or {}).values() if isinstance(fg, dict)]
+    return any(any((c.get("AllowFunnel") or {}).values()) for c in [sc] + fgs)
+
+
+def tailscaled_pids():
+    """The tailscaled processes on the radio's state: the supervisor's, one a killed supervisor left behind, one
+    started by hand from the program on the DATA partition"""
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if args[0] == BIN.encode() or f"--statedir={STATE}".encode() in args:
+            pids.append(int(d))
+    return pids
+
+
+def state_funnel_off(write=True):
+    """No funnel in tailscaled's state file, for its next start. Only while no tailscaled runs: one that runs writes
+    its own copy over it (it keeps the whole file in memory). tailscaled keeps the serve config there as JSON in base64
+    (under _serve/<profile>); the radio's own entries go from it, and every AllowFunnel, as funnel_config does through
+    the local API, and nothing else is touched. Returns whether a funnel was there; Fail when the file cannot be read:
+    then nobody knows. write=False only looks, also while tailscaled runs"""
+    try:
+        with open(STATE_FILE) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return False                               # Tailscale never started on this card
+    except OSError as e:
+        raise Fail(f"tailscaled's state cannot be read: {e}")
+    try:
+        state = json.loads(text) if text.strip() else {}
+    except ValueError:
+        state = None
+    if not isinstance(state, dict):
+        raise Fail("tailscaled's state is not what it should be")
+    found = changed = False
+    for key, value in state.items():
+        try:
+            sc = json.loads(base64.b64decode(value, validate=True))
+        except (TypeError, ValueError):            # the keys, the login: no JSON in them
+            continue
+        if not isinstance(sc, dict) or not (key.startswith("_serve/") or "AllowFunnel" in sc or "Foreground" in sc):
+            continue
+        new, _ = funnel_config(sc, "", 0, 0, False)
+        if new != sc:
+            found = found or funnel_left(sc)
+            state[key] = base64.b64encode(json.dumps(new).encode()).decode()
+            changed = True
+    if changed and write:
+        tmp = f"{STATE_FILE}.{os.getpid()}"
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+        fd = os.open(os.path.dirname(STATE_FILE), os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    return found
+
+
 # ---- the supervisor --------------------------------------------------------------------------
 
 def drop_tmpfs():
@@ -542,6 +621,25 @@ def stop_daemon(p):
             p.wait()
 
 
+def stop_tailscaled(p):
+    """tailscaled stopped with no funnel kept (#58): a version without Funnel (gone back to by hand) would start it
+    with the funnel of its state and never take it off. Out through the local API first, the radio's own and any made
+    by hand, as while it runs; then out of the state file once it has stopped, for one it could not be told about (no
+    login, not answering). The setting stays: the next start sets it again. Whatever comes of the two, tailscaled
+    stops"""
+    if p and p.poll() is None:
+        try:
+            serve_set("", 0, 0, False)
+        except Exception:
+            pass
+    stop_daemon(p)
+    if not tailscaled_pids():
+        try:
+            state_funnel_off()
+        except Exception:
+            pass
+
+
 def nap(seconds):
     """A sleep that ends when Tailscale is turned off"""
     end = time.time() + seconds
@@ -597,7 +695,7 @@ def run():
                 except Stopped:
                     break
                 except (Fail, OSError, ValueError) as e:
-                    stop_daemon(daemon)
+                    stop_tailscaled(daemon)
                     daemon = None
                     say("error", f"Tailscale: {e}; trying again in a minute")
                     nap(RETRY)
@@ -627,7 +725,7 @@ def run():
     finally:
         if daemon and daemon.poll() is None:
             say("stopping", "Stopping Tailscale...")
-        stop_daemon(daemon)
+        stop_tailscaled(daemon)
         say("off", "Off")
         lock.close()                               # released: the next supervisor may start
     # Turned on again while this one stopped (off, then on at once): the next one takes over. Not after
@@ -714,6 +812,76 @@ def cmd_funnel(arg=None):
     return 0
 
 
+def status_field(key):
+    """A field of the status file, "" when it has none"""
+    try:
+        with open(STATUS) as f:
+            for line in f:
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep and k == key:
+                    return v
+    except OSError:
+        pass
+    return ""
+
+
+def cmd_funnel_clear(wait=None):
+    """Funnel off, and made sure of (#58): x6100-update runs it before it goes back to a version without Funnel, which
+    never looks at a funnel kept in tailscaled's state, and whose TCI and browser remote would take connections from
+    the internet without a key. The setting first, so that a supervisor of this version (one that runs on in memory
+    after the step back too) keeps it off; then the funnel out of tailscaled, the radio's own and any made by hand:
+    through its local API while it runs, out of its state file while it does not. A tailscaled not connected yet
+    (starting, no internet, no login) has no netmap, and its serve config then reads as none (reloadServeConfigLocked)
+    while its state keeps the funnel it loads again once it connects: its state file is looked at too, and the wait is
+    for it to connect. Waits FUNNEL_CLEAR_WAIT s at most, or the seconds given: "ok ..." when it is sure, an error
+    naming what kept it from being sure"""
+    try:
+        end = time.time() + (FUNNEL_CLEAR_WAIT if wait is None else float(wait))
+    except ValueError:
+        raise Fail("funnel-clear [seconds]")
+    was = funnel_wanted()
+    if was:
+        conf_write(funnel=0)
+    while True:
+        running = tailscaled_pids()
+        try:
+            if running:
+                cur = api("GET", "serve-config")
+                if funnel_left(cur):
+                    was = True
+                    serve_set("", 0, 0, False)
+                    cur = api("GET", "serve-config")
+                if funnel_left(cur):
+                    why = "tailscaled keeps a funnel"
+                elif state_funnel_off(write=False):
+                    was = True
+                    why = "tailscaled keeps a funnel in its state for when it connects"
+                elif supervisor_pid() and status_field("funnel") == "on":
+                    why = "Tailscale has not taken the setting yet"     # within a poll, or it sets the funnel again
+                else:
+                    break
+            else:
+                again = False
+                if state_funnel_off():
+                    was = True
+                    again = state_funnel_off()     # read back: a tailscaled that came and went wrote its copy over it
+                if tailscaled_pids():
+                    why = "tailscaled is starting"  # it may have read the file before: through its local API then
+                elif again:
+                    why = "a funnel keeps coming back in tailscaled's state"
+                else:
+                    break
+        except Fail as e:
+            why = str(e)
+        except (OSError, ValueError) as e:
+            why = f"tailscaled does not answer ({e})" if running else f"tailscaled's state: {e}"
+        if time.time() >= end:
+            raise Fail(why)
+        time.sleep(1)
+    print("ok Funnel taken off" if was else "ok no funnel")
+    return 0
+
+
 def cmd_status():
     try:
         with open(STATUS) as f:
@@ -725,13 +893,13 @@ def cmd_status():
 
 def main(argv):
     cmds = {"on": cmd_on, "off": cmd_off, "logout": cmd_logout, "hostname": cmd_hostname,
-            "funnel": cmd_funnel, "status": cmd_status, "run": run}
+            "funnel": cmd_funnel, "funnel-clear": cmd_funnel_clear, "status": cmd_status, "run": run}
     if argv and argv[0] not in cmds:
         print("usage: x6100-tailscale [" + "|".join(cmds) + "]", file=sys.stderr)
         return 1
     try:
-        if argv and argv[0] == "funnel":
-            return cmd_funnel(argv[1] if len(argv) > 1 else None)
+        if argv and argv[0] in ("funnel", "funnel-clear"):
+            return cmds[argv[0]](argv[1] if len(argv) > 1 else None)
         return cmds[argv[0]]() if argv else cmd_boot()
     except (Fail, OSError) as e:                   # OSError: tailscaled not answering on its socket
         print(f"error {e}", file=sys.stderr)

@@ -99,7 +99,7 @@ The radio updates itself: Settings > Info > Update, or the Update page of the
 web configurator (System > Update).
 
 - Check asks GitHub for the latest release. Install downloads its update
-  bundle (the GUI, the web pages, the helpers and their data, about 10 MB),
+  bundle (the GUI, the web pages, the helpers and their data, about 14 MB),
   checks every file against the project's signature, puts the files in place
   with the previous ones kept, and restarts the radio software: the screen
   goes dark for a few seconds. Settings, logs and everything on the DATA
@@ -111,6 +111,25 @@ web configurator (System > Update).
 - The web page can also take a bundle file (`OpenX6X00-x6100-vX.Y.Z-update.tar.gz` or `OpenX6X00-x6200-vX.Y.Z-update.tar.gz`
   from the releases page) for a radio without internet, and has a button to go
   back to the previous version by hand.
+- Going back from v0.3.7 to v0.3.6 (that button, or v0.3.6's bundle): the
+  radio first turns [Tailscale Funnel](#tailscale-funnel) off and takes its
+  funnel, and any set up by hand, out of tailscaled. v0.3.6 knows nothing of
+  Funnel: tailscaled would keep the funnel, and v0.3.6's TCI and browser
+  remote would take connections from the internet without a key.
+  - When it cannot make sure of that within half a minute (tailscaled not
+    answering, or not connected: no internet, or waiting for a login, when
+    it keeps the funnel for when it connects), it does not go back, and the
+    page says why: turn Funnel off, or Tailscale itself, wait until it says
+    Off, and try again.
+  - Funnel is then off when you come back to v0.3.7: turn it on again there.
+  - The step back the radio takes by itself after three failed starts tries
+    the same for a few seconds, and goes back whatever came of it.
+  - This was checked against a stand-in of tailscaled, not on a real
+    tailnet.
+- Every paired browser pairs again on v0.3.6, since v0.3.7 keeps only a hash
+  of each browser's key: Forget all (Settings > General > BROWSER REMOTE), on
+  either version, before pairing, so that the first browser paired is the
+  admin again.
 - The bundle is signed; a bundle not made by the project is refused. (For
   building your own: `tools/update/mkbundle.py`, the key in
   `rootfs/usr/share/x6100/update.pub`; a radio with `/mnt/update/allow-unsigned`
@@ -495,8 +514,10 @@ what count. What follows it:
   own lies where they would go (75m at 3.8-3.9 MHz keeps 80m at 3.8);
   another region later moves them on. Before, a radio in Region 2 tuned to
   7.2-7.3 or 3.9-4.0 MHz was on "Broadcast 41m" or "Broadcast 75m", in AM.
-  Auto with nothing to go by takes the band list's region, so it leaves
-  the list as it is;
+  A radio updated from an older version is on Auto: in Region 2 or 3 its
+  list moves by itself at the first start, as soon as Auto knows the
+  region. Auto with nothing to go by takes the band list's region, so it
+  leaves the list as it is;
 - the typical frequencies of Field Ops and the Bands app: in Region 2 and
   the US phone on 80 m at 3.860 and on 40 m at 7.200 MHz, and outside
   Region 1 CW on 6 m at 50.090 MHz (50.060 is among the beacons there).
@@ -2790,8 +2811,10 @@ Mercury with the radio's GUI as its sound card and PTT, as ardopcf has.
 It is experimental. Two stations connected and exchanged mail through it on a
 PC, each with the radio's own Winlink code and Pat, but it has not been on the
 air from a radio yet. It needs far more of the radio's processor than ARDOP:
-how much, and how warm the radio gets, is measured on the bench before a
-release.
+on an X6100, into a dummy load, about one of its four cores, the radio at
+39 % of its processor with Mercury listening (18 % with ARDOP) and at most
+51 % during calls, its receiver never falling behind. The X6100 has no
+temperature sensor to read. Not measured on an X6200 yet.
 
 Choosing it: on Operating > Winlink, the Station card's Modem, Mercury
 (experimental), and its bandwidth, then Save. One modem runs at a time, since
@@ -3567,6 +3590,8 @@ Good to know:
 - It stays on through restarts, and after a new card image it comes back by
   itself once Tailscale has its new login (the name may then be `x6200-1`
   while the tailnet still has the old machine: remove it in the admin console).
+  Tailscale turned off, and the radio's shutdown, take the funnel out of
+  tailscaled; the next start puts it back within seconds.
 - Over SSH, `x6100-tailscale status` prints `funnel=` (off, starting, enable,
   on, error) with `funnel_text=` and `public=`; `x6100-tailscale funnel on|off`
   is the switch. Its setting is `funnel=0|1` in `/mnt/tailscale.conf`.
