@@ -879,10 +879,19 @@ What they do: see [DX Cluster](#dx-cluster).
 
 | Card | Options |
 |---|---|
-| TX CALIBRATION | IQ offsets, band output gain, codec gain |
+| TX CALIBRATION | IQ offsets, band output gain, codec gain, Auto all bands |
 | CESSB | on, level |
 | TX PROTECTION | SWR protection |
 | S-METER | Preamp, Attenuator, RF gain a step, Measure |
+
+Auto, all bands (a base with a band output gain, Xiegu's r13 and newer): sets the band output
+gain of every band from 160 m to 6 m so the radio's own power meter reads the PWR setting. It
+transmits on every band, **into a dummy load only**: FM carriers of 2.5 s, up to 7 a band, about
+4 minutes in all. A band where the limiter holds the power is left at its full power. It stops on
+an SWR over 2, no power out, Stop, a band change or anything else transmitting. The first press
+says it will transmit, a second one within 5 s starts it; the last line of its progress is under
+the button. Over the config socket: `txcal_start`, `txcal_stop`, `txcal_get` (src/tx_autocal.h).
+Where: Settings > TX Cal > TX CALIBRATION > Auto, all bands.
 
 S-meter front end. Where: Settings > TX Cal > S-METER.
 
