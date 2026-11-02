@@ -358,7 +358,7 @@ static button_data_t wlk_atu = KEY_BTN("ATU", KEYPAD_ATU, key_hold_cb);         
 static button_data_t wlk_agc = KEY_BTN("AGC", KEYPAD_AGC, key_hold_cb);         /* held: split */
 static button_data_t wlk_pre = KEY_BTN("PRE", KEYPAD_PRE, key_hold_cb);         /* held: ATT */
 static button_data_t wlk_ab = KEY_BTN("A/B", KEYPAD_AB, key_hold_cb);           /* held: copy */
-static button_data_t wlk_step = KEY_BTN("Step", KEYPAD_FST, key_hold_cb);       /* held: back */
+static button_data_t wlk_step = KEY_BTN("Step", KEYPAD_FST, key_hold_cb);       /* held: FST held (Settings > Keys) */
 static button_data_t wlk_lock = KEY_BTN("Lock", KEYPAD_LOCK, NULL);             /* held would reset */
 static button_data_t wlk_exit = { .type = BTN_TEXT, .label = "Exit\nhold", .hold = exit_cb };
 
@@ -457,12 +457,15 @@ static void update_cb(lv_timer_t *t) {
     snprintf(buf, sizeof(buf), "%i.%03i.%03i", mhz, khz, hz);
     freq_set(buf);
 
-    /* No repeater offset or tone in this firmware: split is the TX on the other VFO */
+    /* No repeater offset or tone in this firmware: split is the TX on the other VFO. LOCK: the user's frequency
+     * lock (the Lock button) */
+    const char *lock = main_screen_freq_user_locked() ? " - LOCK" : "";
+
     if (param_i_get(cfg_band_split)) {
         split_freq(cparam_i_get(cfg_bg_freq), &mhz, &khz, &hz);
-        snprintf(buf, sizeof(buf), "%s - SPLIT %i.%03i.%03i", info_params_mode_label_get(), mhz, khz, hz);
+        snprintf(buf, sizeof(buf), "%s - SPLIT %i.%03i.%03i%s", info_params_mode_label_get(), mhz, khz, hz, lock);
     } else {
-        snprintf(buf, sizeof(buf), "%s", info_params_mode_label_get());
+        snprintf(buf, sizeof(buf), "%s%s", info_params_mode_label_get(), lock);
     }
     set_text(mode_label, buf);
 

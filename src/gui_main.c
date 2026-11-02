@@ -47,6 +47,7 @@
 #include "tci_server.h"
 #include "remote_server.h"
 #include "control_owner.h"
+#include "ext_tune.h"
 #include "birdie.h"
 #include "cfg_socket.h"
 #include "clock.h"
@@ -230,7 +231,7 @@ static void settings_load(void) {
     mfk_init();
     vol_init();
     /* The folder for the user's own themes (docs/THEMES.md). None comes with the image any more: the RS
-     * theme that was copied here is cut from a screenshot of Icom's RS-BA1 (themes/make_rs.py) */
+     * theme that was copied here is cut from a screenshot of another maker's remote software (themes/make_rs.py) */
     if (system("mkdir -p " BOARD_DATA "/themes") != 0)
         LV_LOG_WARN("No " BOARD_DATA "/themes folder");
     styles_load(params.theme_name.x);
@@ -262,6 +263,7 @@ static void services_start(void) {
     cat_init();
     cfg_socket_init();
     ctl_init();
+    ext_tune_init();    /* TUNE for an external tuner: stopped when the radio moves */
     tci_server_init();
     remote_server_init();
     winlink_init();     /* ardopcf's audio and Pat's rigctld: idle until they connect */

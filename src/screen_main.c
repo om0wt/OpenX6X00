@@ -34,10 +34,12 @@
 #include "screen_shot.h"
 #include "screen_rec.h"
 #include "key_input.h"
+#include "mic_keys.h"
 #include "app_window.h"
 #include "settings_window.h"
 #include "freq_entry.h"
 #include "cw_messages.h"
+#include "cw_encoder.h"
 #include "dialog_cw_kbd.h"
 #include "voice_messages.h"
 #include "swrscan_window.h"
@@ -71,6 +73,7 @@
 #include "band_plan.h"
 #include "cw_field.h"
 #include "cluster_column.h"
+#include "ext_tune.h"
 #include "screen_light.h"
 #include "button_bar.h"
 #include "recorder.h"
@@ -98,8 +101,11 @@ static uint16_t     freq_height = 36;       /* the frequency scale under the spe
 static lv_coord_t   wf_y;                   /* waterfall top */
 
 /* What an open app keeps the keys from changing. The frequency lock is a subject: the scale
- * greys out with it */
+ * greys out with it. It is on while either holds it: the user's lock (LOCK, SPCH, Scroll Lock, the Panel's LOCK,
+ * a key given Frequency lock in Settings > Keys), shown by LOCK in the frequency strip, or an open app's hold, which
+ * ends with the app and leaves the user's lock as it was */
 static SubjectInt   *freq_lock;
+static bool         user_lock, app_lock;
 static bool         band_lock, mode_lock, ab_lock;
 static press_action_t last_app;     /* the app opened last: a digital one while radio_digi_cap() */
 
@@ -116,8 +122,63 @@ static bool cw_mode(void) {
     return mode == radio_mode_cw || mode == radio_mode_cwr;
 }
 
-static void toggle_freq_lock(void) {
-    subject_i_set(freq_lock, !subject_i_get(freq_lock));
+/* The scale and the frequency strip follow the subject */
+static void freq_lock_update(void) {
+    subject_i_set(freq_lock, user_lock || app_lock);
+    freq_strip_set_lock(user_lock);
+}
+
+static void set_user_lock(bool lock) {
+    user_lock = lock;
+    freq_lock_update();
+}
+
+static bool toggle_freq_lock(void) {
+    set_user_lock(!user_lock);
+    return user_lock;
+}
+
+static void say_lock(bool on) {
+    msg_update_text_fmt("%s", on ? "Dial locked" : "Dial unlocked");
+}
+
+/* LOCK held: the base board restart, a way out when the base stops answering (#57), only once LOCK has been held
+ * LOCK_RESET_S seconds more after its long press, counted down on the screen; let go before and nothing happens
+ * (#114: on battery the restart switches the radio off, and a 1 s hold caught people who wanted to lock) */
+#define LOCK_RESET_S 4
+
+static lv_timer_t   *lock_reset_timer;
+static int          lock_reset_left;
+
+static void lock_reset_say(void) {
+    msg_update_text_fmt("Keep holding LOCK to restart: %i s", lock_reset_left);   /* fits the box whole */
+}
+
+static void lock_reset_tick(lv_timer_t *t) {
+    if (--lock_reset_left > 0) {
+        lock_reset_say();
+        return;
+    }
+    lv_timer_del(t);
+    lock_reset_timer = NULL;
+    radio_bb_reset();
+    exit(1);
+}
+
+static void lock_reset_start(void) {
+    if (!lock_reset_timer) {
+        lock_reset_left = LOCK_RESET_S;
+        lock_reset_say();
+        lock_reset_timer = lv_timer_create(lock_reset_tick, 1000, NULL);
+    }
+}
+
+static void lock_reset_stop(void) {
+    if (lock_reset_timer) {
+        lv_timer_del(lock_reset_timer);
+        lock_reset_timer = NULL;
+        msg_update_text_fmt("LOCK let go: no restart");
+    }
 }
 
 /* Pop-up with one line of text (the name of the channel FIL/GENE tuned, WEFAX app messages),
@@ -542,6 +603,8 @@ void main_screen_action(press_action_t action) {
         case ACTION_STEP_UP:        step_freq_step(true); break;
         case ACTION_STEP_DOWN:      step_freq_step(false); break;
         case ACTION_ATU_TUNE:       radio_start_atu(); break;   /* as a long press of the ATU key */
+        case ACTION_EXT_TUNE:       ext_tune_toggle(); break;   /* an external tuner's: started, or stopped */
+        case ACTION_FREQ_LOCK:      say_lock(toggle_freq_lock()); break;
 
         case ACTION_NR_TOGGLE:      say_state("NR", toggle_param(cfg_nr) ? "On" : "Off"); break;
         case ACTION_NB_TOGGLE:      say_state("NB", toggle_param(cfg_nb) ? "On" : "Off"); break;
@@ -684,6 +747,7 @@ static bool page_key(keypad_key_t key, bool tap, bool hold) {
 static void ptt_key(keypad_state_t state) {
     if (state == KEYPAD_PRESS) {
         dialog_msg_voice_ptt_pressed();
+        cw_encoder_ptt_pressed();   /* a beacon or QRSS3 lets go of the key first */
         radio_set_ptt(true);
         if (cw_mode()) {
             radio_set_morse_key(true);
@@ -693,6 +757,24 @@ static void ptt_key(keypad_state_t state) {
             radio_set_morse_key(false);
         }
         radio_set_ptt(false);
+    }
+}
+
+/* A/B, the front key and the H-22's: VFO A/B; long: this VFO copied to the other one. Not while an app holds the
+ * VFOs */
+static void ab_key(bool tap, bool hold) {
+    if (ab_lock) {
+        return;
+    }
+    if (tap) {
+        radio_toggle_vfo();
+        spectrum_clear();
+        tiny_vfo();
+    } else if (hold) {
+        bool on_a = param_i_get(cfg_band_current_vfo) == RADIO_VFO_A;
+
+        cfg_band_vfo_copy();
+        msg_update_text_fmt("Clone VFO %s", on_a ? "A->B" : "B->A");
     }
 }
 
@@ -750,9 +832,11 @@ static void front_key_cb(lv_event_t *e) {
             }
             break;
 
-        case KEYPAD_FST:    /* long: the step back down */
-            if (tap || hold) {
-                step_freq_step(tap);
+        case KEYPAD_FST:    /* long: what Settings > Keys gives it, the step back down unless changed */
+            if (tap) {
+                step_freq_step(true);
+            } else if (hold) {
+                main_screen_action(params.long_fst);
             }
             break;
 
@@ -764,20 +848,8 @@ static void front_key_cb(lv_event_t *e) {
             }
             break;
 
-        case KEYPAD_AB:     /* long: this VFO copied to the other one */
-            if (ab_lock) {
-                break;
-            }
-            if (tap) {
-                radio_toggle_vfo();
-                spectrum_clear();
-                tiny_vfo();
-            } else if (hold) {
-                bool on_a = param_i_get(cfg_band_current_vfo) == RADIO_VFO_A;
-
-                cfg_band_vfo_copy();
-                msg_update_text_fmt("Clone VFO %s", on_a ? "A->B" : "B->A");
-            }
+        case KEYPAD_AB:
+            ab_key(tap, hold);
             break;
 
         case KEYPAD_POWER:  /* a press: the screen off/on */
@@ -790,12 +862,13 @@ static void front_key_cb(lv_event_t *e) {
             }
             break;
 
-        case KEYPAD_LOCK:   /* long: the base board reset and a restart of the GUI */
+        case KEYPAD_LOCK:   /* held on past its long press: the base board reset and a restart of the GUI */
             if (tap) {
-                toggle_freq_lock();
+                say_lock(toggle_freq_lock());
             } else if (hold) {
-                radio_bb_reset();
-                exit(1);
+                lock_reset_start();
+            } else if (ev->state == KEYPAD_LONG_RELEASE) {
+                lock_reset_stop();
             }
             break;
 
@@ -815,6 +888,40 @@ static void front_key_cb(lv_event_t *e) {
     }
 }
 
+/* The H-22's VOL+ and VOL-: the RX volume a step a press, as in Xiegu's app, and on by itself while the key is held
+ * (the X6200's goes to 100). Its message as the VOL knob's */
+#define MIC_VOL_DELAY_MS    400     /* held this long, the steps repeat */
+#define MIC_VOL_REPEAT_MS   100
+
+static lv_timer_t *mic_vol_timer;
+static hkey_t      mic_vol_key;
+
+static void mic_vol_step(void) {
+    uint16_t vol = radio_change_vol(mic_vol_key == HKEY_VOL_UP ? +1 : -1);
+
+    if (!knobs_visible() || vol_get_ctrl() != CTRL_VOL) {
+        msg_update_text_fmt("Volume: %i", vol);
+    }
+}
+
+static void mic_vol_stop(void) {
+    if (mic_vol_timer) {
+        lv_timer_del(mic_vol_timer);
+        mic_vol_timer = NULL;
+    }
+}
+
+/* Asks mic_keys.c whether the key is still down: its release goes to the screen in front, which may be another
+ * one by then (walkie mode) */
+static void mic_vol_repeat_cb(lv_timer_t *t) {
+    if (!hkey_down(mic_vol_key)) {
+        mic_vol_stop();
+        return;
+    }
+    mic_vol_step();
+    lv_timer_set_period(t, MIC_VOL_REPEAT_MS);
+}
+
 /* Hand mic keys */
 static void mic_key_cb(lv_event_t *e) {
     event_hkey_t   *ev   = lv_event_get_param(e);
@@ -824,13 +931,22 @@ static void mic_key_cb(lv_event_t *e) {
     switch (ev->key) {
         /* The band printed on the key; digits only in F-INP (dialog_freq.c). Long: memory 1-9 */
         case HKEY_0: case HKEY_1: case HKEY_2: case HKEY_3: case HKEY_4:
-        case HKEY_5: case HKEY_6: case HKEY_7: case HKEY_8: case HKEY_9: {
+        case HKEY_5: case HKEY_6: case HKEY_7: case HKEY_8: case HKEY_9:
+#ifdef BOARD_X6200
+        case HKEY_DOT:
+#endif
+        {
+#ifdef BOARD_X6200
+            /* The H-22 prints 5.3 on its 3 and 28 on its dot (index 10) */
+            static const int16_t band_m[11] = {6, 160, 80, 60, 40, 30, 20, 17, 15, 12, 10};
+#else
             static const int16_t band_m[10] = {6, 160, 80, 40, 30, 20, 17, 15, 12, 10};
-            int                  digit      = ev->key - HKEY_0;
+#endif
+            int                  digit      = ev->key == HKEY_DOT ? 10 : ev->key - HKEY_0;
 
             if (tap && !band_lock) {
                 controls_set_band_m(band_m[digit]);
-            } else if (hold && digit > 0) {
+            } else if (hold && digit > 0 && digit < 10) {
                 mem_load(digit);
             }
             break;
@@ -838,7 +954,7 @@ static void mic_key_cb(lv_event_t *e) {
 
         case HKEY_SPCH:
             if (tap) {
-                toggle_freq_lock();
+                say_lock(toggle_freq_lock());
             }
             break;
 
@@ -916,18 +1032,43 @@ static void mic_key_cb(lv_event_t *e) {
             }
             break;
 
-        /* F1, F2: the actions given to them in Settings, pressed and held */
+        /* F1, F2 and the H-22's F3: the actions given to them in Settings, pressed and held */
         case HKEY_F1:
-        case HKEY_F2: {
-            bool f1 = ev->key == HKEY_F1;
+        case HKEY_F2:
+        case HKEY_F3: {
+            bool f1 = ev->key == HKEY_F1, f2 = ev->key == HKEY_F2;
 
             if (tap) {
-                main_screen_action(f1 ? params.press_f1 : params.press_f2);
+                main_screen_action(f1 ? params.press_f1 : f2 ? params.press_f2 : params.press_f3);
             } else if (hold) {
-                main_screen_action(f1 ? params.long_f1 : params.long_f2);
+                main_screen_action(f1 ? params.long_f1 : f2 ? params.long_f2 : params.long_f3);
             }
             break;
         }
+
+        /* The H-22's own keys */
+        case HKEY_VOL_UP:
+        case HKEY_VOL_DOWN:
+            if (ev->state == HKEY_PRESS) {
+                mic_vol_stop();
+                mic_vol_key   = ev->key;
+                mic_vol_step();
+                mic_vol_timer = lv_timer_create(mic_vol_repeat_cb, MIC_VOL_DELAY_MS, NULL);
+            } else if (!hold) {
+                mic_vol_stop();     /* let go */
+            }
+            break;
+
+        case HKEY_AB:       /* as the front A/B key (Xiegu's app takes it for XFC, which here swaps the VFOs) */
+            ab_key(tap, hold);
+            break;
+
+        case HKEY_BAND_UP:  /* as the BAND keys; Xiegu's app knows them, no base was seen sending them */
+        case HKEY_BAND_DOWN:
+            if (tap) {
+                band_step(ev->key == HKEY_BAND_UP);
+            }
+            break;
 
         default:
             LV_LOG_WARN("Unsuported key: %u", ev->key);
@@ -1090,7 +1231,7 @@ static void spectrum_key_cb(lv_event_t *e) {
         case LV_KEY_RIGHT:          main_screen_mfk(+1); break;
         case KEYBOARD_PGUP:         band_step(true); break;
         case KEYBOARD_PGDN:         band_step(false); break;
-        case KEYBOARD_SCRL_LOCK:    toggle_freq_lock(); break;
+        case KEYBOARD_SCRL_LOCK:    say_lock(toggle_freq_lock()); break;
         case KEYBOARD_F9:           dialog_construct(dialog_settings, obj); break;
 
         case KEYBOARD_PRINT:
@@ -1159,8 +1300,19 @@ void main_screen_keys_enable(bool value) {
     lv_group_set_editing(keyboard_group, false);
 }
 
+/* An app's hold */
 void main_screen_lock_freq(bool lock) {
-    subject_i_set(freq_lock, lock);
+    app_lock = lock;
+    freq_lock_update();
+}
+
+/* The user's lock (the Panel's LOCK) */
+void main_screen_user_lock_freq(bool lock) {
+    set_user_lock(lock);
+}
+
+bool main_screen_freq_user_locked(void) {
+    return user_lock;
 }
 
 void main_screen_lock_band(bool lock) {
@@ -1190,6 +1342,10 @@ bool main_screen_mode_locked() {
 
 const char *main_screen_digital_app(void) {
     return radio_digi_cap() ? app_name(last_app) : NULL;
+}
+
+press_action_t main_screen_digital_app_action(void) {
+    return radio_digi_cap() ? last_app : ACTION_NONE;
 }
 
 /* A jump, not a turn of the knob: the spectrum starts again */
@@ -1483,6 +1639,13 @@ static void build(void) {
     subject_subscribe_delayed((Subject*)cfg_band_if_shift, on_span_change, NULL);
     subject_subscribe_delayed((Subject*)cfg_wf_mode, on_span_change, NULL);
     subject_subscribe_delayed_and_notify((Subject*)cfg_mode_zoom, on_span_change, NULL);
+    /* Fixed mode: these move the view on too (waterfall_view_shift(): Jump at Passband edge, #10) */
+    subject_subscribe_delayed((Subject*)cfg_wf_fixed_jump, on_span_change, NULL);
+    subject_subscribe_delayed((Subject*)cfg_wf_fixed_after, on_span_change, NULL);
+    subject_subscribe_delayed((Subject*)cfg_cur_filter_low, on_span_change, NULL);
+    subject_subscribe_delayed((Subject*)cfg_cur_filter_high, on_span_change, NULL);
+    subject_subscribe_delayed((Subject*)cfg_cur_mode, on_span_change, NULL);
+    subject_subscribe_delayed((Subject*)cfg_key_tone, on_span_change, NULL);
 
     subject_subscribe_delayed_and_notify((Subject*)cfg_bg_freq, on_freq_change, NULL);
 

@@ -4,7 +4,8 @@
 (the radio, the settings, the player, PulseAudio: a few variables) as `winlink_host`.
 Its receiver is a 1 kHz tone, or the other station's air; its player keeps the wall
 clock as the low-latency stream does, keys the radio for the whole transmission and
-writes what it played to `WL_PLAYED` (the variables are at the top of `stubs.c`).
+writes what it played to `WL_PLAYED` (the variables are at the top of `stubs.c`). The
+band table the SWR hold goes by is the real one (`src/cluster/spots.c`, copied beside it).
 liquid-dsp comes from `build-host/deps` (`host/build.sh`), or `make DEPS=...`.
 
 `make` (`make test`) runs `winlink_proto_test.py`: it speaks to the socket as a modem
@@ -17,16 +18,23 @@ message on the screen), a key longer than the GUI allows (40 s), the hellos refu
 rate other than 8000 or 12000, no key, version 3: the connection is closed), messages
 before the hello (ignored), a second hello (ignored), a new connection replacing the
 old one, a digital app opened during a key (`WL_APP`: the key stopped there, the next
-one refused until the app is closed), and the radio file the Winlink page reads
-(`build/radio` here): Winlink's cap of 7 W, and 5 W with the X6200 on its battery
-(`WL_PWR_MAX=5`, said in `cap_battery`). It prints `PROTO OK`.
+one refused until the app is closed), an SWR trip during a key (`WL_SWR`, #147: on
+10.145 MHz the keys on 30 m are held, also after Pat's QSY to 10.120, while 7.102 MHz
+on 40 m keys at once, the radio file saying where the hold is and whether the radio is
+there; on 7.250 MHz, outside the table's 40 m, the hold covers 7.300 MHz, within
+100 kHz of it, and 7.400 keys; `WL_SWR_LATE`, a trip counted outside a key: just
+after one it is that key's, 2.5 s later another transmission's and holds nothing),
+and the radio file the Winlink page reads
+(`build/radio` here): Winlink's cap of 7 W, 5 W with the X6200 on its battery
+(`WL_PWR_MAX=5`, said in `cap_battery`), and 0.5 W under a transverter's TX power limit
+(`WL_PWR_XVTR=0.5`, said in `cap_transverter`, not `cap_battery`). It prints `PROTO OK`.
 
 `make modems` runs `winlink_modems_test.py` with the real modems, in a network
 namespace of its own with loopback only (`unshare -rn`), so Pat reaches nothing
 outside: no Winlink web service, no CMS. It needs the GUI's PC build with the two
 modems built (`cmake --build build-host --target ardopcf x6x00-mercury`; `make
 BUILD=...` for another build directory) and a Pat for this PC (`make PAT=...`: Pat
-v1.0.0 with `tools/pat/patches`, built for linux/amd64).
+v1.0.1 with `tools/pat/patches`, built for linux/amd64; 2026-11-01: MODEMS OK, 58 s).
 
 - ardopcf, as `x6100-winlink` starts it: it connects in protocol 1 (12000 Hz, keys of
   30 s), and the ID frame asked on its host port (`SENDID`) is played whole (1.75 s).

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 
 // SettingsManager-level operations exposed to C. cfg_api_init lives in
 // cfg_api.cpp (it also fills the extern parameter pointers); these are the
@@ -28,6 +29,39 @@ bool cfg_is_rx_only_freq(int32_t freq) {
 
 bool cfg_is_tx_freq(int32_t freq) {
     return cfg_sm.is_tx_freq(freq);
+}
+
+bool cfg_tx_range(int32_t freq, int32_t *lo, int32_t *hi) {
+    struct Range {
+        bool    on;
+        int32_t from, to;
+    };
+    const Range r[] = {
+        {cfg_sm.p_transverter_0_shift.get() != 0, cfg_sm.p_transverter_0_from.get(), cfg_sm.p_transverter_0_to.get()},
+        {cfg_sm.p_transverter_1_shift.get() != 0, cfg_sm.p_transverter_1_from.get(), cfg_sm.p_transverter_1_to.get()},
+        {true, SettingsManager::HF_MIN_FREQ, SettingsManager::HF_MAX_FREQ},
+    };
+
+    for (size_t k = 0; k < std::size(r); k++) {
+        if (!r[k].on || freq < r[k].from || freq > r[k].to) {
+            continue;
+        }
+        *lo = r[k].from;
+        *hi = r[k].to;
+        for (size_t j = 0; j < k; j++) {    /* one before it covers part of it: there the radio goes another way */
+            if (!r[j].on) {
+                continue;
+            }
+            if (r[j].from > freq) {
+                *hi = std::min(*hi, r[j].from - 1);
+            }
+            if (r[j].to < freq) {
+                *lo = std::max(*lo, r[j].to + 1);
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 bool cfg_band_usable(void) {
@@ -74,12 +108,49 @@ void cfg_pwr_set(float watts) {
     cfg_sm.p_pwr.set(watts);
 }
 
+void cfg_hw_caps_set(uint32_t caps) {
+    cfg_sm.hw_caps_ = caps;
+    cfg_sm.cp_mode_lo_offset.recompute();
+}
+
 void cfg_pwr_max_set(float watts) {
     cfg_sm.pwr_max_.store(watts);
 }
 
 float cfg_pwr_max_get(void) {
-    return cfg_sm.pwr_max_.load();
+    return cfg_sm.pwr_top();
+}
+
+float cfg_transverter_pwr_for(int32_t freq) {
+    return cfg_sm.transverter_pwr_for(freq);
+}
+
+float cfg_transverter_pwr_cap(int32_t rx, int32_t tx) {
+    return cfg_sm.transverter_pwr_cap(rx, tx);
+}
+
+pwr_xvtr_t cfg_pwr_xvtr_set(float watts, bool on_xvtr) {
+    switch (cfg_sm.pwr_xvtr_set(watts, on_xvtr)) {
+        case SettingsManager::XvtrPwr::HELD:     return PWR_XVTR_HELD;
+        case SettingsManager::XvtrPwr::RESTORED: return PWR_XVTR_RESTORED;
+        default:                                 return PWR_XVTR_SAME;
+    }
+}
+
+float cfg_pwr_xvtr_get(void) {
+    return cfg_sm.pwr_xvtr_.load();
+}
+
+void cfg_transverter_name(int32_t freq, char *buf, size_t size) {
+    BandInfoLoadResult b     = BandsTable::get_by_freq(static_cast<uint32_t>(freq));
+    bool               first = cfg_sm.p_transverter_0_shift.get() && freq >= cfg_sm.p_transverter_0_from.get() &&
+                         freq <= cfg_sm.p_transverter_0_to.get();
+
+    if (b.rc == SUCCESS && b.value.id != BAND_UNDEFINED && !b.value.name.empty()) {
+        snprintf(buf, size, "%s", b.value.name.c_str());
+    } else {
+        snprintf(buf, size, "%d", first ? 1 : 2);     /* as Settings numbers them */
+    }
 }
 
 void cfg_vfo_toggle(void) {

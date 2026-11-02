@@ -36,6 +36,7 @@ extern "C" {
     #include "screen_light.h"
     #include "radio.h"
     #include "tx_autocal.h"
+    #include "tune_tx.h"
     #include "gui_events.h"
     #include "key_input.h"
     #include "paddle_keyer.h"
@@ -71,6 +72,7 @@ extern "C" {
 #define ROW_H       44  /* option row and control height */
 #define UPD_ROW_H   36  /* Info page: the Update button and its status line */
 #define UPD_NOTE_H  20
+#define INFO_ROW_H  36  /* Info page: a row of text */
 /* Settings text two sizes over the sony_N it names (readability); VISION already scales it up */
 #define SF(n)       font_down(&sony_##n, theme_shape.vision ? 0 : -2)
 
@@ -752,11 +754,15 @@ static const key_action_t front_actions[] = {
     {" RX recorder on/off ", ACTION_RECORDER},
     {" Screen rec on/off ", ACTION_SCREEN_REC},
     {" Mute ", ACTION_MUTE},
+    {" Frequency lock on/off ", ACTION_FREQ_LOCK},
+    {" Step up ", ACTION_STEP_UP},
+    {" Step down ", ACTION_STEP_DOWN},     /* FST's long press until it is changed */
     {" WF mode ", ACTION_WF_MODE},
     {" ATT on/off ", ACTION_ATT_TOGGLE},
     {" PRE on/off ", ACTION_PRE_TOGGLE},
     {" Tuner on/off ", ACTION_ATU_TOGGLE},
     {" Tuner: tune ", ACTION_ATU_TUNE},
+    {" TUNE ext. tuner on/off ", ACTION_EXT_TUNE},
     /* Digital modes, in the order of the Modes menu */
     {" APP RTTY ", ACTION_APP_RTTY},
     {" APP FT8 ", ACTION_APP_FT8},
@@ -786,6 +792,7 @@ static const key_action_t mic_actions[] = {
     {" Mute ", ACTION_MUTE},
     {" Step up ", ACTION_STEP_UP},
     {" Step down ", ACTION_STEP_DOWN},
+    {" Frequency lock on/off ", ACTION_FREQ_LOCK},
     {" NR toggle ", ACTION_NR_TOGGLE},
     {" NB toggle ", ACTION_NB_TOGGLE},
     {" WF mode ", ACTION_WF_MODE},
@@ -793,9 +800,10 @@ static const key_action_t mic_actions[] = {
     {" PRE on/off ", ACTION_PRE_TOGGLE},
     {" Tuner on/off ", ACTION_ATU_TOGGLE},
     {" Tuner: tune ", ACTION_ATU_TUNE},
+    {" TUNE ext. tuner on/off ", ACTION_EXT_TUNE},
 };
 
-#define KEY_ROWS_FRONT  6   /* then the hand mic's */
+#define KEY_ROWS_FRONT  7   /* then the hand mic's */
 
 typedef struct {
     const char *label;
@@ -810,10 +818,17 @@ static const key_row_t key_rows[] = {
     {"MSG", &params.long_msg, &params.dirty.long_msg},
     {"DFN", &params.long_dfn, &params.dirty.long_dfn},
     {"DFL", &params.long_dfl, &params.dirty.long_dfl},
+    {"FST", &params.long_fst, &params.dirty.long_fst},     /* the tuning step key: a press steps up */
     {"F1", &params.press_f1, &params.dirty.press_f1},
     {"F2", &params.press_f2, &params.dirty.press_f2},
+#ifdef BOARD_X6200
+    {"F3", &params.press_f3, &params.dirty.press_f3},       /* the H-22 has an F3, the X6100's mic not */
+#endif
     {"F1 long", &params.long_f1, &params.dirty.long_f1},
     {"F2 long", &params.long_f2, &params.dirty.long_f2},
+#ifdef BOARD_X6200
+    {"F3 long", &params.long_f3, &params.dirty.long_f3},
+#endif
 };
 
 static const key_action_t * key_actions(const key_row_t *k, size_t *n) {
@@ -859,15 +874,35 @@ static void xvrt_cb(lv_event_t *e) {
     ((ParamInt *)lv_event_get_user_data(e))->set(lv_spinbox_get_value(lv_event_get_target(e)) * 1000000L);
 }
 
+/* And its TX power limit (#104), in steps of 0.1 W up to the radio's top, Off at 0: on its band nothing transmits
+ * above it (radio.c) */
+static const char * xvrt_pwr_text(int32_t tenths) {
+    static char s[8];
+
+    if (tenths == 0) return "Off";
+    snprintf(s, sizeof(s), "%i.%i", (int)(tenths / 10), (int)(tenths % 10));
+    return s;
+}
+
+static void xvrt_pwr_cb(lv_event_t *e) {
+    lv_obj_t *obj = lv_event_get_target(e);
+    int32_t   v   = lv_slider_get_value(obj);
+
+    lv_label_set_text((lv_obj_t *)lv_obj_get_user_data(obj), xvrt_pwr_text(v));
+    ((Parameter<float, int32_t, 10> *)lv_event_get_user_data(e))->set(v / 10.0f);
+}
+
 static uint8_t make_transverters(uint8_t row) {
     ParamInt *p[2][3] = {
         {&cfg_sm.p_transverter_0_from, &cfg_sm.p_transverter_0_to, &cfg_sm.p_transverter_0_shift},
         {&cfg_sm.p_transverter_1_from, &cfg_sm.p_transverter_1_to, &cfg_sm.p_transverter_1_shift},
     };
+    Parameter<float, int32_t, 10> *pwr[2] = {&cfg_sm.p_transverter_0_pwr, &cfg_sm.p_transverter_1_pwr};
     const int lo[3] = {70, 70, 0};
 
     for (auto &x : p) {
         char label[32];
+        int  t = x[0]->context_id();
 
         snprintf(label, sizeof(label), "%i: from, to, shift (0 off)", x[0]->context_id() + 1);
         wl_row_label(row, label);
@@ -876,6 +911,14 @@ static uint8_t make_transverters(uint8_t row) {
 
             lv_obj_add_event_cb(sb, xvrt_cb, LV_EVENT_VALUE_CHANGED, x[i]);
         }
+        row++;
+
+        int32_t tenths = lroundf(pwr[t]->get() * 10.0f);
+
+        snprintf(label, sizeof(label), "%i: TX power limit, W", t + 1);
+        wl_row_label(row, label);
+        row_slider(row_cell(row, 4, 3, SMALL_3), tenths, 0, lroundf(BOARD_PWR_MAX * 10.0f), SMALL_3 - 120, xvrt_pwr_cb,
+                   pwr[t], "%s", xvrt_pwr_text(tenths));
         row++;
     }
     return row;
@@ -925,6 +968,38 @@ static uint8_t make_spectrum_show(uint8_t row) {
     spectrum_show_sw = param_switch(row, 1, 3, SMALL_3, cfg_sm.p_spectrum_show);
     lv_obj_add_event_cb(spectrum_show_sw, spectrum_show_cb, LV_EVENT_VALUE_CHANGED, NULL);
     return row + 1;
+}
+
+/* Waterfall Mode: Fixed has the rows Jump at and Jump to under it (#10), the page again after the
+ * event as for the spectrum */
+static lv_obj_t *wf_mode_dd;
+
+static void wf_mode_page(void *arg) {
+    if (!page) {
+        return;
+    }
+    make_display_page();
+    lv_group_focus_obj(wf_mode_dd);
+}
+
+static void wf_mode_cb(lv_event_t *e) {
+    lv_async_call(wf_mode_page, NULL);
+}
+
+static uint8_t make_wf_mode(uint8_t row) {
+    /* Centered: the VFO stays in the middle. Fixed: the span stays put, the VFO line moves */
+    wl_row_label(row, "Mode");
+    wf_mode_dd = row_choice(row++, 1, 3, SMALL_3, " Centered \n Fixed ", cfg_sm.p_wf_mode.get(), int_choice_cb,
+                            &cfg_sm.p_wf_mode);
+    lv_obj_add_event_cb(wf_mode_dd, wf_mode_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    if (cfg_sm.p_wf_mode.get()) {
+        /* When the view moves on: the line 40% of the span out, or the passband or the line at the
+         * screen's edge; and where the line goes then: back to the centre, to the other edge, or it
+         * stays at the edge and the view scrolls along */
+        row = make_param_choice(row, "Jump at", " 40% \n Passband \n Line ", cfg_sm.p_wf_fixed_jump);
+        row = make_param_choice(row, "Jump to", " Center \n Other edge \n Scroll ", cfg_sm.p_wf_fixed_after);
+    }
+    return row;
 }
 
 /* Spectrum fill, peaks */
@@ -2748,8 +2823,57 @@ static lv_obj_t *reachable_end(lv_group_t *g, bool last) {
     return NULL;
 }
 
+/* How many objects the knob can be on in an object, itself included */
+static int controls_in(lv_obj_t *obj) {
+    int n = lv_obj_get_group(obj) ? 1 : 0;
+
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(obj); i++) {
+        n += controls_in(lv_obj_get_child(obj, i));
+    }
+    return n;
+}
+
+/* The bottom of a control's row and of the rows under it without a control, up to the next
+ * control or the card's end: its status line and notes (Info's Update, the Cluster filters) */
+static lv_coord_t notes_bottom(lv_obj_t *obj) {
+    lv_area_t a;
+
+    lv_obj_get_coords(obj, &a);
+    while (obj && lv_obj_get_parent(obj) && lv_obj_get_style_layout(lv_obj_get_parent(obj), 0) != LV_LAYOUT_GRID) {
+        obj = lv_obj_get_parent(obj);
+    }
+    if (!obj || !lv_obj_get_parent(obj)) return a.y2;
+    /* A row of a list (the Wi-Fi networks, the Bluetooth devices): the rows under it are the list's, not its
+     * notes: with them a step onto the list took the page down to that row at its top, the rows over it gone */
+    if (controls_in(obj) > 1) return a.y2;
+
+    lv_obj_t  *g      = lv_obj_get_parent(obj);
+    int        first  = lv_obj_get_style_grid_cell_row_pos(obj, 0);
+    int        last   = first + lv_obj_get_style_grid_cell_row_span(obj, 0) - 1;
+    int        next   = 64;        /* the next row with a control; a card has at most 64 (row_pool) */
+    lv_coord_t bottom = a.y2;
+
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(g); i++) {
+        lv_obj_t *c = lv_obj_get_child(g, i);
+        int       r = lv_obj_get_style_grid_cell_row_pos(c, 0);
+
+        if (r > last && r < next && controls_in(c)) next = r;
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(g); i++) {
+        lv_obj_t *c = lv_obj_get_child(g, i);
+        int       r = lv_obj_get_style_grid_cell_row_pos(c, 0);
+        lv_area_t ca;
+
+        if (r >= first && r < next && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_get_coords(c, &ca);
+            bottom = LV_MAX(bottom, ca.y2);
+        }
+    }
+    return bottom;
+}
+
 /* MFK focus: bring the whole row into view, with a margin (the default
- * scroll-on-focus left rows at the bottom edge half hidden) */
+ * scroll-on-focus left rows at the bottom edge half hidden), and its notes under it */
 static void focus_cb(lv_group_t *g) {
     lv_obj_t *obj = lv_group_get_focused(g);
 
@@ -2768,19 +2892,31 @@ static void focus_cb(lv_group_t *g) {
         lv_obj_scroll_to_y(page, 0, LV_ANIM_OFF);
         return;
     }
-    if (reachable_end(g, true) == obj) {
-        lv_coord_t below = lv_obj_get_scroll_bottom(page);
-
-        if (below > 0) lv_obj_scroll_by(page, 0, -below, LV_ANIM_OFF);
-        return;
-    }
     lv_obj_get_coords(obj, &a);
     lv_obj_get_coords(page, &p);
-    if (a.y2 + margin > p.y2) {
-        lv_obj_scroll_by(page, 0, p.y2 - (a.y2 + margin), LV_ANIM_OFF);
-    } else if (a.y1 - margin < p.y1) {
-        lv_obj_scroll_by(page, 0, p.y1 - (a.y1 - margin), LV_ANIM_OFF);
+
+    lv_coord_t dy = 0;  /* how far the rows move, down when > 0 */
+
+    if (reachable_end(g, true) == obj) {
+        dy = -lv_obj_get_scroll_bottom(page);
+    } else {
+        /* The rows without a control under it come into view with it: 24 px under a control
+         * left a status line in a font with tall lines (DejaVu, VISION's), or on two lines, cut
+         * at the page's bottom edge (#82) */
+        lv_coord_t bottom = LV_MAX(a.y2 + margin, notes_bottom(obj) + 4);
+
+        if (bottom > p.y2) {
+            dy = p.y2 - bottom;
+        } else if (a.y1 - margin < p.y1) {
+            dy = p.y1 - (a.y1 - margin);
+        }
     }
+    /* The control itself stays in view: Wireless ends more than a page under the Tailscale
+     * switch, the last control the knob reaches while Tailscale is off (Funnel and Log out
+     * disabled), and the page's end took the switch off the top */
+    if (a.y1 + dy < p.y1 + 8) dy = p.y1 + 8 - a.y1;
+    dy = LV_CLAMP(-LV_MAX(lv_obj_get_scroll_bottom(page), 0), dy, LV_MAX(lv_obj_get_scroll_top(page), 0));
+    if (dy) lv_obj_scroll_by(page, 0, dy, LV_ANIM_OFF);
 }
 
 static void grid_delete() {
@@ -2923,6 +3059,7 @@ static param_slider_t snap_slow_slider = {&cfg_sm.p_spot_snap_slow, 1, 5, 1, "%i
 static param_slider_t accel_onset_slider = {&cfg_sm.p_freq_accel_onset, 1, 5, 1, "%i"};
 static param_slider_t wf_speed_slider = {&cfg_sm.p_waterfall_speed, 1, 5, 1, "%i"};
 static param_slider_t spectrum_height_slider = {&cfg_sm.p_spectrum_height, 60, 160, 4, "%i px"};
+static param_slider_t textlog_mb_slider = {&cfg_sm.p_textlog_mb, 1, 100, 1, "%i MB"};
 
 /* S-meter cal, when its editing starts: what it is for, before the reading drifts from the truth.
  * Built as the cluster alert (theme roles, popup radius, sony_18 title), framed in the error colour */
@@ -2968,7 +3105,7 @@ extern "C" void smeter_warn_show(void) {   /* not static: the UI harness shows i
     lv_obj_set_style_text_color(l, TC(text), 0);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
     lv_label_set_text(l, "For this band only. Feed -73 dBm and set the reading to S9 on each "
-                         "band you use. -22 dB matches an IC-7300.");
+                         "band you use.");
 
     smeter_warn_timer = lv_timer_create(smeter_warn_close, 5000, NULL);
     lv_timer_set_repeat_count(smeter_warn_timer, 1);
@@ -3119,6 +3256,14 @@ static void make_general_page() {
     card_end(row);
     wv_update();
     wv_timer = lv_timer_create(wv_timer_cb, 1000, NULL);   /* deleted by st_delete_cb */
+
+    /* The keyboard modes' text on the card, a file a day (digi_textlog.c, #55); past the limit the oldest day goes */
+    row = card_begin("TEXT LOG");
+    wl_row_label(row, "Keyboard modes");
+    param_switch(row, 1, 3, SMALL_3, cfg_sm.p_textlog);
+    lv_label_set_text(wl_note(row), "PSK, Olivia, JTTY, RTTY: web Logs page");
+    row = make_param_slider(row + 1, "Size limit", &textlog_mb_slider);
+    card_end(row);
 }
 
 /* The Walkie Talkie screen: on (Settings closes, the portrait screen comes up), its knob, its mic */
@@ -3424,21 +3569,23 @@ static void make_cluster_page() {
     }
     row++;
 
-    /* Two rows of bands, the second right-aligned */
+    /* Six bands a row, 160-20 m and 17-6 m; the last row (4 m, 2 m, 70 cm) right-aligned */
     cf.band_n = 0;
     while (cf.band_n < 16 && cluster_band_name(cf.band_n)[0]) cf.band_n++;
-    int first = (cf.band_n + 1) / 2;
+    int band_rows = (cf.band_n + 5) / 6;
 
     wl_row_label(row, "Bands (m)");
     for (int b = 0; b < cf.band_n; b++) {
-        char name[8];
-        int  r   = b < first ? row : row + 1;
-        int  col = b < first ? 1 + b + (6 - first) : 1 + (b - first) + (6 - (cf.band_n - first));
+        const char *band = cluster_band_name(b);
+        char        name[8];
+        int         r    = b / 6;
+        int         in_r = r < band_rows - 1 ? 6 : cf.band_n - 6 * r;    /* the bands on this row */
 
-        snprintf(name, sizeof(name), "%d", atoi(cluster_band_name(b)));
-        cf.band[b] = cf_toggle(r, col, name, !f->bands || (f->bands & (1u << b)), cf.band);
+        if (strstr(band, "cm")) snprintf(name, sizeof(name), "%s", band);     /* 70cm */
+        else snprintf(name, sizeof(name), "%d", atoi(band));                    /* 20 */
+        cf.band[b] = cf_toggle(row + r, 1 + b % 6 + (6 - in_r), name, !f->bands || (f->bands & (1u << b)), cf.band);
     }
-    row += 2;
+    row += band_rows;
 
     /* Two on a row, two columns each: WWBOTA is wider than a mode */
     wl_row_label(row, "Activity");
@@ -3452,7 +3599,10 @@ static void make_cluster_page() {
     obj = wl_label(grid, SF(18), theme_hex(TC_text_dim), 0);
     lv_label_set_text(obj, "For the app, the column and the waterfall. Alerts always show.\n"
                            "Activity: none lit = all spots. Max age, spotters, alerts: web Cluster page.");
-    lv_obj_set_grid_cell(obj, LV_GRID_ALIGN_START, 0, 7, LV_GRID_ALIGN_CENTER, row, 1);
+    /* wrapped in the card: in DejaVu (VISION's size the more) the second line ran off its right edge */
+    lv_obj_set_width(obj, lv_pct(100));
+    lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
+    lv_obj_set_grid_cell(obj, LV_GRID_ALIGN_STRETCH, 0, 7, LV_GRID_ALIGN_CENTER, row, 1);
     row_dsc[row] = LV_GRID_CONTENT;
     row++;
 
@@ -3497,6 +3647,20 @@ static uint8_t make_swr_protect(uint8_t row) {
     return row + 1;
 }
 
+/* TUNE for an external tuner (ext_tune.h): its own power and its time limit */
+static float_slider_t tune_pwr_fs     = {0.1f, [](float v) { cfg_sm.p_tune_pwr.set(v); }};
+static param_slider_t tune_time_slider = {&cfg_sm.p_tune_time, TUNE_TIME_MIN_S, TUNE_TIME_MAX_S, 1, "%d"};
+
+static uint8_t make_ext_tune(uint8_t row) {
+    wl_row_label(row, "TUNE power, W");
+    float_slider(row_cell(row, 4, 3, SMALL_3), cfg_sm.p_tune_pwr.get(), TUNE_PWR_MIN_W, TUNE_PWR_MAX_W, SMALL_3 - 120,
+                 &tune_pwr_fs);
+    row++;
+    wl_row_label(row, "TUNE time limit, s");
+    param_slider(row_cell(row, 4, 3, SMALL_3), SMALL_3 - 120, &tune_time_slider);   /* as wide as the power's */
+    return row + 1;
+}
+
 static void ptr_clear_cb(lv_event_t *e);
 static lv_obj_t * upd_line(uint8_t row);
 
@@ -3505,9 +3669,27 @@ static lv_obj_t * upd_line(uint8_t row);
  * for this one: on a steady signal (a generator at -73 dBm, or a broadcast carrier well over the
  * noise) the meter is read with everything off, then with PRE, with ATT, and at RF gain 40, 1.5 s
  * to settle and 1.5 s of readings each, and what was left over moves the three settings.
- * PRE, ATT and the RF gain go back as they were after, also when the page closes or on TX. */
+ * PRE, ATT and the RF gain go back as they were after, also when the page closes or on TX.
+ * The X6200's attenuator takes 29 to 53 dB off depending on the band (#125): there its figure is the
+ * band's, up to 60 dB, and Measure sets the band's; and the signal has to be about S9 or more, so that
+ * it stays over the noise with ATT on: 3 dB under S9 passes, as its readings are whole dB from the base
+ * and a generator set to S9, -73 dBm, reading a dB under it was refused. The X6100 has one
+ * figure, up to 40 dB, and takes S5 or more. */
+#ifdef BOARD_X6200
+static ParamInt &sm_att = cfg_sm.p_band_smeter_att;
+#define SM_ATT_MAX   SettingsManager::SMETER_ATT_MAX
+#define SM_ATT_WHERE " on this band"
+#define SMC_MIN      (S9 - 3)
+#define SMC_MIN_S    "S9"
+#else
+static ParamInt &sm_att = cfg_sm.p_smeter_att;
+#define SM_ATT_MAX   40
+#define SM_ATT_WHERE ""
+#define SMC_MIN      S5
+#define SMC_MIN_S    "S5"
+#endif
 static param_slider_t sm_pre_slider = {&cfg_sm.p_smeter_pre, 0, 40, 1, "%i dB"};
-static param_slider_t sm_att_slider = {&cfg_sm.p_smeter_att, 0, 40, 1, "%i dB"};
+static param_slider_t sm_att_slider = {&sm_att, 0, SM_ATT_MAX, 1, "%i dB"};
 
 #define SMC_SETTLE   15     /* ticks of 100 ms */
 #define SMC_SAMPLE   15
@@ -3572,6 +3754,13 @@ static void smc_slider_set(lv_obj_t *sl, int32_t v, int32_t step) {
     lv_event_send(sl, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
+#ifdef BOARD_X6200
+/* Another band, its own attenuator figure: the slider follows */
+static void sm_att_follow(Subject *subj, void *slider) {
+    smc_slider_set((lv_obj_t *)slider, static_cast<SubjectInt *>(subj)->get(), 1);
+}
+#endif
+
 static void smc_timer_cb(lv_timer_t *t) {
     static const char *const names[SMC_STEPS] = {"everything off", "PRE on", "ATT on", "RF gain 40"};
     char buf[128];
@@ -3612,9 +3801,14 @@ static void smc_timer_cb(lv_timer_t *t) {
         smc_stop(buf);
         return;
     }
-    if (smc_step == 0 && (smc_read[0] < S5 || smc_read[0] > S9_20)) {
-        snprintf(buf, sizeof(buf), "The signal reads %.0f dB: feed one between S5 and S9+20. Nothing changed.", smc_read[0]);
+    if (smc_step == 0 && (smc_read[0] < SMC_MIN || smc_read[0] > S9_20)) {
+        snprintf(buf, sizeof(buf), "The signal reads %.0f dB: feed one between " SMC_MIN_S " and S9+20. Nothing changed.", smc_read[0]);
         smc_stop(buf);
+        return;
+    }
+    /* At the meter's floor the reading says nothing of the depth (an attenuator figure far too low) */
+    if (smc_step == 2 && smc_read[2] < S1 + 1) {
+        smc_stop("With ATT it read S1: raise Attenuator first. Nothing changed.");
         return;
     }
     if (++smc_step < SMC_STEPS) {
@@ -3624,7 +3818,7 @@ static void smc_timer_cb(lv_timer_t *t) {
 
     /* The readings came through the present corrections: each moves by what was left over */
     int32_t pre = LV_CLAMP(0, lroundf(cfg_sm.p_smeter_pre.get() + (smc_read[1] - smc_read[0])), 40);
-    int32_t att = LV_CLAMP(0, lroundf(cfg_sm.p_smeter_att.get() + (smc_read[0] - smc_read[2])), 40);
+    int32_t att = LV_CLAMP(0, lroundf(sm_att.get() + (smc_read[0] - smc_read[2])), SM_ATT_MAX);
     int32_t rfg = LV_CLAMP(0, lroundf(cfg_sm.p_smeter_rfg.get() + 100.0f * (smc_read[0] - smc_read[3]) / (100 - SMC_RFG_LOW)), 200);
 
     rfg = (rfg + 2) / 5 * 5;    /* the slider's step */
@@ -3633,9 +3827,21 @@ static void smc_timer_cb(lv_timer_t *t) {
     smc_slider_set(smc_sl[1], att, 1);
     smc_slider_set(smc_sl[2], rfg, 5);
     cfg_sm.p_smeter_pre.set(pre);   /* also without the sliders (the page may be gone) */
-    cfg_sm.p_smeter_att.set(att);
+    sm_att.set(att);
     cfg_sm.p_smeter_rfg.set(rfg);
-    snprintf(buf, sizeof(buf), "Done: preamp %i dB, attenuator %i dB, RF gain %i.%02i dB a step.", pre, att, rfg / 100, rfg % 100);
+#ifdef BOARD_X6200
+    /* The band by its name: the page follows the band, so "this band" would be another one after a band change, and
+     * a broadcast carrier next to a ham band sets the broadcast band's figure, not the ham band's. PRE and ATT as on
+     * the keys, for the line to hold "Broadcast 41m" */
+    BandInfoLoadResult band = BandsTable::get_by_id(smc_band);
+
+    snprintf(buf, sizeof(buf), "Done %s%s: PRE %i dB, ATT %i dB, RF gain %i.%02i dB a step.",
+             band.rc == SUCCESS ? "on " : "outside the bands", band.rc == SUCCESS ? band.value.name.c_str() : "",
+             pre, att, rfg / 100, rfg % 100);
+#else
+    snprintf(buf, sizeof(buf), "Done: preamp %i dB, attenuator %i dB, RF gain %i.%02i dB a step.", pre, att,
+             rfg / 100, rfg % 100);
+#endif
     smc_note_set(buf);
 }
 
@@ -3665,6 +3871,12 @@ static void smc_delete_cb(lv_event_t *e) {
     smc_stop(NULL);
 }
 
+/* Power off: the settings are saved right after (radio_poweroff), and the timer's own stop came too late for them,
+ * so the step's PRE, ATT or RF gain 40 stayed on at the next start. The front end goes back first */
+void settings_window_poweroff(void) {
+    if (smc_timer) smc_stop("Stopped: power off. Nothing changed.");
+}
+
 static uint8_t make_smeter_fe(uint8_t row) {
     int32_t rfg = cfg_sm.p_smeter_rfg.get();
 
@@ -3672,9 +3884,12 @@ static uint8_t make_smeter_fe(uint8_t row) {
     smc_sl[0] = param_slider(row_cell(row, 4, 3, SMALL_3), SMALL_3 - 134, &sm_pre_slider);
     lv_obj_add_event_cb(smc_sl[0], ptr_clear_cb, LV_EVENT_DELETE, &smc_sl[0]);
     row++;
-    wl_row_label(row, "Attenuator");
+    wl_row_label(row, "Attenuator" SM_ATT_WHERE);
     smc_sl[1] = param_slider(row_cell(row, 4, 3, SMALL_3), SMALL_3 - 134, &sm_att_slider);
     lv_obj_add_event_cb(smc_sl[1], ptr_clear_cb, LV_EVENT_DELETE, &smc_sl[1]);
+#ifdef BOARD_X6200
+    observers.emplace_back(sm_att.subscribe(sm_att_follow, smc_sl[1]));
+#endif
     row++;
     wl_row_label(row, "RF gain, a step");
     smc_sl[2] = row_slider(row_cell(row, 4, 3, SMALL_3), rfg / 5, 0, 40, SMALL_3 - 134, sm_rfg_cb, NULL,
@@ -3688,7 +3903,7 @@ static uint8_t make_smeter_fe(uint8_t row) {
     row++;
     smc_note = upd_line(row);
     lv_obj_add_event_cb(smc_note, smc_delete_cb, LV_EVENT_DELETE, NULL);
-    lv_label_set_text(smc_note, "Steady carrier in, S5 to S9+20. PRE, ATT and RF gain are tried, then put back.");
+    lv_label_set_text(smc_note, "Steady carrier in, " SMC_MIN_S " to S9+20. PRE, ATT and RF gain are tried, then put back.");
     row++;
     return row;
 }
@@ -3783,6 +3998,10 @@ static void make_txcal_page() {
     row = make_swr_protect(row);
     card_end(row);
 
+    row = card_begin("EXTERNAL TUNER");
+    row = make_ext_tune(row);
+    card_end(row);
+
     row = card_begin("S-METER");
     row = make_smeter_fe(row);
     card_end(row);
@@ -3810,8 +4029,7 @@ static void make_display_page() {
     card_end(row);
 
     row = card_begin("WATERFALL");
-    /* Centered: the VFO stays in the middle. Fixed: the span stays put, the VFO line moves */
-    row = make_param_choice(row, "Mode", " Centered \n Fixed ", cfg_sm.p_wf_mode);
+    row = make_wf_mode(row);
     row = make_auto_offset(row);
     row = make_grid_min_max(row);
     row = make_waterfall_line_zoom(row);
@@ -3835,6 +4053,9 @@ static void make_display_page() {
     row = make_param_choice(row, "Birdies", " Off \n Marks \n Marks + notch ", cfg_sm.p_birdie_marks);
     /* Off: one waterfall zoom and one tuning step for every mode, a mode change keeps them */
     row = make_param_switch(row, "Zoom and step per mode", cfg_sm.p_zoom_step_per_mode);
+    /* The box at the top right: the charge and the time left or to full, the voltages, the two in turn, or
+     * the charge and the supply's voltage */
+    row = make_param_choice(row, "Power display", " % + time \n Volts \n Alternate \n % + V ", cfg_sm.p_power_display);
     card_end(row);
 
     row = card_begin("INTERFACE");
@@ -4450,12 +4671,16 @@ static void make_bluetooth_page() {
     btaudio_run("status", bt_status_done, (void *)(intptr_t)wl_gen);
 }
 
+/* A row of text, as high as the Update rows: Version to Baseband in option rows left the Update
+ * line under the first control half cut at the page's bottom edge as the page opened with the
+ * taller buttons (62 px: DejaVu, VISION), and the knob does not scroll above the first control (#82) */
 static uint8_t info_row(uint8_t row, const char *label, const char *val) {
     wl_row_label(row, label);
     lv_obj_t *obj = lv_label_create(grid);
     lv_label_set_text(obj, val);
     lv_obj_set_style_text_color(obj, TC(text), 0);
     lv_obj_set_grid_cell(obj, LV_GRID_ALIGN_END, 1, 6, LV_GRID_ALIGN_CENTER, row, 1);
+    row_dsc[row] = INFO_ROW_H;
     return row + 1;
 }
 

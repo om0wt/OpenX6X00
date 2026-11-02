@@ -66,8 +66,17 @@ const char *hw_base_ver_str(void) {
     return "stub";
 }
 
+/* None: the X6100's ways. HOST_STUB_CW=x6200: the X6200's CW, its spectrum on the dial and the tone rising as the
+ * dial goes up in CW too (#115), to see its picture on a PC: the carrier keeps its place in the stream, 1 kHz off
+ * the dial in SSB, in every mode (the S-meter from the stream still takes the X6100's CW band) */
 uint32_t hw_caps(void) {
-    return 0;
+    static int cw = -1;
+
+    if (cw < 0) {
+        const char *e = getenv("HOST_STUB_CW");
+        cw = e && !strcmp(e, "x6200");
+    }
+    return cw ? HW_CAP_CW_SPECTRUM_ON_DIAL | HW_CAP_CW_TONE_RISES : 0;
 }
 
 /* ---- Settings ------------------------------------------------------------------------- */
@@ -179,6 +188,55 @@ static float gauss(void) {
     return r * cosf(2.0f * (float)M_PI * u2);
 }
 
+/* What PRE and ATT do to the stream: twice and half the level, or HOST_STUB_FE in dB ("16,52": a preamp of 16 dB
+ * and an attenuator of 52 dB, an X6200 on 80 m in #125), for the S-meter's corrections and their Measure */
+static float front_end_gain(bool pre, bool att) {
+    static float pre_gain = -1.0f, att_gain = 0.5f;
+
+    if (pre_gain < 0.0f) {
+        const char *e = getenv("HOST_STUB_FE");
+        float       p, a;
+
+        pre_gain = 2.0f;
+        if (e && sscanf(e, "%f,%f", &p, &a) == 2 && p >= 0.0f && p <= 60.0f && a >= 0.0f && a <= 80.0f) {
+            pre_gain = powf(10.0f, p / 20.0f);
+            att_gain = powf(10.0f, -a / 20.0f);
+        }
+    }
+    return (pre ? pre_gain : 1.0f) * (att ? att_gain : 1.0f);
+}
+
+/* HOST_STUB_CARRIERS=<Hz>: also a weaker carrier on every multiple of that many Hz, which keeps its frequency as
+ * the dial turns (the 1 kHz one goes along with the dial), to see Waterfall Mode Fixed on a PC (#10). The stream
+ * is drawn the other way up (the 1 kHz carrier shows 1 kHz below the dial in SSB): a carrier f above the centre
+ * goes in at -f. Four levels in turn, so they can be told apart. Up to 1 kHz from the stream's edges: one left out
+ * further in, the Fixed waterfall took it for gone there and kept nothing of it on the side tuned away from */
+static void add_band(float _Complex *s, int32_t center, float gain) {
+    const int64_t   reach = SAMPLE_RATE / 2 - 1000;
+    static int      step = -1;
+    static uint64_t n;          /* samples since the start: each carrier's phase goes on across the packets */
+
+    if (step < 0) {
+        const char *e = getenv("HOST_STUB_CARRIERS");
+        step = e && atoi(e) >= 1000 && atoi(e) <= 50000 ? atoi(e) : 0;
+    }
+    if (!step) {
+        return;
+    }
+    for (int64_t f = ((int64_t)center - reach) / step * step + step; f < (int64_t)center + reach; f += step) {
+        double         w   = -2.0 * M_PI * (double)(f - center) / SAMPLE_RATE;
+        float          amp = gain * TONE_AMP * (0.04f + 0.06f * (float)((f / step) % 4));
+        float _Complex ph  = amp * cexpf(I * (float)fmod(w * (double)n, 2.0 * M_PI));
+        float _Complex rot = cexpf(I * (float)w);
+
+        for (int i = 0; i < SAMPLES; i++) {
+            s[i] += ph;
+            ph *= rot;
+        }
+    }
+    n += SAMPLES;
+}
+
 bool hw_flow_read(hw_pack_t *p) {
     uint64_t now = now_ns();
     const uint64_t period = (uint64_t)SAMPLES * 1000000000ULL / SAMPLE_RATE;   /* 5.12 ms */
@@ -195,7 +253,7 @@ bool hw_flow_read(hw_pack_t *p) {
     }
 
     bool  tx   = hw_tx_keyed_by_gui();
-    float gain = (vfo[reg_i[HW_VFO_CUR] & 1].pre ? 2.0f : 1.0f) * (vfo[reg_i[HW_VFO_CUR] & 1].att ? 0.5f : 1.0f);
+    float gain = front_end_gain(vfo[reg_i[HW_VFO_CUR] & 1].pre, vfo[reg_i[HW_VFO_CUR] & 1].att);
     float step = 2.0f * (float)M_PI * TONE_HZ / SAMPLE_RATE;
 
     for (int i = 0; i < SAMPLES; i++) {
@@ -210,17 +268,45 @@ bool hw_flow_read(hw_pack_t *p) {
         }
         samples[i] = (gain * re) + (gain * im) * I;
     }
+    if (!tx) {
+        add_band(samples, vfo[reg_i[HW_VFO_CUR] & 1].freq, gain);
+    }
 
     memset(p, 0, sizeof(*p));
     p->samples    = samples;
     p->n_samples  = SAMPLES;
     p->tx         = tx;
+    /* The SWR it reads in TX: 1.1, or HOST_STUB_SWR (tenths: 34 is an antenna at 3.4 that a tuner still has to match) */
+    static int swr = -1;
+    if (swr < 0) {
+        const char *e = getenv("HOST_STUB_SWR");
+        swr = e && atoi(e) >= 10 && atoi(e) <= 255 ? atoi(e) : 11;
+    }
     p->tx_power   = tx ? (uint8_t)(reg_f[HW_TXPWR_F] * 10.0f + 0.5f) : 0;
-    p->vswr       = tx ? 11 : 0;
+    p->vswr       = tx ? (uint8_t)swr : 0;
     p->alc_level  = 0;
-    p->vext       = 0;
-    p->vbat       = 78;
-    p->batcap     = 80;
+    /* On battery: 7.8 V and the base's 80 %, or HOST_STUB_BAT ("82,0": 8.2 V with the base at 0 %, #49's
+     * full pack that its base never saw charged). A supply after them, and the charging flag: "79,66,138,1" a pack
+     * at 7.9 V and 66 % charging from 13.8 V, "79,66,138,0" the same with the charger off (#108) */
+    static int vbat = -1, batcap = 80, vext, charging;
+    if (vbat < 0) {
+        const char *e = getenv("HOST_STUB_BAT");
+        int         v, c, x = 0, g = 0;
+
+        vbat = 78;
+        if (e && sscanf(e, "%d,%d,%d,%d", &v, &c, &x, &g) >= 2 && v >= 0 && v <= 255 && c >= 0 && c <= 100 &&
+            x >= 0 && x <= 255) {
+            vbat = v;
+            batcap = c;
+            vext = x;
+            charging = x > 0 && g;
+        }
+    }
+    p->vext       = (uint8_t)vext;
+    p->vext_flag  = vext > 0;
+    p->charging   = charging;
+    p->vbat       = (uint8_t)vbat;
+    p->batcap     = (uint8_t)batcap;
     p->atu_params = (uint32_t)reg_i[HW_ATU_NETWORK];
     p->atu_status = reg_i[HW_ATU_TUNE] != 0;
     return true;

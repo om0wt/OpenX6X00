@@ -84,6 +84,14 @@ void radio_set_charger(bool on);
 
 void radio_start_atu();
 
+/* A TUNE for an external tuner (tune_tx.c) is on the air at w W for up to limit_ms: the TX power never above w
+ * meanwhile, whatever sets it, and the SWR protection off for the readings of the tune's own power within its time
+ * (tune_swr_limit). 0: over, the power back to the setting. Any thread */
+void radio_set_tune(float w, uint32_t limit_ms);
+/* The base's mode for a transmission on the VFO that transmits (tx_player's), without the setting; -1: both VFOs
+ * back to their own. Any thread */
+void radio_set_tx_mode(int mode);
+
 /* From RX only, where the radio may transmit (else false, "No TX on ..." said): the VFO that transmits to `from`,
  * then AM at 1 W at most */
 bool radio_start_swrscan(int32_t from);
@@ -99,6 +107,8 @@ void radio_set_modem(bool tx);
 bool radio_get_modem(void);   /* the TX audio from the GUI (apps, recordings), not the mic */
 /* How many times the SWR protection stopped a transmission since the start. Any thread */
 unsigned radio_swr_trips(void);
+/* When it last did, get_time() (CLOCK_MONOTONIC ms), 0 never; set before the count goes up. Any thread */
+uint64_t radio_swr_trip_at(void);
 /* true: the baseband sends our audio to the speaker, the path of voice prompts and the
  * recorder (meanwhile its audio to us is not the receiver); false: the mics again */
 void radio_speaker_play(bool speaker);
@@ -110,6 +120,10 @@ radio_base_ver_t radio_base_ver(void);
 const char *radio_base_ver_str(void);
 /* HW_CAP_* bits (radio_types.h): what the base does itself */
 uint32_t radio_caps(void);
+/* CW and CW-R as the base receives them: 1 when the tone rises as the dial goes up (CW-R; CW too with
+ * HW_CAP_CW_TONE_RISES, the X6200), -1 when it falls (CW on the X6100), 0 in the other modes. The tone is
+ * heard from an oscillator the key tone off the dial on that side: a station on the dial sounds at the key tone */
+int radio_cw_tone_dir(radio_mode_t mode);
 
 /* The board's switches on the base's pins */
 void radio_wifi_power(bool on);
@@ -120,6 +134,10 @@ void radio_set_line_in(uint8_t d);
 void radio_set_line_out(uint8_t d);
 
 void radio_set_morse_key(bool on);
+/* The GUI's CW key down for at most ms at a time, 0: no limit (QRSS3's TX time limit): past it the radio thread lets
+ * go of the key and counts it. Any thread */
+void radio_set_morse_key_limit(uint32_t ms);
+unsigned radio_morse_key_cuts(void);
 /* Break-in delay of the base, ms (cfg_qsk_time is the setting; the CW encoder holds TX longer) */
 void radio_set_qsk_time(uint16_t ms);
 /* The TX voice reaches the screen recording only through the monitor: at least 30 while recording */

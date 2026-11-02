@@ -43,6 +43,7 @@
 #include "front_keys.h"
 #include "backlight.h"
 #include "swr_guard.h"
+#include "tune_tx.h"
 #include "paddle_keyer.h"
 #include "cw_encoder.h"
 #include "dialog_msg_voice.h"
@@ -54,6 +55,7 @@
 #include "start_trace.h"
 #include "clock.h"
 #include "wifi.h"
+#include "settings_window.h"
 
 /*********************
  *      DEFINES
@@ -100,6 +102,8 @@ static void radio_unlock();
 
 static void on_vfo_freq_change(Subject *subj, void *user_data);
 static void on_transverter_change(Subject *subj, void *user_data);
+static void on_xvtr_pwr_change(Subject *subj, void *user_data);
+static void xvtr_settle_cb(void *arg);
 static void on_vfo_mode_change(Subject *subj, void *user_data);
 static void on_vfo_agc_change(Subject *subj, void *user_data);
 static void on_cw_agc_cond_change(Subject *subj, void *user_data);
@@ -118,12 +122,16 @@ static void on_fw_zoom_change(Subject *subj, void *user_data);
 static void on_change_i(Subject *subj, void *user_data);
 static void on_change_f(Subject *subj, void *user_data);
 static void on_pwr_change(Subject *subj, void *user_data);
+static void on_train_hold_change(Subject *subj, void *user_data);
 static void on_volume_change(Subject *subj, void *user_data);
 
 #ifndef BOARD_X6200
 static void recover_processing_audio_inputs();
 #endif
 static bool tx_refused(void);
+#ifdef BOARD_PWR_MAX_BAT
+static void tune_cap_top(float top);
+#endif
 static bool radio_tick();
 static void * radio_thread(void *arg);
 
@@ -162,6 +170,7 @@ static void supply_cb(void *arg) {
         cfg_pwr_max_set(BOARD_PWR_MAX);
     } else {
         cfg_pwr_max_set(BOARD_PWR_MAX_BAT);
+        tune_cap_top(BOARD_PWR_MAX_BAT);
         if (param_f_get(cfg_pwr) > BOARD_PWR_MAX_BAT) {
             cfg_pwr_set(BOARD_PWR_MAX_BAT);
             msg_schedule_text_fmt("TX power %0.0f W on battery", BOARD_PWR_MAX_BAT);
@@ -206,6 +215,19 @@ static bool             mute = false;
 static bool             tci_mute = false;   /* a TCI client transmits: the speaker and the monitor off */
 static bool             rec_moni = false;   /* a screen recording takes the TX audio: the monitor at 30 at least (X6100) */
 static bool             digi_cap;       /* a digital app is open: never above its cap */
+static float            tune_cap;       /* a TUNE for an external tuner: never above its power (under the lock) */
+/* A transverter's TX power limit where the radio is tuned (#104): never above it, 0 none; -1 until first looked at
+ * (on_xvtr_pwr_change). Under the lock, as txpwr_asked: the last power asked of set_txpwr, before its caps */
+static float            xvtr_cap = -1.0f;
+static float            txpwr_asked;
+/* KEY Train in CW or CW-R (#127): the power at the base held at 0 W, whatever keys the radio. In Train the base's keyer
+ * sounds only the sidetone with Auto-L and Auto-R (the X6200's base 1.0.8 goes into TX at 0.0 W), but in Manual its
+ * KEY jack keyed the X6200 at PWR, Train or not. Written under the lock (on_train_hold_change), read by the radio
+ * thread too; train_said: its note on the screen, once while it holds (train_note) */
+static atomic_bool      train_hold;
+static atomic_bool      train_said;
+static pthread_mutex_t  tune_mux = PTHREAD_MUTEX_INITIALIZER;
+static tune_guard_t     tune_guard;     /* that tune, for the SWR protection (under tune_mux) */
 
 static tx_watch_t       tx_watch;
 static bool             resync_due;     /* resend the whole register block (base_guard.h) */
@@ -213,14 +235,29 @@ static uint64_t         resync_time;
 static uint64_t         block_time;     /* the whole register block last sent (resend_all), radio thread only */
 static volatile bool    morse_on;
 static volatile uint32_t morse_ms;      /* the GUI's CW key last changed */
+static atomic_uint      morse_down_ms;  /* when the GUI's CW key went down (get_time, never 0), 0: up */
+static atomic_uint      morse_limit_ms; /* radio_set_morse_key_limit, 0 none */
+static atomic_uint      morse_cuts;
 static uint64_t         atu_time;       /* the tune asked, then the base last seen in TX for it */
 
 static void power_key_cb(void *arg) {
     keypad_power_set(*(bool *)arg);
 }
 
+/* The SWR scan's carrier: 1 W is enough to read the SWR. Held here for as long as the scan runs: PWR set meanwhile
+ * (TCI's drive, the Panel's PWR, the X6200's battery cap) came through on_pwr_change, and the sweep went on at PWR */
+#define SWRSCAN_PWR_W   1.0f
+
 static void set_txpwr(float w) {
-    hw_set_f(HW_TXPWR_F, digi_cap && w > TX_PLAYER_MAX_PWR_W ? TX_PLAYER_MAX_PWR_W : w);
+    txpwr_asked = w;
+    if (atomic_load(&state) == RADIO_SWRSCAN && w > SWRSCAN_PWR_W) w = SWRSCAN_PWR_W;
+    /* An app open: its cap, but not over a TUNE's own power (#87), which holds the power to it instead */
+    if (digi_cap && tune_cap <= 0.0f && w > TX_PLAYER_MAX_PWR_W) w = TX_PLAYER_MAX_PWR_W;
+    if (tune_cap > 0.0f && w > tune_cap) w = tune_cap;     /* PWR turned up, the battery's top, a restore */
+    if (xvtr_cap > 0.0f && w > xvtr_cap) w = xvtr_cap;     /* whoever asks: PWR, an app's own, TUNE's, TCI, CAT */
+    /* A TUNE keeps its own power: the base is in USB-D for it, and the user asked for that carrier */
+    if (atomic_load(&train_hold) && tune_cap <= 0.0f) w = 0.0f;
+    hw_set_f(HW_TXPWR_F, w);
 }
 
 /* Whether the base's charging flag counts: on the X6200 only when charging was asked for, as its base (1.0.8)
@@ -275,6 +312,7 @@ void radio_start() {
 
     hw_start();
     base_ver = hw_base_ver();
+    cfg_hw_caps_set(hw_caps());     /* the LO offset from them, before the first frame */
     start_trace("base: version %s", hw_base_ver_str());
     /* What the digital TX level comes from, for a report of an app at 0 W (#16); the base version was nowhere */
     fprintf(stderr, "radio: base %s, line_in %u, line_out %u, play %.1f dB, rec %.1f dB, digital level %.1f dB\n",
@@ -290,6 +328,19 @@ void radio_start() {
     subject_subscribe((Subject*)cfg_transverter_1_from, on_transverter_change, NULL);
     subject_subscribe((Subject*)cfg_transverter_1_to, on_transverter_change, NULL);
     subject_subscribe((Subject*)cfg_transverter_1_shift, on_transverter_change, NULL);
+
+    /* A transverter's TX power limit (#104) follows where the radio listens and transmits and the transverters'
+     * settings; looked at once now, before PWR goes to the base below */
+    Subject *xvtr_by[] = {
+        (Subject*)cfg_fg_freq, (Subject*)cfg_bg_freq, (Subject*)cfg_band_split, (Subject*)cfg_band_tx_shift,
+        (Subject*)cfg_transverter_0_from, (Subject*)cfg_transverter_0_to, (Subject*)cfg_transverter_0_shift,
+        (Subject*)cfg_transverter_0_pwr, (Subject*)cfg_transverter_1_from, (Subject*)cfg_transverter_1_to,
+        (Subject*)cfg_transverter_1_shift, (Subject*)cfg_transverter_1_pwr,
+    };
+    for (size_t i = 0; i < sizeof(xvtr_by) / sizeof(xvtr_by[0]); i++) {
+        subject_subscribe(xvtr_by[i], on_xvtr_pwr_change, NULL);
+    }
+    on_xvtr_pwr_change(NULL, NULL);
 
     subject_subscribe_and_notify((Subject*)cfg_band_vfoa_mode, on_vfo_mode_change, (void*)RADIO_VFO_A);
     subject_subscribe_and_notify((Subject*)cfg_band_vfob_mode, on_vfo_mode_change, (void*)RADIO_VFO_B);
@@ -371,6 +422,17 @@ void radio_start() {
     subject_subscribe_and_notify((Subject*)cfg_key_ratio, on_change_f, (void*)HW_KEY_RATIO_F);
     subject_subscribe_and_notify((Subject*)cfg_cw_peak_on, on_change_i, (void*)HW_CW_PEAK);
     subject_subscribe_and_notify((Subject*)cfg_cw_peak_q, on_change_i, (void*)HW_CW_PEAK_Q);
+
+    /* KEY Train holds the power at 0 W in CW and CW-R (set_txpwr): looked at again when Train, a VFO's mode, the VFO
+     * in use or split changes (a band key, a memory, CAT and TCI change the mode through them) */
+    Subject *train_by[] = {
+        (Subject*)cfg_key_train, (Subject*)cfg_band_vfoa_mode, (Subject*)cfg_band_vfob_mode,
+        (Subject*)cfg_band_current_vfo, (Subject*)cfg_band_split,
+    };
+    for (size_t i = 0; i < sizeof(train_by) / sizeof(train_by[0]); i++) {
+        subject_subscribe(train_by[i], on_train_hold_change, NULL);
+    }
+    on_train_hold_change(NULL, NULL);
 
     subject_subscribe_and_notify((Subject*)cfg_agc_hang, on_change_i, (void*)HW_AGC_HANG);
     subject_subscribe_and_notify((Subject*)cfg_agc_knee, on_change_i, (void*)HW_AGC_KNEE);
@@ -477,6 +539,7 @@ void radio_set_tx_freq(int32_t freq) {
         on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
         on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
         if (atomic_exchange(&split_held, false)) {
+            on_train_hold_change(NULL, NULL);   /* the other VFO transmits again: its CW held, before the bit */
             WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, param_i_get(cfg_band_split)));
         }
         return;
@@ -487,6 +550,7 @@ void radio_set_tx_freq(int32_t freq) {
     }
     if (param_i_get(cfg_band_split) && !atomic_exchange(&split_held, true)) {
         WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, false));
+        on_train_hold_change(NULL, NULL);   /* this VFO transmits now: the other one's CW holds nothing */
     }
     WITH_RADIO_LOCK(hw_vfo_set_freq(vfo, freq - cfg_transverter_shift_for(freq)));
 }
@@ -564,11 +628,42 @@ bool radio_change_spmode(int16_t df) {
 }
 
 void radio_start_atu() {
+    float xvtr;
+
     if (tx_refused()) {
+        return;
+    }
+    /* The tuner's carrier is the base's own, at a power the GUI does not set: not into a transverter with a TX power
+     * limit (#104). What it would tune there is the IF into the transverter. Short: the box scrolls a longer line */
+    WITH_RADIO_LOCK(xvtr = xvtr_cap);
+    if (xvtr > 0.0f) {
+        msg_schedule_text_fmt("No tuner: %.1f W transverter", xvtr);
         return;
     }
     state_move(RADIO_RX, RADIO_ATU_START);
 }
+
+/* The X6200's base (1.0.8) transmits in its scan mode but reports SWR 1.0 there, the stock firmware's scan too;
+ * a plain carrier reads it. Keyed as the digital modes are (not radio_set_modem: no app is on air), so the mics
+ * stay out, their gain 0 still lets a voice through; nothing plays to the base meanwhile. In FM: an AM carrier
+ * at 1 W is ~0.2 W, too little for the bridge */
+#ifdef BOARD_X6200
+#define SWRSCAN_TX      HW_MODEM
+#define SWRSCAN_MODE    radio_mode_nfm
+#define SWRSCAN_MIN_MS  1200    /* from a move: the power comes up in about that */
+#define SWRSCAN_FLAT_MS 300     /* without the power going up: it is up */
+#define SWRSCAN_WAIT_MS 3000    /* a power that never settles is read anyway */
+
+/* In ms, not packets: the X6200's come every ~35 ms (hw_x6200.c). The radio thread's own (radio_tick), but for
+ * swrscan_fresh, which radio_start_swrscan sets for it */
+static atomic_bool swrscan_fresh;       /* a new scan: the wait starts afresh */
+static uint8_t     swrscan_peak;        /* the power's top since the move */
+static uint64_t    swrscan_move_ms;     /* the move, or the key */
+static uint64_t    swrscan_up_ms;       /* the power last went up */
+#else
+#define SWRSCAN_TX      HW_SWRSCAN
+#define SWRSCAN_MODE    radio_mode_am
+#endif
 
 /* Nothing moves before the scan is known to start: the VFO that transmits goes to `from` only then */
 bool radio_start_swrscan(int32_t from) {
@@ -577,12 +672,15 @@ bool radio_start_swrscan(int32_t from) {
     }
 
     radio_set_tx_freq(from);
-    cparam_i_set(cfg_cur_mode, radio_mode_am);
+    cparam_i_set(cfg_cur_mode, SWRSCAN_MODE);
     radio_lock();
-    /* 1 W is enough to read the SWR; less if PWR is set lower.
+    /* 1 W, held there by set_txpwr (SWRSCAN_PWR_W); less if PWR is set lower, or a transverter's limit.
      * ponytail: fixed 1 W cap, make it a setting if the bridge reads poorly that low */
-    hw_set_f(HW_TXPWR_F, LV_MIN(param_f_get(cfg_pwr), 1.0f));
-    hw_set_i(HW_SWRSCAN, true);
+    set_txpwr(param_f_get(cfg_pwr));
+#ifdef BOARD_X6200
+    atomic_store(&swrscan_fresh, true);
+#endif
+    hw_set_i(SWRSCAN_TX, true);
     radio_unlock();
 
     return true;
@@ -591,7 +689,7 @@ bool radio_start_swrscan(int32_t from) {
 void radio_stop_swrscan() {
     if (state_move(RADIO_SWRSCAN, RADIO_RX)) {
         radio_lock();
-        hw_set_i(HW_SWRSCAN, false);
+        hw_set_i(SWRSCAN_TX, false);
         set_txpwr(param_f_get(cfg_pwr));
         radio_unlock();
     }
@@ -608,6 +706,42 @@ void radio_set_digi_cap(bool on) {
 
 bool radio_digi_cap(void) {
     return digi_cap;
+}
+
+void radio_set_tune(float w, uint32_t limit_ms) {
+    pthread_mutex_lock(&tune_mux);
+    tune_guard = (tune_guard_t){.pwr_w = w, .start_ms = get_time(), .limit_ms = limit_ms};
+    pthread_mutex_unlock(&tune_mux);
+    radio_lock();
+    tune_cap = w;
+    set_txpwr(param_f_get(cfg_pwr));    /* tx_player sets the tune's own: this is the cap, and the setting after */
+    radio_unlock();
+}
+
+#ifdef BOARD_PWR_MAX_BAT
+/* The radio went onto its battery, its top down to `top`: a tune on the air above that is held to it now. The tune's
+ * own power (up to 8 W on external power, #87) went to the base as it keyed, and with PWR at the battery's top or
+ * under it nothing set the power again: the tune went on at 8 W on the battery, up to its 30 s */
+static void tune_cap_top(float top) {
+    radio_lock();
+    if (tune_cap > top) {
+        tune_cap = top;
+        set_txpwr(txpwr_asked);
+    }
+    radio_unlock();
+}
+#endif
+
+/* The VFO that transmits is the active one: tx_player moves it to the TX frequency, split held off (radio_set_tx_freq) */
+void radio_set_tx_mode(int mode) {
+    radio_lock();
+    if (mode < 0) {
+        hw_vfo_set_mode(RADIO_VFO_A, param_i_get(cfg_band_vfoa_mode));
+        hw_vfo_set_mode(RADIO_VFO_B, param_i_get(cfg_band_vfob_mode));
+    } else {
+        hw_vfo_set_mode(param_i_get(cfg_band_current_vfo), mode);
+    }
+    radio_unlock();
 }
 
 void radio_set_tx_filter(uint16_t from_hz, uint16_t to_hz) {
@@ -657,6 +791,7 @@ static void save_log(void) {
 void radio_poweroff() {
     save_log();
     screen_rec_shutdown();
+    settings_window_poweroff();     /* a Measure under way: PRE, ATT and the RF gain back before they are saved */
     if (params.charger.x == RADIO_CHARGER_SHADOW) {
         WITH_RADIO_LOCK(hw_set_i(HW_CHARGER, true));
     }
@@ -780,6 +915,13 @@ uint32_t radio_caps(void) {
     return hw_caps();
 }
 
+int radio_cw_tone_dir(radio_mode_t mode) {
+    if (mode == radio_mode_cwr || (mode == radio_mode_cw && (radio_caps() & HW_CAP_CW_TONE_RISES))) {
+        return 1;
+    }
+    return mode == radio_mode_cw ? -1 : 0;
+}
+
 const char *radio_base_ver_str(void) {
     return hw_base_ver_str();
 }
@@ -824,6 +966,28 @@ void radio_set_morse_key(bool on) {
     morse_on = on;
     morse_ms = get_time();
     hw_pin_set(HW_PIN_MORSE_KEY, on);
+    atomic_store(&morse_down_ms, on ? morse_ms | 1 : 0);
+}
+
+void radio_set_morse_key_limit(uint32_t ms) {
+    atomic_store(&morse_limit_ms, ms);
+}
+
+unsigned radio_morse_key_cuts(void) {
+    return atomic_load(&morse_cuts);
+}
+
+/* The TX time limit of a key-down (QRSS3's, cw_encoder.c): the GUI's key down past it is let go here, on the radio
+ * thread, whatever holds it; the keyer sees the count move and stops */
+static void morse_limit_check(void) {
+    uint32_t limit = atomic_load(&morse_limit_ms);
+    uint32_t down  = atomic_load(&morse_down_ms);
+
+    if (key_limit_over((uint32_t)now_time, down, limit)) {
+        radio_set_morse_key(false);
+        atomic_fetch_add(&morse_cuts, 1);
+        fprintf(stderr, "radio: the CW key down over %u ms, let go\n", (unsigned)limit);
+    }
 }
 
 /**********************
@@ -854,6 +1018,71 @@ static void on_pwr_change(Subject *subj, void *user_data) {
     WITH_RADIO_LOCK(set_txpwr(subject_f_get((SubjectFloat*)subj)));
 }
 
+static bool is_cw_mode(int32_t mode) {
+    return mode == radio_mode_cw || mode == radio_mode_cwr;
+}
+
+/* KEY Train on, and the VFO in use in CW or CW-R, or in split the other one, which transmits: the power at the base
+ * held at 0 W (set_txpwr, #127), in every key mode. Out of CW the power comes back as asked: the apps and the voice
+ * modes are not the keyer's, and a digital app's TX level would climb at 0 W. While the base's split bit is held off
+ * (radio_set_tx_freq: an app, TCI's audio, a voice message, the SWR scan) the VFO in use transmits, in its own mode:
+ * the other one's CW held an FT8 slot at 0 W. Under the lock: radio_set_tx_freq calls it from the apps' threads */
+static void on_train_hold_change(Subject *subj, void *user_data) {
+    (void)subj;
+    (void)user_data;
+    radio_lock();
+
+    bool    a     = param_i_get(cfg_band_current_vfo) == RADIO_VFO_A;
+    int32_t mode  = param_i_get(a ? cfg_band_vfoa_mode : cfg_band_vfob_mode);
+    int32_t other = param_i_get(a ? cfg_band_vfob_mode : cfg_band_vfoa_mode);
+    bool    split = param_i_get(cfg_band_split) && !atomic_load(&split_held);
+    bool    hold  = param_i_get(cfg_key_train) && (is_cw_mode(mode) || (split && is_cw_mode(other)));
+
+    if (hold != atomic_load(&train_hold)) {
+        atomic_store(&train_hold, hold);
+        if (hold) {
+            atomic_store(&train_said, false);
+        }
+        set_txpwr(txpwr_asked);
+    }
+    radio_unlock();
+}
+
+/* The base went into TX while KEY Train holds the power: the screen says why nothing goes out, once while it holds.
+ * Not in the CW trainer, which is Train's own, nor for a TUNE, which keeps its power. Radio thread */
+static void train_note(void) {
+    bool tuning;
+
+    if (!atomic_load(&train_hold) || cw_trainer_on()) {
+        return;
+    }
+    pthread_mutex_lock(&tune_mux);
+    tuning = tune_guard.pwr_w > 0.0f;
+    pthread_mutex_unlock(&tune_mux);
+    if (!tuning && !atomic_exchange(&train_said, true)) {
+        msg_schedule_text_fmt("KEY Train: sidetone only, 0 W");
+    }
+}
+
+/* Under the lock, before a VFO of the base goes to freq: a transverter's TX power limit there, lower than the one in
+ * force, goes to the base first (#104). A band key, a memory, a spot or CAT moves the VFOs before the dial's frequency
+ * is notified (on_xvtr_pwr_change), and with PTT held the base sent PWR on the transverter's IF meanwhile. The VFO in
+ * use counts, and in split the other one; the limit where the radio is tuned is looked at again after the round
+ * (xvtr_settle_cb). True: held here */
+static bool xvtr_hold(radio_vfo_t vfo, int32_t freq) {
+    float w = cfg_transverter_pwr_for(freq);
+
+    if (xvtr_cap < 0.0f || (vfo != param_i_get(cfg_band_current_vfo) && !param_i_get(cfg_band_split))) {
+        return false;   /* not looked at yet (radio_start), or the other VFO out of split */
+    }
+    if (w <= 0.0f || (xvtr_cap > 0.0f && w >= xvtr_cap)) {
+        return false;
+    }
+    xvtr_cap = w;
+    set_txpwr(txpwr_asked);
+    return true;
+}
+
 static void on_vfo_freq_change(Subject *subj, void *user_data) {
     radio_vfo_t vfo = (radio_vfo_t )user_data;
     int32_t new_val;
@@ -865,8 +1094,12 @@ static void on_vfo_freq_change(Subject *subj, void *user_data) {
     int32_t shift = cfg_transverter_shift_for(new_val);
     shift += param_i_get(cfg_band_if_shift);
     radio_lock();
+    bool held = xvtr_hold(vfo, new_val);
     bool changed = hw_vfo_set_freq(vfo, new_val - shift);
     radio_unlock();
+    if (held && !scheduler_put_coalesced(xvtr_settle_cb)) {
+        LV_LOG_ERROR("Radio: the transverter's TX power limit not looked at again (the next change does)");
+    }
     if (changed) {
         LV_LOG_USER("Radio set vfo %i freq=%i (%i)", vfo, new_val, new_val - shift);
     }
@@ -878,6 +1111,88 @@ static void on_vfo_freq_change(Subject *subj, void *user_data) {
 static void on_transverter_change(Subject *subj, void *user_data) {
     on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
     on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
+}
+
+/* A transverter's TX power limit came or went (#104), on the LVGL thread: PWR and its top follow it, and the screen
+ * says so, as for the X6200's battery. In place of what it said last, not queued after it: the limit stepped in
+ * Settings on its band would stack a message for each step */
+typedef struct {
+    float   w;          /* the limit, 0 none */
+    int32_t freq;       /* where it comes from: the dial, or the frequency the radio transmits on */
+    bool    on;         /* tuned through a transverter, one without a limit too: the PWR from before only off it */
+} xvtr_pwr_t;
+
+static void xvtr_pwr_cb(void *arg) {
+    xvtr_pwr_t *x = arg;
+    char        name[24];
+
+    switch (cfg_pwr_xvtr_set(x->w, x->on)) {
+        case PWR_XVTR_HELD:
+            cfg_transverter_name(x->freq, name, sizeof(name));
+            msg_update_text_fmt("TX power %.1f W: transverter %s", param_f_get(cfg_pwr), name);
+            break;
+        case PWR_XVTR_RESTORED:
+            msg_update_text_fmt("TX power back to %.1f W", param_f_get(cfg_pwr));
+            break;
+        default:
+            break;
+    }
+}
+
+/* The limit for where the radio is tuned: the dial's transverter, or the one it transmits through (split's other VFO,
+ * a TX shift), the lower where both have one. The base goes to it at once, whatever asked for the power last (an app's
+ * own, a TUNE's); PWR and the screen after it (xvtr_pwr_cb). The first look (radio_start, no subject) always goes
+ * there, a PWR a transverter took down before a restart comes back if the radio starts off it; the base gets PWR
+ * right after it, held to the limit. Off a limit onto a transverter without one (Off in Settings, 70 cm with none
+ * after 2 m), the PWR from before waits until the radio is off the transverters too.
+ * A lower limit goes to the base at once; one higher or none, and the PWR from before, after the round of
+ * notifications (xvtr_settle_cb), once the base has left the band: the VFOs, the split bit and the VFO in use move
+ * the base in no set order with this, and with PTT held through a band key the base sent 10 W on the IF meanwhile */
+typedef enum {
+    XVTR_FIRST,         /* radio_start */
+    XVTR_NOTIFIED,      /* where the radio is tuned or a transverter's setting changed */
+    XVTR_SETTLED,       /* after that round */
+} xvtr_look_t;
+
+static void xvtr_pwr_look(xvtr_look_t how) {
+    static xvtr_pwr_t said = {-1.0f, 0, false};     /* passed on to PWR last: -1 nothing yet */
+    int32_t           rx   = cparam_i_get(cfg_fg_freq), tx = radio_tx_freq();
+    xvtr_pwr_t        x    = {cfg_transverter_pwr_cap(rx, tx), 0,
+                              cfg_transverter_shift_for(rx) != 0 || cfg_transverter_shift_for(tx) != 0};
+    float             cap;
+
+    x.freq = cfg_transverter_pwr_for(rx) == x.w ? rx : tx;
+    WITH_RADIO_LOCK(cap = xvtr_cap);
+    if (how == XVTR_NOTIFIED && !(x.w > 0.0f && (cap <= 0.0f || x.w < cap)) && (x.w != cap || x.on != said.on) &&
+        scheduler_put_coalesced(xvtr_settle_cb)) {
+        return;
+    }
+    radio_lock();
+    if (x.w != xvtr_cap) {
+        xvtr_cap = x.w;
+        if (how != XVTR_FIRST) set_txpwr(txpwr_asked);
+    }
+    radio_unlock();
+    if (x.w == said.w && x.on == said.on) {
+        return;
+    }
+    said = x;
+    if (x.w > 0.0f) {
+        LV_LOG_USER("Radio TX power at most %.1f W: a transverter at %i", x.w, x.freq);
+    }
+    if (scheduler_on_gui_thread()) {
+        xvtr_pwr_cb(&x);
+    } else if (!scheduler_put_urgent(xvtr_pwr_cb, &x, sizeof(x))) {
+        LV_LOG_ERROR("Radio: the transverter's TX power limit not passed on to PWR (the base holds it)");
+    }
+}
+
+static void xvtr_settle_cb(void *arg) {
+    xvtr_pwr_look(XVTR_SETTLED);
+}
+
+static void on_xvtr_pwr_change(Subject *subj, void *user_data) {
+    xvtr_pwr_look(subj ? XVTR_NOTIFIED : XVTR_FIRST);
 }
 
 static void on_vfo_mode_change(Subject *subj, void *user_data) {
@@ -1269,12 +1584,14 @@ static void battery_startup_log(const bat_watch_t *w, const hw_pack_t *p) {
 
 static swr_guard_t swr_guard;
 static atomic_uint swr_trips;
+static atomic_ullong swr_trip_at;       /* the last one, get_time(); 0 none */
 static atomic_bool swr_trip_queued;     /* a trip's job waits in the queue: one stops TX, more add nothing */
 
 /* SWR protection, on the GUI thread: what the GUI keys lets go (a PTT held on the radio or the
  * mic, VOX and the radio's own keyer are the base's: they may key again) */
 static void swr_trip_cb(void *arg) {
     atomic_store(&swr_trip_queued, false);  /* out of the queue: a trip from now on is posted again */
+    atomic_store(&swr_trip_at, get_time()); /* before the count: whoever sees the trip can tell when */
     atomic_fetch_add(&swr_trips, 1);    /* before the modem bit drops: whoever sees it gone can tell why */
     cw_encoder_stop();
     paddle_keyer_stop();
@@ -1291,6 +1608,10 @@ int radio_get_battery() {
 
 unsigned radio_swr_trips(void) {
     return atomic_load(&swr_trips);
+}
+
+uint64_t radio_swr_trip_at(void) {
+    return atomic_load(&swr_trip_at);
 }
 
 /* The base never keyed for the tuner, or ended a tune without its done flag (no match: more likely on 10 and 15 m
@@ -1356,8 +1677,27 @@ static bool radio_tick() {
              * full and the battery log (charge_flag_counts: the X6100's as its base gives it) */
             pack->charging = pack->charging && charge_flag_counts();
             clock_update_no_battery(pack->bat_missing);
+
+            /* The % sags under the TX current and comes back slowly: the last RX reading holds
+             * while transmitting and for 30 s after (also in the top bar, clock.c). Before the top bar
+             * and the battery log take it: they took the % of the reading before, and at the first
+             * reading on battery that was none, so the base's went in. On #49's radio (the base at 0 %
+             * with a full pack) that gave "Battery 0%: connect power" at each power-on and a time left
+             * from 0h00, climbing back over the first ten minutes */
+            static uint64_t hold_until;
+            static int8_t   held_cap = -1;
+            int8_t          cap = bat_watch.counts && !bat_watch.ext ? pack->batcap : -1;
+
+            if (radio_get_state() == RADIO_TX) hold_until = now_time + 30000;
+            if (now_time < hold_until && held_cap >= 0 && cap >= 0) {
+                cap = held_cap;
+            } else {
+                if (cap >= 0) cap = bat_watch_cap(&bat_watch, pack->vbat, pack->batcap);   /* on receive only */
+                held_cap = cap;
+            }
+            bat_pct = cap;   /* the % on the screen (clock.c) */
             if (bat_watch.counts) {
-                clock_update_power(pack->vext * 0.1f, pack->vbat * 0.1f, pack->batcap, pack->charging);
+                clock_update_power(pack->vext * 0.1f, pack->vbat * 0.1f, cap >= 0 ? cap : pack->batcap, pack->charging);
                 battery_log(pack);
             }
 
@@ -1377,23 +1717,6 @@ static bool radio_tick() {
                 told      = due ? w : told | w;
                 told_time = now_time;
             }
-
-            /* The % sags under the TX current and comes back slowly: the last RX reading holds
-             * while transmitting and for 30 s after (also in the top bar, clock.c) */
-            static uint64_t hold_until;
-            static int8_t   held_cap = -1;
-            int8_t          cap = bat_watch.counts && !bat_watch.ext ? pack->batcap : -1;
-
-            if (radio_get_state() == RADIO_TX) hold_until = now_time + 30000;
-            if (now_time < hold_until && held_cap >= 0 && cap >= 0) {
-                cap = held_cap;
-            } else {
-                if (cap >= 0) cap = bat_watch_cap(&bat_watch, pack->vbat, pack->batcap);   /* on receive only */
-                held_cap = cap;
-            }
-            bat_pct = cap;   /* the % on the screen (clock.c) */
-            if (cap >= 0 && cap != pack->batcap)
-                clock_update_power(pack->vext * 0.1f, pack->vbat * 0.1f, cap, pack->charging);
 
             /* low_power: what the GUI was told (the note above radio_tick) */
             if (bat_watch.low != low_power) {
@@ -1450,6 +1773,7 @@ static bool radio_tick() {
                     if (notify_rx_tx) {
                         notify_rx_tx(true);
                     }
+                    train_note();
                 }
                 break;
 
@@ -1465,8 +1789,15 @@ static bool radio_tick() {
                     /* A stop: the urgent reserve. Dropped even so, swr_guard trips again 300 ms on. One in the
                      * queue at a time: with the GUI thread stalled and TX still on, a trip every ~320 ms took
                      * the reserve in 25 s from those that do not try again (TCI's unkey, FT8's last post).
-                     * Marked before the put, the job may run before the put returns */
-                    if (swr_guard_check(&swr_guard, pack->tx_power * 0.1f, swr, param_i_get(cfg_swr_protect) * 0.1f, now_time) &&
+                     * Marked before the put, the job may run before the put returns. A TUNE for an external
+                     * tuner shows a high SWR on purpose while the tuner matches: none for the readings of its
+                     * own power within its time (tune_swr_limit), as for the ATU's (#84) */
+                    float limit = param_i_get(cfg_swr_protect) * 0.1f;
+
+                    pthread_mutex_lock(&tune_mux);
+                    limit = tune_swr_limit(&tune_guard, pack->tx_power * 0.1f, limit, now_time);
+                    pthread_mutex_unlock(&tune_mux);
+                    if (swr_guard_check(&swr_guard, pack->tx_power * 0.1f, swr, limit, now_time) &&
                         !atomic_exchange(&swr_trip_queued, true) && !scheduler_put_urgent(swr_trip_cb, &swr, sizeof(swr))) {
                         atomic_store(&swr_trip_queued, false);
                     }
@@ -1520,6 +1851,27 @@ static bool radio_tick() {
                 break;
 
             case RADIO_SWRSCAN:
+#ifdef BOARD_X6200
+                /* Not keyed yet, or the power still coming up: it starts from 0 at each move and comes up
+                 * in 0.1 W steps over ~1 s, and the SWR reads low meanwhile (1.0-1.1 at 0.2 W where 0.8 W reads
+                 * 1.5). Where it settles depends on the SWR (0.8 W at 1.5, 0.6 W at 3.4): read once the move is
+                 * SWRSCAN_MIN_MS old and the power has not gone up for SWRSCAN_FLAT_MS */
+                if (atomic_exchange(&swrscan_fresh, false) || !pack->tx) {
+                    swrscan_peak    = 0;        /* a new scan, or not keyed (yet): the wait counts from the key */
+                    swrscan_move_ms = swrscan_up_ms = now_time;
+                }
+                if (!pack->tx)
+                    break;
+                if (pack->tx_power > swrscan_peak || pack->tx_power + 1 < swrscan_peak) {
+                    swrscan_peak  = pack->tx_power;     /* going up, or a new ramp */
+                    swrscan_up_ms = now_time;
+                }
+                if ((now_time - swrscan_move_ms < SWRSCAN_MIN_MS || now_time - swrscan_up_ms < SWRSCAN_FLAT_MS) &&
+                    now_time - swrscan_move_ms < SWRSCAN_WAIT_MS)
+                    break;
+                swrscan_peak    = 0;            /* read: dialog_swrscan_update moves to the next point */
+                swrscan_move_ms = swrscan_up_ms = now_time;
+#endif
                 dialog_swrscan_update(pack->vswr * 0.1f);
                 break;
 
@@ -1544,7 +1896,7 @@ static bool radio_tick() {
 
         switch (tx_watch_power(&tx_watch, now_time, pack->tx)) {
             case TX_WATCH_CUT:
-                WITH_RADIO_LOCK(hw_set_f(HW_TXPWR_F, 0.0f));
+                WITH_RADIO_LOCK(set_txpwr(0.0f));   /* 0 W also if a transverter's limit changes meanwhile */
                 base_guard_log("base still in TX %u ms after PTT off and a write error: TX power set to 0 (vext %.1f V, vbat %.1f V)",
                                TX_WATCH_CUT_MS, pack->vext * 0.1f, pack->vbat * 0.1f);
                 break;
@@ -1623,6 +1975,7 @@ static void * radio_thread(void *arg) {
         now_time = get_time();
 
         guard_events();
+        morse_limit_check();
 
         if (radio_tick()) {
             usleep(2000);

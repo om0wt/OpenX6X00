@@ -36,7 +36,12 @@
  *  key is a lease: "key PTT 1 HOLD" presses it, HOLD the page's number for the press, and the
  *  page repeats it every second; the radio unkeys without it for three seconds, and after three
  *  minutes whatever happens (R4). A hold that ended stays ended: only a new number keys again
- *  (audit C02). "tx 0|1" goes to every client when the radio's TX state changes.
+ *  (audit C02). "tx 0|1" goes to every client when the radio's TX state changes. TUNE for an external
+ *  tuner (ext_tune.h, #85) is a lease the same way: "tune 1 HOLD" starts it and the page repeats it every
+ *  second while the tune is on, "tune 0" stops it (another's tune too, with operate and control); without a
+ *  renewal for three seconds, or when the page's connection goes, the radio stops it, and its own time limit
+ *  ends it in any case. It needs operate, control and a session that may transmit, and is refused where the
+ *  radio would not tune ("err tune: on the air").
  *
  *  The Panel page works the radio natively instead of through a picture of its screen: a client
  *  that sends "panel 1" gets the radio's state as JSON ("state {...}": frequency, mode, filter,
@@ -61,8 +66,9 @@
  *  "unknown", never logged twice by a retry (R6). A receipt is bound to its QSO: the same number
  *  with another QSO is answered "conflict", never with the other QSO's answer (audit C03).
  *
- *  The Origin check of ws_handshake() keeps pages from other sites out; like the TCI server there
- *  is no login: the radio's own network is trusted.
+ *  The Origin check of ws_handshake() keeps pages from other sites out, and on the radio Pat's
+ *  web mailbox (port 8080) too; like the TCI server there is no login: the radio's own network is
+ *  trusted.
  *
  *  Tailscale Funnel (#58) brings the Panel and the Screen page from the internet, through
  *  tailscaled, which marks each such connection (ws_handshake's peer.funnel). One of those gets
@@ -94,6 +100,7 @@
 #include "cluster/spots.h"
 #include "dialog_field.h"
 #include "dsp.h"
+#include "ext_tune.h"
 #include "ft8_window.h"
 #include "lv_drivers/display/drm.h"
 #include "main.h"
@@ -199,6 +206,10 @@ typedef struct {
     uint64_t        ptt_ms;         /* the PTT key held: its last renewal, and when it began */
     uint64_t        ptt_start_ms;
     uint32_t        ptt_hold;       /* the page's number for its last PTT press: renewed while held, then over */
+    bool            tune_on;        /* a TUNE this client asked for may be on the air: its lease (tune_lease) */
+    uint64_t        tune_ms;        /* its last renewal */
+    uint32_t        tune_hold;      /* the page's number for its last TUNE */
+    atomic_uint     tune_want;      /* that number while the start waits for the LVGL thread, 0 let go (tune_apply) */
     uint32_t        ctl_told;       /* the control version last told ("ctl"), 0 never */
 } client_t;
 
@@ -248,7 +259,10 @@ static atomic_bool     forget_all_due;       /* Settings: every session revoked 
 /* What the panel clients are told; read from the radio every PANEL_MS */
 typedef struct {
     int32_t freq, mode, flo, fhi, kt, agc, pre, att, nb, nr, sql, rfg, vol, pwr10, step, zoom, vfo, atu, bat;
+    int32_t tune, tune_s;   /* TUNE for an external tuner on, its time limit */
     bool    tx, lock;
+    bool    ulock;          /* the user's lock alone (LOCK), not an app's hold: the page's LOCK button */
+    bool    cwrise;         /* CW's tone rises with the dial, as CW-R's (the X6200): its CW passband the other side */
 } pstate_t;
 
 /* A change asked by a panel client, for the LVGL thread */
@@ -913,6 +927,11 @@ static void client_textf(client_t *c, const char *fmt, ...) {
 
 static void client_close(client_t *c) {
     client_release_keys(c);
+    atomic_store(&c->tune_want, 0);
+    if (c->tune_on) {               /* its TUNE goes with it */
+        c->tune_on = false;
+        ext_tune_stop_owner(TUNE_BY_PANEL + (int)(c - clients), true);
+    }
     ctl_release(CTL_BROWSER, (int)(c - clients));
     pthread_mutex_lock(&c->lock);
     if (c->fd >= 0) {
@@ -983,7 +1002,7 @@ static void panel_apply(void *arg) {
             }
             break;
         case P_ATU:    param_i_set(cfg_atu_enabled, p->a != 0); break;
-        case P_LOCK:   main_screen_lock_freq(p->a != 0); break;
+        case P_LOCK:   main_screen_user_lock_freq(p->a != 0); break;   /* the user's: an app's hold stays */
     }
 }
 
@@ -1045,6 +1064,7 @@ static void pstate_read(pstate_t *s) {
     s->flo   = cparam_i_get(cfg_cur_filter_low);
     s->fhi   = cparam_i_get(cfg_cur_filter_high);
     s->kt    = param_i_get(cfg_key_tone);       /* CW: the filter edges are tones, the band is around the dial */
+    s->cwrise = radio_cw_tone_dir(radio_mode_cw) > 0;
     s->agc   = cparam_i_get(cfg_cur_agc);
     s->pre   = cparam_i_get(cfg_cur_pre);
     s->att   = cparam_i_get(cfg_cur_att);
@@ -1061,15 +1081,20 @@ static void pstate_read(pstate_t *s) {
     s->bat   = radio_get_battery();
     s->tx    = radio_get_state() != RADIO_RX || radio_get_modem();
     s->lock  = main_screen_freq_locked();
+    s->ulock = main_screen_freq_user_locked();
+    s->tune  = ext_tune_on();
+    s->tune_s = ext_tune_limit_s();
 }
 
 static void pstate_line(char *buf, size_t n, const pstate_t *s) {
     snprintf(buf, n,
              "state {\"freq\":%d,\"mode\":%d,\"flo\":%d,\"fhi\":%d,\"kt\":%d,\"agc\":%d,\"pre\":%d,\"att\":%d,"
              "\"nb\":%d,\"nr\":%d,\"sql\":%d,\"rfg\":%d,\"vol\":%d,\"pwr\":%d.%d,\"step\":%d,\"zoom\":%d,"
-             "\"vfo\":%d,\"atu\":%d,\"bat\":%d,\"tx\":%d,\"lock\":%d}",
+             "\"vfo\":%d,\"atu\":%d,\"bat\":%d,\"tx\":%d,\"lock\":%d,\"tune\":%d,\"tune_s\":%d,\"ulock\":%d,"
+             "\"cwrise\":%d}",
              s->freq, s->mode, s->flo, s->fhi, s->kt, s->agc, s->pre, s->att, s->nb, s->nr, s->sql, s->rfg, s->vol,
-             s->pwr10 / 10, s->pwr10 % 10, s->step, s->zoom, s->vfo, s->atu, s->bat, s->tx, s->lock);
+             s->pwr10 / 10, s->pwr10 % 10, s->step, s->zoom, s->vfo, s->atu, s->bat, s->tx, s->lock, s->tune, s->tune_s,
+             s->ulock, s->cwrise);
 }
 
 /* A string into JSON: quotes and backslashes escaped, control characters dropped */
@@ -1805,6 +1830,86 @@ static void ptt_lease(client_t *c, uint64_t now) {
     }
 }
 
+/* A TUNE asked by a page, for the LVGL thread: the client, and the page's number for it */
+typedef struct {
+    int      ci;
+    uint32_t hold;
+} tcmd_t;
+
+/* LVGL thread. Not when the page let go while it waited (tune_want), nor where the radio would not tune: that
+ * page is told why, as the radio's screen is */
+static void tune_apply(void *arg) {
+    const tcmd_t *t = (const tcmd_t *)arg;
+    client_t     *c = &clients[t->ci];
+    const char   *no;
+
+    if (atomic_load(&c->tune_want) != t->hold)
+        return;
+    if ((no = ext_tune_start(TUNE_BY_PANEL + t->ci)))
+        client_textf(c, "err tune: %s", no);
+}
+
+/* "tune 1 HOLD": TUNE for an external tuner, HOLD the page's number for it, renewed every second while the tune is
+ * on, as a held PTT (ptt_down); a renewal of one that ended starts nothing, a new press comes with a new number.
+ * "tune 0": its own stopped; one the radio or another page started too, with operate and control. Socket thread */
+static void tune_cmd(client_t *c, bool on, const char *hold_text) {
+    uint32_t    hold = hold_text ? (uint32_t)strtoul(hold_text, NULL, 10) : 0;
+    tcmd_t      t    = {.ci = (int)(c - clients), .hold = hold};
+    const char *no;
+
+    if (!on) {
+        bool own = c->tune_on;
+
+        c->tune_on = false;
+        atomic_store(&c->tune_want, 0);
+        /* Its own at any time, as asked (not "browser gone" on the radio's screen); another's (the radio's, another
+         * page's) as anything else that touches the RF side */
+        if (!(own && ext_tune_stop_owner(TUNE_BY_PANEL + t.ci, false)) && allowed(c, ROLE_OPERATE, true))
+            ext_tune_stop();
+        return;
+    }
+    if (!hold) {
+        client_text(c, "err tune 1 HOLD: reload the page");
+        return;
+    }
+    if (hold < c->tune_hold || (hold == c->tune_hold && !c->tune_on))
+        return;                                 /* an ended tune's renewal */
+    if (hold == c->tune_hold) {
+        c->tune_ms = now_ms();                  /* renewed */
+        return;
+    }
+    c->tune_hold = hold;                        /* a press counts once, taken or refused */
+    if (!allowed(c, ROLE_OPERATE, true))
+        return;
+    if (!c->tx_ok) {
+        client_text(c, "err this session may not transmit");
+        return;
+    }
+    if ((no = ext_tune_refusal())) {
+        client_textf(c, "err tune: %s", no);
+        return;
+    }
+    atomic_store(&c->tune_want, hold);
+    if (!scheduler_put(tune_apply, &t, sizeof(t))) {
+        atomic_store(&c->tune_want, 0);
+        client_text(c, "err tune: the radio is busy, try again");
+        return;
+    }
+    c->tune_on = true;
+    c->tune_ms = now_ms();
+}
+
+/* A page's TUNE is a lease: without a renewal for PTT_LEASE_MS the radio stops it, and says so if it was still on.
+ * Server thread */
+static void tune_lease(client_t *c, uint64_t now) {
+    if (!c->tune_on || now - c->tune_ms <= PTT_LEASE_MS)
+        return;
+    c->tune_on = false;
+    atomic_store(&c->tune_want, 0);
+    if (ext_tune_stop_owner(TUNE_BY_PANEL + (int)(c - clients), true))
+        client_text(c, "err tune stopped: no renewal from the page");
+}
+
 static void sessions_tell(client_t *c) {
     char line[4096];          /* 16 sessions of up to 220 characters: 1 kB held five or six */
     int  n = snprintf(line, sizeof(line), "sessions [");
@@ -1999,6 +2104,8 @@ static void handle_text(client_t *c, char *text) {
             return;
         }
         panel_set(c, a[1], n >= 3 ? a[2] : NULL, n >= 4 ? a[3] : NULL);
+    } else if (!strcmp(a[0], "tune") && n >= 2) {
+        tune_cmd(c, atoi(a[1]) != 0, n >= 3 ? a[2] : NULL);
     } else if (!strcmp(a[0], "ft8") && n >= 2) {
         if (!allowed(c, ROLE_OPERATE, true))
             return;
@@ -2273,6 +2380,10 @@ static void accept_client(int listen_fd) {
         c->tx_ok   = false;
         c->ptt_ms  = c->ptt_start_ms = 0;
         c->ptt_hold = 0;
+        c->tune_on  = false;
+        c->tune_ms  = 0;
+        c->tune_hold = 0;
+        atomic_store(&c->tune_want, 0);
         c->ctl_told = 0;
         c->last_ms = c->ping_ms = now_ms();
         inet_ntop(AF_INET, &peer.sin_addr, c->ip, sizeof(c->ip));
@@ -2374,7 +2485,7 @@ static void *server_thread(void *arg) {
                 }
             }
         }
-        /* The PTT leases (ptt_lease). Who controls the radio, and its TX state, to everyone. */
+        /* The PTT and TUNE leases (ptt_lease, tune_lease). Who controls the radio, and its TX state, to everyone. */
         {
             bool tx = ctl_transmitting();
             bool tx_changed = tx != atomic_exchange(&tx_last, tx);
@@ -2384,6 +2495,7 @@ static void *server_thread(void *arg) {
                 if (c->fd < 0 || !c->up)
                     continue;
                 ptt_lease(c, now);
+                tune_lease(c, now);
                 if (tx_changed)
                     client_textf(c, "tx %d", tx ? 1 : 0);
                 if (c->ctl_told != ver)

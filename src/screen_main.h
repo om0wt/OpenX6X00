@@ -44,8 +44,11 @@ void main_screen_vol_press(void);
 void main_screen_mfk(int dir);
 void main_screen_agc_next();
 
-/* Locks set by the apps, checked by the web remote */
+/* Locks set by the apps, checked by the web remote. The frequency is locked while an app holds it or the user
+ * locked it (main_screen_freq_locked); the app's hold leaves the user's lock as it was */
 void main_screen_lock_freq(bool lock);
+void main_screen_user_lock_freq(bool lock);
+bool main_screen_freq_user_locked(void);
 void main_screen_lock_band(bool lock);
 void main_screen_lock_mode(bool lock);
 void main_screen_lock_ab(bool lock);
@@ -56,6 +59,8 @@ bool main_screen_mode_locked();
  * audio. By the name it has now, as in the frequency strip: FT4 once the FT8 app was switched to it, PSK63. Any
  * thread (Winlink asks) */
 const char *main_screen_digital_app(void);
+/* The same as its action (ACTION_APP_FT8 ...), ACTION_NONE when none is open */
+press_action_t main_screen_digital_app_action(void);
 
 /* A jump to a frequency: the spectrum starts over */
 void main_screen_set_freq(uint64_t freq);

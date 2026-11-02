@@ -32,10 +32,21 @@
  *     ptt.lost(why)                 the link went or stalled: whatever was on the air is over (the
  *                                   release goes out when the socket still takes it)
  *     ptt.state                     idle | requesting | tx | releasing | ended | refused | busy
+ *     ptt.micOver()                 a Mic on transmission, press to confirmed end: its TCI link holds
+ *                                   control meanwhile, which the session does not report (#97)
  *   While a radio-microphone PTT is held the key is renewed every second (the radio lets it go
  *   after three seconds without, and after three minutes whatever happens): "key PTT 1 N", N the
  *   press's own number. The radio renews only the hold that keyed, so renewals that arrive after
  *   it let go (a stalled link delivering late) never key it again (audit C02).
+ *
+ *   const tune = RadioTune.create({el, send, status, session, link});   TUNE for an external tuner (#85)
+ *     tune.press()                  a tune, or the one on the air stopped (also one started at the radio)
+ *     tune.radio(on, limit)         the radio's state: "tune" and "tune_s" of "state {...}"
+ *     tune.err(text)                -> true when the "err ..." was the tune's (refused, stopped by the radio)
+ *     tune.lost(why)                the link went or stalled: the renewals stop, the radio stops it within 3 s
+ *     tune.state                    idle | requesting | on | stopping | ended | refused
+ *   A press, not a hold: while the tune is on the page renews it every second ("tune 1 N", N the press's own
+ *   number, as the PTT's), and the radio stops it after three seconds without, or at its own time limit.
  */
 (function() {
   "use strict";
@@ -111,7 +122,10 @@
       const mine = w[w.length - 1] === "1", who = w[0], name = who === "browser" ? w.slice(1, -1).join(" ") : "";
       const was = this.ctl;
       this.ctl = {who: who, name: name, mine: mine};
-      if (was.mine && !mine && this.o.status) this.o.status(who === "local" ? "Control taken at the radio: Take control to operate from here again" : who === "tci" ? "A TCI client took control: Take control to operate from here again" : who === "browser" ? "Control taken by " + name : "Control released", who !== "none");
+      /* This page's own Mic on keys through its TCI link, which holds control for the over and gives it back after
+       * (#97): not a takeover to report, nor a Take control to ask for */
+      const own = who === "tci" && this.ptt && this.ptt.micOver();
+      if (was.mine && !mine && !own && this.o.status) this.o.status(who === "local" ? "Control taken at the radio: Take control to operate from here again" : who === "tci" ? "A TCI client took control: Take control to operate from here again" : who === "browser" ? "Control taken by " + name : "Control released", who !== "none");
       this.render(); if (this.o.onChange) this.o.onChange();
       return true;
     }
@@ -268,9 +282,12 @@
     this.o = o; this.state = "idle"; this.path = null; this.since = 0; this.timer = null; this.renew = null; this.why = ""; this.tick = null;
     this.hold = 0;    /* the last press's number */
     const self = this;
+    if (o.session) o.session.ptt = this;     /* its Mic on over is no takeover to the session (#97) */
     this.tick = setInterval(function() { if (self.state === "tx") self.render(); }, 1000);
     this.render();
   }
+  /* A transmission of the browser's microphone, from its press until the radio confirmed its end */
+  Ptt.prototype.micOver = function() { return this.path === "mic" && (this.state === "requesting" || this.state === "tx" || this.state === "releasing"); };
   Ptt.prototype.clear = function() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } if (this.renew) { clearInterval(this.renew); this.renew = null; } };
   Ptt.prototype.press = function() {
     const self = this, o = this.o;
@@ -354,7 +371,95 @@
     el.innerHTML = ""; el.appendChild(document.createTextNode(main)); const sm = document.createElement("small"); sm.textContent = sub; el.appendChild(sm);
   };
 
+  /* ---- TUNE for an external tuner ---- */
+  const TUNE_START_MS = 2000;
+  function Tune(o) {
+    this.o = o; this.state = "idle"; this.hold = 0; this.renew = null; this.timer = null; this.since = 0; this.limit = 0;
+    this.why = ""; this.radioOn = false;
+    const self = this;
+    this.tick = setInterval(function() { if (self.state === "on" || (self.state === "idle" && self.radioOn)) self.render(); }, 1000);
+    this.render();
+  }
+  Tune.prototype.clear = function() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } if (this.renew) { clearInterval(this.renew); this.renew = null; } };
+  Tune.prototype.press = function() {
+    const self = this, o = this.o;
+    if (this.state === "requesting" || this.state === "on" || this.radioOn) {
+      this.clear(); o.send("tune 0");      /* a stop goes even to a stalled link: late, it still stops */
+      this.set("stopping", "");
+      this.timer = setTimeout(function() { if (self.state === "stopping") self.set("idle", ""); }, TUNE_START_MS);
+      return;
+    }
+    if (o.link && o.link.stalled) { this.set("refused", "The radio does not answer: no tune until it does"); return; }
+    const no = o.session ? o.session.can() : "";
+    if (no) { this.set("refused", no); return; }
+    const key = "tune 1 " + (++this.hold);
+    this.clear();
+    if (!o.send(key)) { this.set("refused", "No link to the radio: no tune"); return; }
+    this.renew = setInterval(function() { o.send(key); }, RENEW_MS);
+    this.state = "requesting"; this.why = ""; this.render();
+    this.timer = setTimeout(function() {
+      if (self.state !== "requesting") return;
+      self.clear(); o.send("tune 0"); self.set("refused", "The radio did not start the tune (see its screen)");
+    }, TUNE_START_MS);
+  };
+  Tune.prototype.radio = function(on, limit) {
+    const was = this.radioOn;
+    this.radioOn = !!on; if (limit) this.limit = limit;
+    if (on && this.state === "requesting") {
+      if (this.timer) { clearTimeout(this.timer); this.timer = null; }     /* the renewal goes on while it is on */
+      this.state = "on"; this.since = Date.now(); this.why = "";
+      if (this.o.status) this.o.status("TUNE on the air: press TUNE again to stop");
+    } else if (!on && this.state === "on") {
+      this.clear(); this.set("ended", "The tune is over"); return;
+    } else if (!on && this.state === "stopping") {
+      this.clear(); this.set("idle", ""); return;
+    } else if (on && !was && this.state !== "on") {
+      this.since = Date.now();     /* started at the radio: this page only shows it, and may stop it */
+    }
+    this.render();
+  };
+  /* Its own: the refusals and stops that name the tune; while a press waits for the radio, the access refusals too */
+  Tune.prototype.err = function(text) {
+    if (!/^tune\b/.test(text) && !(this.state === "requesting" && /^(controlled by|view only|this session may not transmit)/.test(text))) return false;
+    this.clear();
+    if (/^tune stopped/.test(text)) { this.radioOn = false; this.set("ended", "The radio stopped the tune: " + text.replace(/^tune stopped: /, "")); }
+    else this.set("refused", text.replace(/^tune: /, ""));
+    return true;
+  };
+  /* The stop goes behind the renewals a stalled link still holds, as the PTT's release does: delivered late, they end
+   * with it, not with a tune kept three seconds past the last of them */
+  Tune.prototype.lost = function(why) {
+    this.radioOn = false;     /* not known any more: the radio stops it within 3 s, and its next state says */
+    if (this.state === "requesting" || this.state === "on") { this.clear(); this.o.send("tune 0"); this.set("ended", why || "The link dropped: the radio stops the tune within 3 s"); }
+    else if (this.state === "stopping") { this.clear(); this.set("idle", ""); }
+  };
+  Tune.prototype.set = function(state, why) {
+    const self = this;
+    this.clear();
+    this.state = state; this.why = why || "";
+    if (why && this.o.status) this.o.status(why, state === "ended" || state === "refused");
+    if (state === "ended" || state === "refused") this.timer = setTimeout(function() { if (self.state === state) self.set("idle", ""); }, ENDED_MS);
+    this.render();
+  };
+  Tune.prototype.render = function() {
+    const el = this.o.el; if (!el) return;
+    let main, sub = "external tuner";
+    const s = Math.floor((Date.now() - this.since) / 1000), lim = this.limit ? " / " + this.limit + " s" : "";
+    switch (this.state) {
+      case "requesting": main = "Tuning..."; break;
+      case "on": main = "TUNE " + s + lim; sub = "press to stop"; break;
+      case "stopping": main = "Stopping..."; break;
+      case "ended": main = "TUNE over"; sub = this.why.length > 40 ? this.why.slice(0, 38) + "…" : this.why; break;
+      case "refused": main = "No tune"; sub = this.why.length > 40 ? this.why.slice(0, 38) + "…" : this.why; break;
+      default: if (this.radioOn) { main = "TUNE " + s + lim; sub = "from the radio: press to stop"; } else main = "TUNE";
+    }
+    el.classList.toggle("down", this.state === "on" || this.state === "requesting" || (this.state === "idle" && this.radioOn));
+    el.classList.toggle("warn", this.state === "ended" || this.state === "refused");
+    el.innerHTML = ""; el.appendChild(document.createTextNode(main)); const sm = document.createElement("small"); sm.textContent = sub; el.appendChild(sm);
+  };
+
   window.RadioSession = {create: function(o) { return new Session(o); }, forRadio: forRadio, takeLink: takeLink,
                          token: function() { return load(TOKEN_KEY); }};
   window.RadioPtt = {create: function(o) { return new Ptt(o); }};
+  window.RadioTune = {create: function(o) { return new Tune(o); }};
 })();

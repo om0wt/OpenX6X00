@@ -95,6 +95,13 @@ static const std::map<int, Knob> knobs = {
                            : m == CLUSTER_FM_DIG ? "DIG" : m == (CLUSTER_FM_CW | CLUSTER_FM_DIG) ? "CW+DIG" : "Some");
     }}},
 
+    {CTRL_AGC, pick("AGC", cfg_sm.cp_cur_agc, {"Off", "Slow", "Fast", "Auto"})},
+    {CTRL_PRE, on_off("PRE", cfg_sm.cp_cur_pre)},
+    {CTRL_ATT, on_off("ATT", cfg_sm.cp_cur_att)},
+    {CTRL_ATU, on_off("ATU", cfg_sm.p_atu_enabled)},
+    {CTRL_STEP, {"Step", &cfg_sm.p_mode_freq_step,
+                 [] { return std::to_string(cfg_sm.p_mode_freq_step.get()) + " Hz"; }}},
+
     {CTRL_DNF, on_off("Notch filter", cfg_sm.p_dnf)},
     {CTRL_DNF_CENTER, num("DNF center", cfg_sm.p_dnf_center)},
     {CTRL_DNF_WIDTH, num("DNF width", cfg_sm.p_dnf_width)},
@@ -222,6 +229,14 @@ void knobs_init(lv_obj_t *parent) {
 
     vol_line.make(parent, y - LINE_H * 2);
     mfk_line.make(parent, y - LINE_H);
+
+    /* A line as high as its box at least: in VISION's bigger type the boxes are 35 px, the
+     * two lay over each other and the MFK one ran 3 px under the buttons (#82) */
+    lv_obj_update_layout(mfk_line.obj());
+    lv_coord_t h = LV_MAX(LINE_H, lv_obj_get_height(mfk_line.obj()));
+
+    lv_obj_set_y(vol_line.obj(), y - h * 2);
+    lv_obj_set_y(mfk_line.obj(), y - h);
     cfg_sm.p_knob_info.subscribe_delayed_and_notify(knob_info_cb, nullptr);
 }
 

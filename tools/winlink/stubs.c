@@ -13,7 +13,13 @@
  *                 (default 1000)
  *    WL_AIR_OUT   the other station's WL_AIR_IN: what this one transmits goes there, as the radio sends it
  *    WL_PWR_MAX   the top of PWR in W, default BOARD_PWR_MAX (the X6200's 8 W); 5 is the X6200 on its battery
+ *    WL_PWR_XVTR  a transverter's TX power limit in force, W (#104), default none; give WL_PWR_MAX the same
  *    WL_APP       a file: while it is there, its text is the digital app open (FT8...), else none is
+ *    WL_SWR       a file: when it is there during a key, the SWR protection stops that key as radio.c's does (a trip
+ *                 counted, the radio unkeyed, "TX stopped: SWR 3.0"), and the file goes: one trip each
+ *    WL_SWR_LATE  a file: a trip counted at the next look at the trips (radio_swr_trips), outside any key, and the
+ *                 file goes: as swr_trip_cb counts one the LVGL thread runs after the key ended, or another
+ *                 transmission's (a PTT, FT8)
  *  The receiver has a little noise under what it hears. The player keeps time as the low-latency stream does
  *  (100 ms queued), keys the radio for the whole of it and unkeys once the last sample is out.
  *
@@ -100,15 +106,33 @@ float   param_f_get(const ParamFloat *p) { return p->v; }
 void    cparam_i_set(ComputedParamInt *p, int32_t v) { p->v = v; }
 bool    cfg_is_valid_hw_freq(int32_t f) { return f >= 100000 && f <= 55000000; }
 float   cfg_pwr_max_get(void) { return getenv("WL_PWR_MAX") ? (float)atof(getenv("WL_PWR_MAX")) : BOARD_PWR_MAX; }
+float   cfg_pwr_xvtr_get(void) { return getenv("WL_PWR_XVTR") ? (float)atof(getenv("WL_PWR_XVTR")) : 0.0f; }
 
 /* ---- the radio, the screen, the scheduler (the work done at once: no LVGL thread here) ---- */
 
-static atomic_bool keyed;
+static atomic_bool   keyed;
+static atomic_uint   swr_trips;
+static atomic_ullong swr_trip_at;
+
+/* A trip counted, as swr_trip_cb (radio.c) does: its time before the count */
+static void swr_trip_count(void) {
+    atomic_store(&swr_trip_at, now_us() / 1000);
+    atomic_fetch_add(&swr_trips, 1);
+}
+
+/* WL_SWR_LATE there: a trip counted now */
+unsigned radio_swr_trips(void) {
+    const char *path = getenv("WL_SWR_LATE");
+
+    if (path && *path && unlink(path) == 0)
+        swr_trip_count();
+    return atomic_load(&swr_trips);
+}
 
 radio_state_t radio_get_state(void) { return atomic_load(&keyed) ? RADIO_TX : RADIO_RX; }
 bool          radio_get_modem(void) { return atomic_load(&keyed); }
 int32_t       radio_tx_freq(void) { return freq.v; }
-unsigned      radio_swr_trips(void) { return 0; }
+uint64_t      radio_swr_trip_at(void) { return atomic_load(&swr_trip_at); }
 uint32_t      radio_caps(void) { return HW_CAP_TX_FILTER; }
 
 const char *channels_mode_name(int m) { return m == radio_mode_usb_dig ? "USB-D" : "USB"; }
@@ -292,6 +316,17 @@ const char *pa_strerror(int error) {
 
 /* ---- the player: keyed for the whole transmission, on the wall clock, 100 ms queued ---- */
 
+/* WL_SWR there: the SWR protection stops this key, as swr_trip_cb (radio.c) does, the trip counted before the unkey */
+static void swr_check(void) {
+    const char *path = getenv("WL_SWR");
+
+    if (!path || !*path || unlink(path) != 0)
+        return;
+    swr_trip_count();
+    atomic_store(&keyed, false);
+    msg_schedule_text_fmt("TX stopped: SWR %.1f", 3.0);
+}
+
 float tx_player_base_gain_offset(void) { return 0.0f; }
 
 static void played_write(const int16_t *s, size_t n, bool stopped) {
@@ -331,6 +366,7 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
 
         if (n == 0)
             break;
+        swr_check();
         if ((abort && abort(abort_ctx)) || !atomic_load(&keyed)) {
             stopped = true;
             break;

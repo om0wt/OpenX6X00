@@ -6,6 +6,7 @@
 // parameter_api.h.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -38,8 +39,16 @@ bool cfg_is_valid_hw_freq(int32_t freq);
 bool cfg_is_rx_only_freq(int32_t freq);
 /* Transmitted on: HF, a transverter with a shift */
 bool cfg_is_tx_freq(int32_t freq);
+/* The frequencies transmitted on the same way as freq, [*lo, *hi] (Hz): the range of the transverter it is on (the
+ * first, as cfg_transverter_shift_for), else HF 0.1-55 MHz, cut where a transverter before it in that order starts
+ * or ends. False when freq is not transmitted on */
+bool cfg_tx_range(int32_t freq, int32_t *lo, int32_t *hi);
 /* The band the radio is on is one it can use (band_use over its edges); true between bands */
 bool cfg_band_usable(void);
+
+/* The base's HW_CAP_* bits (radio_caps()), from radio.c once hw_start() ran: the LO offset (cfg_mode_lo_offset) is
+ * computed again from them. None until then */
+void cfg_hw_caps_set(uint32_t caps);
 
 // Persist all pending deferred writes immediately.
 void cfg_api_flush_all(void);
@@ -57,9 +66,30 @@ void cfg_band_load_next(bool up);
 void cfg_pwr_set(float watts);
 
 /* The highest TX power in W that can be set (BOARD_PWR_MAX; the X6200 on battery BOARD_PWR_MAX_BAT).
- * Only later settings are clipped to it: the power already set is left as it is */
+ * Only later settings are clipped to it: the power already set is left as it is. The get is the top in force: a
+ * transverter's TX power limit under it too (cfg_pwr_xvtr_set) */
 void cfg_pwr_max_set(float watts);
 float cfg_pwr_max_get(void);
+
+/* What cfg_pwr_xvtr_set did to PWR */
+typedef enum {
+    PWR_XVTR_SAME = 0,
+    PWR_XVTR_HELD,          /* to the limit (down, or up after it with a new one), the PWR from before kept */
+    PWR_XVTR_RESTORED,      /* off the transverter: the PWR from before back */
+} pwr_xvtr_t;
+
+/* The TX power limit of a transverter (#104), W, 0 none: of the one that covers freq (on, with a shift), and the one
+ * the radio is held to tuned to rx and transmitting on tx, the lower where both have one */
+float cfg_transverter_pwr_for(int32_t freq);
+float cfg_transverter_pwr_cap(int32_t rx, int32_t tx);
+
+/* The transverter limit in force (radio.c, LVGL thread), 0 none: PWR stays at or under it, and comes down to it; off
+ * the transverters (on_xvtr false) the PWR from before comes back. The get: the limit in force, 0 none */
+pwr_xvtr_t cfg_pwr_xvtr_set(float watts, bool on_xvtr);
+float cfg_pwr_xvtr_get(void);
+
+/* The transverter at freq for the screen: the name of the band list's band there ("2m"), else its number ("1") */
+void cfg_transverter_name(int32_t freq, char *buf, size_t size);
 
 /* The other VFO; with independent VFOs (p_indep_vfo) its own band comes with it */
 void cfg_vfo_toggle(void);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iterator>
 
@@ -15,7 +16,8 @@ extern "C" {
 //   - Explicit band switch: setting p_band_id triggers an observer that calls
 //     switch_band(implicit=false). Save the pending writes of the current band,
 //     then load all band params of the new band EXCEPT current_vfo (the active
-//     VFO reference stays the same VFO).
+//     VFO reference stays the same VFO). With independent VFOs the other VFO
+//     keeps all it had, as on an implicit switch, unless the new band has split on.
 //   - Implicit switch: when a VFO frequency is tuned into a different band
 //     (via cp_fg_freq or the active p_band_vfo*_freq), an observer triggers a
 //     band switch. The active VFO's frequency that caused the switch is kept,
@@ -50,7 +52,8 @@ SettingsManager::SettingsManager()
       cp_cur_pre([this]() { return cur_pre_get(); }, [this](int32_t pre) { cur_pre_set(pre); }),
       cp_cur_agc([this]() { return cur_agc_get(); }, [this](int32_t agc) { cur_agc_set(agc); }),
 
-      // Mode LO offset: CW→-key_tone, CWR→+key_tone, else 0. One-way (no reverse).
+      // Mode LO offset: CW→-key_tone, CWR→+key_tone, else 0 (0 also in CW where the base's
+      // spectrum is centred on the dial). One-way (no reverse).
       cp_mode_lo_offset([this]() { return lo_offset_compute(); }),
 
       // Computed current filter params. The compute fns derive the effective
@@ -92,9 +95,11 @@ void SettingsManager::init_load(void (*on_db_error)(const char *msg)) {
     p_transverter_0_from.load(0);
     p_transverter_0_to.load(0);
     p_transverter_0_shift.load(0);
+    p_transverter_0_pwr.load(0);
     p_transverter_1_from.load(1);
     p_transverter_1_to.load(1);
     p_transverter_1_shift.load(1);
+    p_transverter_1_pwr.load(1);
 
     // The starting band comes from the persisted global parameter.
     band_id_ = p_band_id.get();
@@ -295,6 +300,12 @@ void SettingsManager::switch_band(int new_band_id, bool implicit) {
 
         // The band the active VFO is on, for independent VFOs (vfo_toggle)
         (p_band_current_vfo.get() == RADIO_VFO_A ? p_vfoa_band : p_vfob_band).set(new_band_id);
+
+        // The VFO in use, saved with the band it is now in use on: a switch keeps it without writing it, so each band
+        // kept the VFO in use when it was last left there, and a restart came back on that one (B tuned from 20m
+        // into the gap above CB C, or the VFO key's switch to B's band with independent VFOs: A after the restart)
+        pending_writes_.write(StorageKey{StorageType::BAND, band_id_, p_band_current_vfo.db_name()},
+                              p_band_current_vfo.get());
     }
 
     band_switch_active_ = false;
@@ -304,23 +315,39 @@ void SettingsManager::vfo_toggle() {
     const bool    on_a  = p_band_current_vfo.get() == RADIO_VFO_A;
     const int32_t other = (on_a ? p_vfob_band : p_vfoa_band).get();
 
-    // The other VFO's band only where the radio can still use it: a 2 m left there by v0.3.5 on an X6200 with the
-    // transverters and the WR12 off is not (load_band_vfo would keep its 145.500, and the base be sent it)
-    auto usable = [this](int32_t id) {
-        BandInfoLoadResult b = BandsTable::get_by_id(id);
-        return b.rc == SUCCESS && band_use(b.value.start_freq, b.value.stop_freq) != BAND_USE_NONE;
-    };
-
     (on_a ? p_vfoa_band : p_vfob_band).set(band_id_);
     p_band_current_vfo.set(on_a ? RADIO_VFO_B : RADIO_VFO_A);
-    if (p_indep_vfo.get() && other != BAND_UNDEFINED && other != band_id_ && usable(other)) {
-        p_band_id.set(other);   /* explicit switch: both VFO records of that band are loaded */
+    if (p_indep_vfo.get() && other != BAND_UNDEFINED && other != band_id_ && band_usable(other)) {
+        p_band_id.set(other);   /* explicit switch: the VFO now in use from that band, the other kept (load_band_vfo) */
     } else if (p_band_tx_shift.get() && p_band_split.get()) {
         band_follow(p_band_vfoa_freq.get());    /* a TX shift: the band is A's, B = A + the shift can lie beyond it */
     } else {
         band_follow(fg_freq_get());   /* the VFO now active was tuned into another band while inactive */
     }
 }
+
+// A band the radio can use, for the other VFO's own band (vfo_toggle, load_band_all): a 2 m left there by v0.3.5 on
+// an X6200 with the transverters and the WR12 off is not (load_band_vfo would keep its 145.500, and the base be sent it)
+bool SettingsManager::band_usable(int32_t id) const {
+    BandInfoLoadResult b = BandsTable::get_by_id(id);
+    return b.rc == SUCCESS && band_use(b.value.start_freq, b.value.stop_freq) != BAND_USE_NONE;
+}
+
+#ifdef BOARD_X6200
+// The X6200's attenuator on a band never set (#125): what two X6200s showed on a steady carrier, 53 and 51 dB on 80 m,
+// 36 and 29 on 40 m, 43 and 34 on 20 m, 40 and 32 on 10 m, their mean, each band taking that of the nearest of the
+// four by the middle of the band. Measure gives a band its own. The one value of v0.3.8 and before (params
+// "smeter_att": 15 dB, or a Measure on one band) is not taken: it fit one band at most. Its row stays, for going back
+int32_t SettingsManager::smeter_att_start() const {
+    BandInfoLoadResult b  = BandsTable::get_by_id(p_band_smeter_att.context_id());
+    uint32_t           hz = b.rc == SUCCESS ? b.value.start_freq / 2 + b.value.stop_freq / 2 : 7'100'000;
+
+    if (hz < 5'000'000) return 52;      /* 80 m: 160 m and the broadcast bands up to 60 m too */
+    if (hz < 10'000'000) return 33;     /* 40 m: 60 m to the 31 m broadcast band */
+    if (hz < 20'000'000) return 39;     /* 20 m: 30 m to the 15 m broadcast band */
+    return 36;                          /* 10 m: 15 m and up */
+}
+#endif
 
 void SettingsManager::tx_shift_follow() {
     const int32_t shift = p_band_tx_shift.get();
@@ -354,6 +381,39 @@ void SettingsManager::tx_shift_cb(Subject * /*subj*/, void *user_data) {
 void SettingsManager::tx_shift_set(int32_t hz) {
     p_band_tx_shift.set(hz);
     p_band_split.set(hz != 0);
+}
+
+/* In tenths of a watt, as the settings keep them: 0.3 W is 0.2999 in float */
+SettingsManager::XvtrPwr SettingsManager::pwr_xvtr_set(float w, bool on_xvtr) {
+    long pwr = std::lround(p_pwr.get() * 10.0f), held = std::lround(p_pwr_xvtr_held.get() * 10.0f);
+    long was = std::lround(pwr_xvtr_.load() * 10.0f), lim = std::lround(w * 10.0f), to;
+
+    pwr_xvtr_.store(w > 0.0f ? w : 0.0f);
+    if (lim > 0) {
+        if (pwr > lim) {
+            if (held == 0) {
+                p_pwr_xvtr_held.set(p_pwr.get());
+            }
+            to = lim;
+        } else if (held > 0 && pwr == was) {
+            to = std::min(held, lim);   /* held at the limit before: at the new one, or the PWR from before */
+        } else {
+            return XvtrPwr::SAME;
+        }
+        if (to == pwr) {
+            return XvtrPwr::SAME;
+        }
+        p_pwr.set(to / 10.0f);
+        return XvtrPwr::HELD;
+    }
+    /* Still on a transverter: the PWR from before only off it. Off is next to 0.1 W on the limit's slider, one step
+     * too far put 10 W back into the transverter at once */
+    if (held == 0 || on_xvtr) {
+        return XvtrPwr::SAME;
+    }
+    p_pwr_xvtr_held.set(0.0f);
+    p_pwr.set(held / 10.0f);    /* the top is pwr_max_ again: the X6200 on battery stops there */
+    return XvtrPwr::RESTORED;
 }
 
 void SettingsManager::switch_mode(ModeGroup new_group_id) {
@@ -867,7 +927,15 @@ void SettingsManager::load_band_all(int band_id) {
 
     // VFO params are handled in explicit order (restore/clamp with sibling
     // dependency). Initial full load restores nothing (no implicit skip).
-    load_band_vfo(band_id, false);
+    // Independent VFOs: the other VFO as it was on its own band, where the VFO key takes it back, loaded from there
+    // first and then kept as a band key keeps it (not where this band has split on). Loaded from this band, a restart
+    // showed this band's other VFO; kept from nothing, the GUI's own 14.100 or 14.150
+    const int32_t own   = (p_band_current_vfo.get() == RADIO_VFO_A ? p_vfob_band : p_vfoa_band).get();
+    const bool    other = p_indep_vfo.get() && own != BAND_UNDEFINED && own != band_id && band_usable(own);
+    if (other) {
+        load_band_vfo(own, false, false);
+    }
+    load_band_vfo(band_id, false, other);
 }
 
 void SettingsManager::load_mode_all() {
@@ -890,10 +958,10 @@ void SettingsManager::load_band_switch(int new_band_id, bool implicit) {
         }
         p->load(new_band_id);
     }
-    load_band_vfo(new_band_id, implicit);
+    load_band_vfo(new_band_id, implicit, implicit || p_indep_vfo.get());
 }
 
-void SettingsManager::load_band_vfo(int band_id, bool implicit) {
+void SettingsManager::load_band_vfo(int band_id, bool implicit, bool keep) {
     const int active_vfo = p_band_current_vfo.get();
 
     // BandInfo drives the clamp/restore rules. A missing or undefined band
@@ -909,27 +977,32 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
     // new band has split on (p_band_split is loaded before): the inactive VFO is
     // then the one the radio transmits on, and comes from the band as on an
     // explicit switch (kept, 40m CW in split sent on 40m SSB's B, 7.150, not its own 7.025).
-    const bool keep_other = implicit && !p_band_split.get();
+    // With independent VFOs the inactive VFO is kept on every switch, a band key's too (`keep`): it stays on its own
+    // band (p_vfoa_band, p_vfob_band) until the VFO key brings that band back; loaded from the band key's band, B
+    // showed what it had there, not its own. Into split the same rule as above: kept, a band key to 15m left in
+    // split sent on B's 7.030 (40m), not on the B that 15m transmits on.
+    const bool keep_other = keep && !p_band_split.get();
     const bool keep_a = keep_other && active_vfo == RADIO_VFO_B, keep_b = keep_other && active_vfo == RADIO_VFO_A;
+
+    // A VFO's frequency on this band from what it has saved here: none, the band start (or the default), on what the
+    // radio can tune (4m has no opening frequency and neither radio tunes 70 MHz); one outside the band, clamped.
+    auto freq_here = [&](std::optional<int32_t> saved) {
+        const int32_t start = static_cast<int32_t>(band.value.start_freq);
+        const int32_t stop  = static_cast<int32_t>(band.value.stop_freq);
+        if (!saved) {
+            return have_band ? clamp_to_valid_hw_freq(start) : default_freq;
+        }
+        return have_band && (*saved < start || *saved > stop) ? clamp_to_valid_hw_freq(*saved) : *saved;
+    };
 
     // VFOA frequency: skipped on an implicit switch when VFOA is the active VFO, or kept.
     if (!(implicit && active_vfo == RADIO_VFO_A) && !keep_a) {
-        // vfoa_freq: NOT_FOUND -> band start (or the default), on what the radio can tune (4m has no opening
-        // frequency and neither radio tunes 70 MHz); an out-of-range loaded value is clamped.
         int rc = p_band_vfoa_freq.load(band_id);
-        if (rc == NOT_FOUND) {
-            p_band_vfoa_freq.set_quiet(have_band ? clamp_to_valid_hw_freq(static_cast<int32_t>(band.value.start_freq))
-                                                 : default_freq);
-        } else if (rc == SUCCESS && have_band) {
-            const int32_t freq = p_band_vfoa_freq.get();
-            if (freq < static_cast<int32_t>(band.value.start_freq) ||
-                freq > static_cast<int32_t>(band.value.stop_freq)) {
-                p_band_vfoa_freq.set_quiet(clamp_to_valid_hw_freq(freq));
-            }
-        }
+        p_band_vfoa_freq.set_quiet(freq_here(rc == SUCCESS ? std::optional<int32_t>(p_band_vfoa_freq.get())
+                                                           : std::nullopt));
     }
 
-    // VFOA mode/att/pre/agc: kept when VFOA is the inactive VFO of an implicit switch.
+    // VFOA mode/att/pre/agc: kept when VFOA is the inactive VFO kept (keep_a).
     if (!keep_a) {
         int rc = p_band_vfoa_mode.load(band_id);
         if (rc != SUCCESS) {
@@ -946,19 +1019,22 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
         (void)rc;
     }
 
-    // VFOB frequency: skipped on an implicit switch when VFOB is the active VFO, or kept.
+    // VFOB frequency: skipped on an implicit switch when VFOB is the active VFO, or kept. Clamped like vfoa_freq when
+    // loaded; none saved, the current vfoa_freq. With VFOA kept on its own band (independent VFOs, VFOB taking this
+    // band by a band key, the VFO key or a restart), the frequency VFOA has on this band, else the band start, as
+    // VFOA comes here: VFOA's own from the band it stayed on put VFOB, on 30m for the first time, on 20m's 14.326 (the
+    // dial on 20m, the band 30m) and, the VFO key back from VFOA on 6m, on 50.000 (#137)
+    bool b_new = false;
     if (!(implicit && active_vfo == RADIO_VFO_B) && !keep_b) {
-        // vfob_freq: copies the current vfoa_freq when absent; clamped like
-        // vfoa_freq when loaded.
         int rc = p_band_vfob_freq.load(band_id);
-        if (rc == NOT_FOUND) {
+        if (rc == SUCCESS) {
+            p_band_vfob_freq.set_quiet(freq_here(p_band_vfob_freq.get()));
+        } else if (keep_a) {
+            p_band_vfob_freq.set_quiet(
+                freq_here(storage_policy_for(StorageType::BAND).load_int(band_id, p_band_vfoa_freq.db_name())));
+            b_new = true;
+        } else {
             p_band_vfob_freq.set_quiet(p_band_vfoa_freq.get());
-        } else if (rc == SUCCESS && have_band) {
-            const int32_t freq = p_band_vfob_freq.get();
-            if (freq < static_cast<int32_t>(band.value.start_freq) ||
-                freq > static_cast<int32_t>(band.value.stop_freq)) {
-                p_band_vfob_freq.set_quiet(clamp_to_valid_hw_freq(freq));
-            }
         }
     }
 
@@ -971,8 +1047,8 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
         return v ? *v : dflt;
     };
 
-    // VFOB mode/att/pre/agc: kept when VFOB is the inactive VFO of an implicit
-    // switch; else they fall back to a_here() when
+    // VFOB mode/att/pre/agc: kept when VFOB is the inactive VFO kept (keep_b);
+    // else they fall back to a_here() when
     // absent (mode copied, att/pre/agc copied on NOT_FOUND).
     if (!keep_b) {
         int rc = p_band_vfob_mode.load(band_id);
@@ -993,6 +1069,14 @@ void SettingsManager::load_band_vfo(int band_id, bool implicit) {
         rc = p_band_vfob_agc.load(band_id);
         if (rc == NOT_FOUND) {
             p_band_vfob_agc.set_quiet(a_here(p_band_vfoa_agc, p_band_vfoa_agc.get()));
+        }
+    }
+
+    // Where VFOB starts on a band new to it, saved as its own there: not saved, the VFO key away and back found it
+    // where VFOA was on this band by then
+    if (b_new) {
+        for (Parameter<int32_t> *p : {&p_band_vfob_freq, &p_band_vfob_mode}) {
+            pending_writes_.write(StorageKey{StorageType::BAND, band_id, p->db_name()}, p->get());
         }
     }
 }
@@ -1042,9 +1126,15 @@ std::string SettingsManager::encoder_bind_validate(const std::string &val) {
     return result;
 }
 
+/* Where the base's spectrum is centred, Hz from the dial: the X6100's in CW and CW-R on the oscillator the tone is
+ * heard from, the key tone below the dial in CW and above it in CW-R (its lo_freq); the X6200's on the dial in every
+ * mode (HW_CAP_CW_SPECTRUM_ON_DIAL), where this offset drew a station on the dial a pitch off it (#115) */
 int32_t SettingsManager::lo_offset_compute() {
     int32_t mode = cp_cur_mode.get();
     int32_t key_tone = p_key_tone.get();
+    if (hw_caps_ & HW_CAP_CW_SPECTRUM_ON_DIAL) {
+        return 0;
+    }
     if (mode == radio_mode_cw) {
         return -key_tone;
     }

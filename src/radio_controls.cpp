@@ -17,6 +17,7 @@
 #include "util.hpp"
 
 #include "cfg/settings_manager.h"
+#include "cfg/settings_manager_api.h"
 
 extern "C" {
 #include "cluster/client.h"
@@ -95,6 +96,7 @@ static const struct {
     {CTRL_WF_MODE, &cfg_sm.p_wf_mode, "Waterfall: %s", "Centered", "Fixed"},
     {CTRL_CLUSTER_ORDER, &cfg_sm.p_cluster_order, "Cluster order: %s", "frequency", "newest first"},
     {CTRL_CLUSTER_BANDS, &cfg_sm.p_cluster_all_bands, "Cluster: %s", "current band", "all bands"},
+    {CTRL_ATU, &cfg_sm.p_atu_enabled, "ATU: %s", "Off", "On"},
 };
 
 template <typename T, typename D, int32_t S>
@@ -242,6 +244,39 @@ void controls_encoder_update(cfg_ctrl_t ctrl, int32_t diff, std::string &msg) {
             break;
         }
 
+        case CTRL_AGC: {        /* Off, Slow, Fast, Auto, a step a detent; it stops at either end. The AGC key goes
+                                 * round, but a knob turned on past Auto landed on Off, the loudest */
+            static const char *const names[] = {"Off", "Slow", "Fast", "Auto"};
+
+            i = cfg_sm.cp_cur_agc.get();
+            if (diff) {
+                cfg_sm.cp_cur_agc.set(LV_CLAMP(radio_agc_off, i + (diff > 0 ? 1 : -1), radio_agc_auto));
+                i = cfg_sm.cp_cur_agc.get();
+            }
+            snprintf(buf, size, "AGC: %s", i >= 0 && i < 4 ? names[i] : "?");
+            break;
+        }
+
+        case CTRL_PRE:          /* per band, as the PRE key and the VOL 2:2 buttons */
+        case CTRL_ATT: {
+            ComputedParameter<int32_t> &p = ctrl == CTRL_PRE ? cfg_sm.cp_cur_pre : cfg_sm.cp_cur_att;
+
+            if (diff) {
+                p.set(!p.get());
+            }
+            snprintf(buf, size, "%s: %s", ctrl == CTRL_PRE ? "PRE" : "ATT", p.get() ? "On" : "Off");
+            break;
+        }
+
+        case CTRL_STEP:         /* 10, 100, 500, 1000, 5000 Hz as FST, but stopping at either end: FST goes round,
+                                 * and a knob turned on past 5 kHz landed on 10 Hz */
+            i = cfg_sm.p_mode_freq_step.get();
+            if ((diff > 0 && i < 5000) || (diff < 0 && i > 10)) {
+                i = cfg_mode_change_freq_step(diff > 0);
+            }
+            snprintf(buf, size, "Freq step: %i Hz", i);
+            break;
+
         case CTRL_IF_SHIFT:
             if (if_shift_supported()) {
                 snprintf(buf, size, "IF shift: %i Hz", turn(cfg_sm.p_band_if_shift, diff, 100));
@@ -345,11 +380,13 @@ void controls_span_narrower(button_data_t *data) {
     cfg_sm.p_mode_zoom.set(cfg_sm.p_mode_zoom.get() << 1);
 }
 
-/* CW ZAP: tune so that the signal the decoder hears sits on the key tone, to 10 Hz */
+/* CW ZAP: tune so that the signal the decoder hears sits on the key tone, to 10 Hz. A tone above the key tone
+ * is a station above the dial where the tone falls as the dial goes up (CW on the X6100), below it where the
+ * tone rises (CW-R; CW on the X6200 too, where ZAP went the wrong way, #115) */
 void controls_cw_zap(button_data_t *data) {
-    int32_t mode = cfg_sm.cp_cur_mode.get();
+    int dir = radio_cw_tone_dir((radio_mode_t)cfg_sm.cp_cur_mode.get());
 
-    if (mode != radio_mode_cw && mode != radio_mode_cwr) {
+    if (!dir) {
         return;
     }
 
@@ -358,7 +395,7 @@ void controls_cw_zap(button_data_t *data) {
     int32_t freq      = cfg_sm.cp_fg_freq.get();
 
     LV_LOG_USER("tone_freq: %f, key_tone: %i", tone_freq, key_tone);
-    if (mode == radio_mode_cw) {
+    if (dir < 0) {
         freq += tone_freq - key_tone;
     } else {
         freq -= tone_freq - key_tone;

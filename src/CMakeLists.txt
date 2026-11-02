@@ -19,9 +19,10 @@ target_sources(${PROJECT_NAME} PUBLIC
     dialog_olivia.c olivia.c olivia_app.c olivia_demod.c olivia_macro.c olivia_mod.c olivia_resamp.c
     olivia_rx.c olivia_tx.c
     dialog_jtty.c jtty.c jtty_rx.c jtty_tx.c
+    digi_textlog.c
     tx_player.c tx_level.c
     tx_autocal.cpp
-    swr_guard.c
+    swr_guard.c tune_tx.c ext_tune.c
     base_guard.c
     app_sstv.c
     app_sstv_tx.c
@@ -57,6 +58,7 @@ target_sources(${PROJECT_NAME} PUBLIC
     navtex_window.c navtex/sitorb.c navtex/dsc.c
     channel_list.c broadcast_db.c cJSON.c
     text_popup.c cw_encoder.c image_level.c start_trace.c
+    cw_beacon.c
     button_bar.cpp vol_control.cpp recorder.c
     cw_tune_view.c adif.c qso_log.c scheduler.cpp
     wifi_window.c wifi.cpp btaudio.cpp bt_dev.c radio_controls.cpp

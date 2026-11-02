@@ -19,6 +19,26 @@
 #ifndef WS_TAILSCALE_STATUS
 #define WS_TAILSCALE_STATUS "/run/tailscale/status"
 #endif
+/* The domains the radio's network gives it: the search and domain lines NetworkManager writes for the connections
+ * that are up (the radio's /etc/resolv.conf is a link to /run/NetworkManager/resolv.conf) */
+#ifndef WS_RESOLV_CONF
+#define WS_RESOLV_CONF "/etc/resolv.conf"
+#endif
+/* The names its owner added on the web configurator's Network page, one per line (#105) */
+#ifndef WS_OWN_NAMES
+#define WS_OWN_NAMES "/mnt/own_names.conf"
+#endif
+
+/* The port of Pat's web mailbox on the radio (x6100-winlink's HTTP_PORT): a page there is one of the
+ * radio's own names, but it shows what anyone can send by Winlink, so a socket from it is refused. On the
+ * PC the web configurator itself is on 8080, and nothing is refused (0) */
+#ifndef WS_REFUSED_ORIGIN_PORT
+#ifdef HOST_BUILD
+#define WS_REFUSED_ORIGIN_PORT 0
+#else
+#define WS_REFUSED_ORIGIN_PORT 8080
+#endif
+#endif
 
 /* ---- SHA-1 (FIPS 180-4), for the handshake only ------------------------------------ */
 
@@ -210,6 +230,23 @@ static bool host_name(const char *h, size_t n, char *out, size_t out_max) {
     return true;
 }
 
+/* The port of a Host header or of an Origin's authority (n bytes), 0 when it names none */
+static unsigned host_port(const char *h, size_t n) {
+    const char *end = h + n, *c;
+    unsigned    port = 0;
+
+    if (n && h[0] == '[') { /* [fe80::1]:8080 */
+        c = memchr(h, ']', n);
+        if (!c || ++c == end || *c != ':')
+            return 0;
+    } else if (!(c = memchr(h, ':', n))) {
+        return 0;
+    }
+    for (c++; c < end && isdigit((unsigned char)*c) && port <= 65535; c++)
+        port = port * 10 + (unsigned)(*c - '0');
+    return port;
+}
+
 /* The radio's MagicDNS short name (the first part of name= in the status file), lower case; "" when none */
 static void tailnet_name(char *out, size_t out_max) {
     char  line[256];
@@ -232,9 +269,127 @@ static void tailnet_name(char *out, size_t out_max) {
     fclose(f);
 }
 
-/* A name of the radio's own (host_name's form): an IP address, localhost, the hostname, <hostname>.local, a
- * Tailscale name (*.ts.net) or MagicDNS's short name, the names the web configurator takes (local_host_ok in
- * webserver/.../apps.py) and Pat's mailbox too (tools/pat) */
+/* A DNS name in lower case: labels of letters, digits and '-' (not first or last), the last one with a letter */
+static bool dns_name(const char *d) {
+    size_t label = 0;
+    bool   letter = false;
+
+    if (!*d || strlen(d) > 253)
+        return false;
+    for (const char *p = d;; p++) {
+        if (*p == '.' || !*p) {
+            if (!label || label > 63 || p[-1] == '-')
+                return false;
+            if (!*p)
+                return letter;
+            label = 0, letter = false;
+        } else if ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '-') {
+            if (!label && *p == '-')
+                return false;
+            letter |= *p >= 'a' && *p <= 'z';
+            label++;
+        } else {
+            return false;
+        }
+    }
+}
+
+/* A domain of the radio's network that names it: no public suffix on its own, under which anyone may register a
+ * name (x6100.nl could be anyone's). A single name only when routers keep it out of the public DNS (lan, home);
+ * no country's second level (co.uk, com.au). As the web configurator's network_domains (webserver/.../apps.py) */
+static bool domain_private(const char *d) {
+    static const char *const single[]   = {"lan", "home", "localdomain", "internal", "intranet", "corp", "private"};
+    static const char *const registry[] = {"ac", "co",  "com", "edu", "go", "gob", "gouv", "gov", "gv",
+                                           "ltd", "mil", "ne", "net", "nom", "or", "org", "plc", "sch"};
+    const char *dot = strchr(d, '.');
+
+    if (!dot) {
+        for (size_t i = 0; i < sizeof(single) / sizeof(single[0]); i++)
+            if (strcmp(d, single[i]) == 0)
+                return true;
+        return false;
+    }
+    if (!dns_name(d))
+        return false;
+    if (strchr(dot + 1, '.') || strlen(dot + 1) != 2)
+        return true;
+    for (size_t i = 0; i < sizeof(registry) / sizeof(registry[0]); i++)
+        if (strlen(registry[i]) == (size_t)(dot - d) && strncmp(d, registry[i], dot - d) == 0)
+            return false;
+    return true;
+}
+
+#define WS_NAMES_FILE_MAX 4096   /* the most read of resolv.conf and own_names.conf, in whole lines (as apps.py) */
+
+/* A small file's whole lines into buf (WS_NAMES_FILE_MAX + 1 bytes): at most WS_NAMES_FILE_MAX bytes, a line cut
+ * there left out, so no word of it is taken cut short. False when there is no file */
+static bool read_lines(const char *path, char *buf) {
+    FILE  *f = fopen(path, "r");
+    size_t n;
+
+    if (!f)
+        return false;
+    n = fread(buf, 1, WS_NAMES_FILE_MAX, f);
+    if (n == WS_NAMES_FILE_MAX && fgetc(f) != EOF) {
+        while (n && buf[n - 1] != '\n')
+            n--;
+    }
+    fclose(f);
+    buf[n] = 0;
+    return true;
+}
+
+/* The word in lower case, without a trailing dot: a domain or a name as resolv.conf and own_names.conf have them */
+static void lower_word(char *w) {
+    size_t l = 0;
+
+    for (; w[l]; l++)
+        w[l] = (char)tolower((unsigned char)w[l]);
+    if (l && w[l - 1] == '.')
+        w[l - 1] = 0;
+}
+
+/* name is <own>.<domain> for a domain the radio's network gives it (resolv.conf's search and domain lines) */
+static bool network_name(const char *name, const char *own, size_t o) {
+    char buf[WS_NAMES_FILE_MAX + 1], *lines = NULL, *line;
+
+    if (strncmp(name, own, o) != 0 || name[o] != '.' || !read_lines(WS_RESOLV_CONF, buf))
+        return false;
+    for (line = strtok_r(buf, "\n", &lines); line; line = strtok_r(NULL, "\n", &lines)) {
+        char *words = NULL, *w = strtok_r(line, " \t\r", &words);
+        if (!w || (strcmp(w, "search") != 0 && strcmp(w, "domain") != 0))
+            continue;
+        while ((w = strtok_r(NULL, " \t\r", &words))) {
+            lower_word(w);
+            if (domain_private(w) && strcmp(name + o + 1, w) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+/* name is one the owner added on the Network page (own_names.conf: a name, the first word, on each line) */
+static bool listed_name(const char *name) {
+    char buf[WS_NAMES_FILE_MAX + 1], *lines = NULL, *line;
+
+    if (!read_lines(WS_OWN_NAMES, buf))
+        return false;
+    for (line = strtok_r(buf, "\n", &lines); line; line = strtok_r(NULL, "\n", &lines)) {
+        char *words = NULL, *w = strtok_r(line, " \t\r", &words);
+        if (w && *w != '#') {
+            lower_word(w);
+            if (strcmp(name, w) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+/* A name of the radio's own (host_name's form): an IP address, localhost, the hostname, <hostname>.local,
+ * <hostname>.<domain> for a domain its network gives it, a name its owner added on the Network page, a Tailscale
+ * name (*.ts.net) or MagicDNS's short name, the names the web configurator takes (local_host_ok in
+ * webserver/.../apps.py) and Pat's mailbox too (tools/pat). The files are read at each browser's handshake: a few
+ * hundred bytes, and a page opens a socket or two */
 static bool host_local(const char *name) {
     struct in6_addr a6;
     struct in_addr  a4;
@@ -253,7 +408,11 @@ static bool host_local(const char *name) {
             return true;
         if (o && n == o + 6 && strncmp(name, own, o) == 0 && strcmp(name + o, ".local") == 0)
             return true;
+        if (o && network_name(name, own, o))
+            return true;
     }
+    if (listed_name(name))
+        return true;
     tailnet_name(tailnet, sizeof(tailnet));
     return tailnet[0] && strcmp(name, tailnet) == 0;
 }
@@ -317,6 +476,11 @@ int ws_handshake(const char *req, size_t len, char *resp, size_t resp_max, ws_pe
         char oh[256], hh[256];
         if (!host || !host_name(o, ol - (o - org), oh, sizeof(oh)) || !host_name(host, hl, hh, sizeof(hh)) ||
             strcmp(oh, hh) != 0 || !host_local(hh))
+            return -1;
+        /* ...but not from Pat's mailbox, the radio's other web server: a script that ever runs on its page
+         * (#105's review: Pat v1.0.0 put a message's attachment names into it as markup) cannot key the
+         * radio through TCI, nor open the Panel's socket */
+        if (WS_REFUSED_ORIGIN_PORT && host_port(o, ol - (o - org)) == WS_REFUSED_ORIGIN_PORT)
             return -1;
     }
     /* A Funnel name is a *.ts.net name, and passes the check above: only this header tells the

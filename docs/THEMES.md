@@ -4,7 +4,7 @@ Every colour of the GUI comes from a **role** (background, button, selected
 row, header text, OK, TX...). A theme gives each role a colour, plus a few
 shapes, the font and the waterfall palette.
 
-Built in: **RF.Guru** (default: near-black surfaces, gold for what is on, electric blue as the second accent), **Classic** (black, grey keys, IC-7300 style)
+Built in: **RF.Guru** (default: near-black surfaces, gold for what is on, electric blue as the second accent), **Classic** (black, grey keys, the look of a classic transceiver)
 **Outdoor** (light, for the sun), **Outdoor-Negative** (Outdoor with the
 lightness inverted: dark, the hues kept), **1bit** (black on one white, like a
 monochrome LCD), **KX3Lovers Plus** (amber LCD glass, see below) and, not offered in the menu, Legacy. More themes are JSON files
@@ -54,7 +54,7 @@ Every key is optional: what a file does not set comes from its `base`.
 
 | Key | Meaning |
 |---|---|
-| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor`, `Outdoor-Negative`, `1bit` or `KX3Lovers Plus` (default RF.Guru) |
+| `base` | `RF.Guru`, `Classic`, `Legacy`, `Outdoor`, `Outdoor-Negative`, `VISION`, `Black Metal`, `Total Black`, `1bit` or `KX3Lovers Plus` (default RF.Guru) |
 | `colors` | role -> `#rrggbb`, roles below |
 | `radius`, `radius_btn`, `radius_popup` | corners of the boxes (top bar, strip, windows), of the bottom buttons, of menus and panels in the apps |
 | `border` | border width of boxes and buttons (3 or more: high contrast boxes) |
@@ -69,6 +69,8 @@ Every key is optional: what a file does not set comes from its `base`.
 | `mode_box` | the mode next to the frequency in a box (`mode_bg`, `mode_border`) instead of plain text |
 | `btn_gap` | 0 to 4: more space around the bottom buttons, so rounded (pill) buttons show all their corners |
 | `rule` | an `accent` line under the top bar and on top of the active button instead of its frame (Holo) |
+| `btn_text_size` | the text on the bottom buttons, one size on every button and page, the apps' too: 16 to 36, the font's sizes (built in: 26 RF.Guru and Legacy, 28 Outdoor, Outdoor-Negative, Classic and 1bit, 24 Black Metal and Total Black). Where two lines of it do not fit the buttons' height (`btn_gap`, a taller `font`) the whole row takes a smaller size; a text too wide for its button takes the biggest smaller size it fits in. On base `VISION`, and on the walkie screen's narrow buttons, each text is fitted to its button instead |
+| `btn_caps` | that text in capitals, a unit after a number as it is (`FILTER HIGH 2950 Hz`, as Black Metal and Total Black write it) |
 
 The encoder LED shows which encoder a button's control is on (`btn_mark`,
 `btn_mark_assigned`); the control the encoder adjusts now is `btn_mark_active`

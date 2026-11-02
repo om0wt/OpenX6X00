@@ -4,6 +4,7 @@ try:
 except ImportError:   # images built before python3-zlib was selected
     zlib = None
 import base64
+import binascii
 import csv
 import fcntl
 import hashlib
@@ -41,8 +42,7 @@ POST_READS = ("/logs/export", "/api/gallery/zip")
 
 
 def host_refused():
-    msg = (f"Open this page by the radio's address, {socket.gethostname()}.local or its Tailscale name: by another "
-           "name a page from another site could do the same through your browser")
+    msg = not_own_name("by another name a page from another site could do the same through your browser")
     if bottle.request.path.startswith("/api/"):   # the pages show the msg of an API's answer
         return bottle.HTTPResponse(json.dumps({"status": "error", "msg": msg}), 403,
                                    {"Content-Type": "application/json"})
@@ -74,7 +74,12 @@ def refuse_other_sites():
     (local_host_ok) as well. Before, the Wavelog page sent the key and Files handed it out by any name (audit C08).
     A request from the internet through Tailscale Funnel is refused whatever it asks, also a page: these pages have
     no login, and a funnel made by hand (tailscale funnel 80) would hand anyone the settings, the Files page with
-    the keys, Backup restore and the updates. A Funnel name is a *.ts.net name and passed the name check (#58)"""
+    the keys, Backup restore and the updates. A Funnel name is a *.ts.net name and passed the name check (#58).
+    The page's port counts too (review of #105): Pat's mailbox is on port 8080 of the same names, opens a received
+    message's attachments there and shows the names of its files as they came, so a script in a message could run
+    on Pat's page. What such a page sends without asking first passed: a form's POST (an update bundle, an older
+    signed one too, Go back to the previous version, Upgrade, the uploads). A change sent as JSON, a PUT or a DELETE
+    the browser asks for first (CORS), which these pages never allow"""
     req = bottle.request
     if via_funnel():
         raise funnel_refused()
@@ -88,9 +93,15 @@ def refuse_other_sites():
         bottle.abort(403, "Cross-site request refused")
     origin = req.headers.get("Origin", "")
     if origin:   # "null" (a file:// page) has no host and is refused too
-        theirs = (urllib.parse.urlsplit(origin).hostname or "").lower()
-        ours = (urllib.parse.urlsplit("//" + req.headers.get("Host", "")).hostname or "").lower()
-        if not theirs or theirs != ours:
+        theirs = urllib.parse.urlsplit(origin)
+        ours = urllib.parse.urlsplit("//" + req.headers.get("Host", ""))
+        # A browser names the port in Origin, as in Host, only when it is not the scheme's own (80, 443): the radio's
+        # pages, by http, https, the tailnet or on a PC on a port of their own, send the same port in both
+        try:
+            same_port = theirs.port is None or theirs.port == ours.port
+        except ValueError:   # no port number
+            same_port = False
+        if not theirs.hostname or theirs.hostname.lower() != (ours.hostname or "").lower() or not same_port:
             bottle.abort(403, "Cross-site request refused")
 
 
@@ -153,7 +164,8 @@ CLUSTER_DEFAULT_PORT = 8000
 CLUSTER_MAX_SERVERS = 16
 CLUSTER_MAX_ALERTS = 50
 CLUSTER_MODES = ["CW", "SSB", "DIG", "AMFM"]
-CLUSTER_BANDS = [160, 80, 60, 40, 30, 20, 17, 15, 12, 10, 6]
+# The GUI's cluster bands (src/cluster/spots.c), as cluster.conf has them: the number in the name, 70 for 70 cm
+CLUSTER_BANDS = [160, 80, 60, 40, 30, 20, 17, 15, 12, 10, 8, 6, 4, 2, 70]
 CLUSTER_ACTIVITY = ["POTA", "SOTA", "WWBOTA", "HOTA"]   # the GUI's cluster_act_names
 # Written by the radio GUI: pattern|freq_hz|HH:MM of the last spot that matched
 CLUSTER_ALERTS_SEEN = "/tmp/cluster_alerts_seen"
@@ -414,9 +426,8 @@ def remote_state():
     r.update({"tci_enabled": t["enabled"], "tci_port": t["port"],
               "wss_port": settings.WSS_REMOTE_PORT, "wss_tci_port": settings.WSS_TCI_PORT})
     if not local_host_ok():   # the radio takes a page's sockets by these names only (src/tci_ws.c): say so
-        r["name_refused"] = (f"Open this page by the radio's address, {socket.gethostname()}.local or its Tailscale "
-                             "name: by another name the radio does not take its connection, as a page from another "
-                             "site could make your browser connect the same way")
+        r["name_refused"] = not_own_name("by another name the radio does not take its connection, as a page from "
+                                         "another site could make your browser connect the same way")
     ts = tailscale_status()   # Funnel on (#58): the Panel's address on the internet, for "Use away from home"
     if ts.get("state") == "running" and ts.get("funnel") == "on" and ts.get("public", "").startswith("https://"):
         r["funnel_url"] = ts["public"]
@@ -668,28 +679,169 @@ def tailscale_page():
     return bottle.template('tailscale')
 
 
+# The radio's own names (#105). Beyond its addresses, localhost, the hostname, <hostname>.local and its Tailscale
+# names: <hostname>.<domain> for each domain its network gives it (the DHCP domain and search list, which
+# NetworkManager writes to resolv.conf for the connections that are up), and the names the owner lists on the
+# Network page (a name in the owner's own DNS, a reverse proxy's). A site that points a name of its own at the radio
+# (DNS rebinding) has no page at either: the domain is the radio's own network's, the list the owner's. A domain
+# that is a public suffix on its own (nl, co.uk: anyone may register x6100.nl) does not count. The radio's sockets
+# (src/tci_ws.c) and Pat's mailbox (tools/pat, 0001) read the same two files and take the same names
+RESOLV_CONF = "/etc/resolv.conf"        # on the radio a link to NetworkManager's /run/NetworkManager/resolv.conf
+OWN_NAMES_CONF = "/mnt/own_names.conf"  # one name per line, written by the Network page
+OWN_NAMES_MAX = 8
+# Single names routers give their networks that stay out of the public DNS (lan, home and the others are never
+# delegated, internal is ICANN's for private networks): <hostname>.lan counts. Any other single name has a top-level
+# domain's shape (nl, box), and x6100.<it> could be anyone's
+PRIVATE_DOMAINS = ("lan", "home", "localdomain", "internal", "intranet", "corp", "private")
+# A country's second level, where anyone registers names (co.uk, com.au, or.jp): <one of these>.<two letters> is a
+# public suffix alone. The Public Suffix List is not on the radio: these are its common shapes
+REGISTRY_LABELS = ("ac", "co", "com", "edu", "go", "gob", "gouv", "gov", "gv", "ltd", "mil", "ne", "net", "nom", "or",
+                   "org", "plc", "sch")
+# A DNS name in lower case: labels of letters, digits and '-' (not first or last), the last one with a letter (so
+# no address in any of its forms: 10.1, 0x7f.1)
+DNS_NAME_RE = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*(?=[a-z0-9-]*[a-z])"
+                         r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+NAMES_FILE_MAX = 4096   # the most read of resolv.conf and own_names.conf, in whole lines (as src/tci_ws.c)
+file_cache = {}
+
+
+def file_lines(path):
+    """The whole lines of a small file, at most NAMES_FILE_MAX bytes (a line cut there is left out, so no word of it
+    is taken cut short), read again only when the file changed (its inode, size or time: NetworkManager and
+    replace_file put a new file in place); [] without it"""
+    try:
+        st = os.stat(path)
+        key = (st.st_ino, st.st_size, st.st_mtime_ns)
+        hit = file_cache.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
+        with open(path, "rb") as f:
+            data = f.read(NAMES_FILE_MAX)
+            if len(data) == NAMES_FILE_MAX and f.read(1):
+                data = data[:data.rfind(b"\n") + 1]
+    except OSError:
+        return []
+    lines = data.decode(errors="replace").split("\n")
+    file_cache[path] = (key, lines)
+    return lines
+
+
+def public_suffix(name):
+    """A name that is a public suffix on its own, under which anyone may register one: a top-level domain's shape
+    (a single name) or a country's second level (co.uk)"""
+    labels = name.split(".")
+    return len(labels) == 1 or (len(labels) == 2 and len(labels[1]) == 2 and labels[0] in REGISTRY_LABELS)
+
+
+def network_domains():
+    """The domains the radio's network gives it, from resolv.conf's search and domain lines, lower case: those that
+    are no public suffix alone, and the private single names (PRIVATE_DOMAINS)"""
+    found = []
+    for line in file_lines(RESOLV_CONF):
+        words = line.split()
+        if words and words[0] in ("search", "domain"):
+            for d in words[1:]:
+                d = d.lower().rstrip(".")
+                if (d in PRIVATE_DOMAINS or (DNS_NAME_RE.fullmatch(d) and not public_suffix(d))) and d not in found:
+                    found.append(d)
+    return found
+
+
+def listed_names():
+    """The names the owner added on the Network page (OWN_NAMES_CONF: a name, the first word, on each line), lower
+    case"""
+    names = []
+    for line in file_lines(OWN_NAMES_CONF):
+        words = line.split()
+        n = words[0].lower().rstrip(".") if words else ""
+        if n and not n.startswith("#") and n not in names:
+            names.append(n)
+    return names
+
+
+def own_names():
+    """The radio's own DNS names but the hostname alone and the Tailscale ones, lower case: <hostname>.local,
+    <hostname>.<domain> for the network's domains, and the listed names"""
+    name = socket.gethostname().lower()
+    names = [name + ".local"] + [f"{name}.{d}" for d in network_domains()]
+    return names + [n for n in listed_names() if n not in names]
+
+
+def request_host():
+    """The name or address the page was opened by (the Host header's), lower case, without port and trailing dot"""
+    return (urllib.parse.urlsplit("//" + (bottle.request.get_header("Host") or "")).hostname or "").rstrip(".")
+
+
 def local_host_ok():
-    """The page opened by an address or by the radio's own name. A page from another site that points its own
-    name at the radio (DNS rebinding) passes the cross-site guard: every change (refuse_other_sites), the Files
-    page and the Backup download, Tailscale's login link (which would put the radio on that site's tailnet) and
-    the list of SSH keys only by these names. Pat's mailbox on port 8080 takes the same names (tools/pat).
-    MagicDNS's short name too, which is the tailnet's name for the radio: x6200-1 while the tailnet still has the
-    machine of an earlier card image as x6200. Never a request from the internet through Tailscale Funnel: its
-    name is a *.ts.net name too (#58)"""
+    """The page opened by an address or by one of the radio's own names (own_names). A page from another site that
+    points its own name at the radio (DNS rebinding) passes the cross-site guard: every change (refuse_other_sites),
+    the Files page and the Backup download, Tailscale's login link (which would put the radio on that site's
+    tailnet) and the list of SSH keys only by these names. Pat's mailbox on port 8080 takes the same names
+    (tools/pat). MagicDNS's short name too, which is the tailnet's name for the radio: x6200-1 while the tailnet
+    still has the machine of an earlier card image as x6200. Never a request from the internet through Tailscale
+    Funnel: its name is a *.ts.net name too (#58)"""
     if via_funnel():
         return False
-    host = (urllib.parse.urlsplit("//" + (bottle.request.get_header("Host") or "")).hostname or "").rstrip(".")
+    host = request_host()
     try:
         ipaddress.ip_address(host)
         return True
     except ValueError:
         pass
-    name = socket.gethostname().lower()
-    names = {"localhost", name, name + ".local"}
+    if host in ("localhost", socket.gethostname().lower()) or host.endswith(".ts.net") or host in own_names():
+        return True
     tailnet = tailscale_status().get("name", "").lower()
-    if tailnet:
-        names.add(tailnet.split(".")[0])
-    return host in names or host.endswith(".ts.net")
+    return bool(tailnet) and host == tailnet.split(".")[0]
+
+
+def radio_address():
+    """The radio's address on the network the request came from, "" when not known (a request through a proxy on
+    the radio itself: Tailscale's, the https sockets')"""
+    peer = bottle.request.environ.get("REMOTE_ADDR", "")
+    try:
+        ip = ipaddress.ip_address(peer)
+        if ip.is_loopback:
+            return ""
+        with socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((peer, 9))   # sends nothing: the route only, and the address it leaves from
+            return s.getsockname()[0]
+    except (ValueError, OSError):
+        return ""
+
+
+def own_name_error(name):
+    """Why a name (lower case) can't be listed as one of the radio's own, "" when it can"""
+    if "*" in name:
+        return f"{name}: no wildcards, one whole name"
+    try:
+        ipaddress.ip_address(name)
+        return f"{name}: an address, and the radio's addresses count already"
+    except ValueError:
+        pass
+    if not DNS_NAME_RE.fullmatch(name):
+        return f"{name}: not a DNS name (letters, digits, '-' and dots)"
+    if public_suffix(name):
+        return f"{name}: give the whole name with its domain, as x6100.example.nl"
+    return ""
+
+
+def not_own_name(why):
+    """A refusal's text for a page opened by another name (#105): the name it was opened by, the names that work
+    (the Tailscale name only while Tailscale runs) and where to add that name if it is the owner's own. Only then:
+    a site that points a name of its own at the radio can open the radio's own pages by it, this text and all, and
+    then ask the owner to add it"""
+    host = request_host()
+    addr = radio_address()
+    works = [f"its address ({addr})" if addr else "its address"] + own_names()
+    ts = tailscale_status()
+    if ts.get("state") == "running":
+        works.append(f"its Tailscale name ({ts['name'].lower()})" if ts.get("name") else "its Tailscale name")
+    text = (f"This page was opened as {host}, which is not one of the radio's own names" if host else
+            "This page was opened without a name") + f": {why}. Open it by {', '.join(works[:-1])} or {works[-1]}"
+    if host and not own_name_error(host):
+        text += (f". If {host} is a name your own DNS server or reverse proxy gives the radio, add it to Other "
+                 "names on System > Network, opened by one of those: never a name a web site or a message asks for")
+    return text
 
 
 @app.get('/api/tailscale')
@@ -783,6 +935,9 @@ def winlink_state():
               radio_mycall=max(read_callsign().upper().split("/"), key=len),   # ON6URE of ON6URE/P
               radio_locator=read_param("qth"), installed=all(os.access(p, os.X_OK) for p in WINLINK_PROGRAMS),
               host_ok=local_host_ok(), port=WINLINK_PORT, radio=winlink_radio())
+    if not st["host_ok"]:   # the page's note: which names work, and where another one is added (#105)
+        st["name_refused"] = not_own_name("by another name a page from another site could change Winlink through "
+                                          "your browser, and the mailbox opens only by the radio's own names too")
     return st
 
 
@@ -1054,8 +1209,8 @@ def ssh_write(lines):
 def ssh_request():
     """The request's JSON object, or the error to answer with: also for a page opened by another site's name"""
     if not local_host_ok():
-        return None, api_error(403, f"Open this page by the radio's address or {socket.gethostname()}.local "
-                                    "to see or change the SSH keys")
+        return None, api_error(403, not_own_name("by another name a page from another site could add a key "
+                                                 "through your browser, so the keys are not shown or changed"))
     try:
         data = bottle.request.json if bottle.request.method != "GET" else {}
     except ValueError:
@@ -1158,7 +1313,7 @@ def set_tci():
 
 field_lock = threading.Lock()
 field_update = {"running": False, "result": ""}
-field_refs_counts = (None, {})   # (mtime, size), {"P": parks, "S": summits, "B": bunkers, "H": HOTA, "F": WWFF, "T": towers, "C": castles, "M": mills, "L": lights}
+field_refs_counts = (None, {})   # (mtime, size), {"P": parks, "S": summits, "B": bunkers, "H": HOTA, "F": WWFF, "T": towers, "C": castles, "M": mills, "L": lights, "K": lakes}
 
 
 def field_path(*names):
@@ -1242,7 +1397,7 @@ def field_refs():
     return {"date": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)), "size": fmt_size(st.st_size),
             "parks": c.get(b"P", 0), "summits": c.get(b"S", 0), "bunkers": c.get(b"B", 0), "hota": c.get(b"H", 0),
             "wwff": c.get(b"F", 0), "towers": c.get(b"T", 0), "castles": c.get(b"C", 0), "mills": c.get(b"M", 0),
-            "lights": c.get(b"L", 0)}
+            "lights": c.get(b"L", 0), "lakes": c.get(b"K", 0)}
 
 
 def field_logs():
@@ -1616,14 +1771,14 @@ SOTA_REF = r'[A-Z0-9]{1,4}/[A-Z]{2}-[0-9]{3}'     # I/LO-123 ([0-9]: \d takes an
 POTA_REF = r'[A-Z0-9]{1,4}-[0-9]{4,5}'            # IT-1234
 # The ADIF SIG of each programme but SOTA (SOTA_REF), by the letter ref_prog gives
 REF_SIG = {"P": "POTA", "B": "WWBOTA", "H": "HOTA", "F": "WWFF", "T": "TOTA", "C": "WCA", "M": "MOTA", "L": "ARLHS",
-           "G": "TILES"}
+           "G": "TILES", "K": "LLOTA"}
 TILE = r'[A-R]{2}[0-9]{2}[A-X]{2}'                # a Tiles tile, JO20ab (the references come here in capitals)
 
 
 def ref_prog(ref):
     """The programme of a reference by its shape, as the radio tells it (src/field/flog.c field_ref_prog): S SOTA,
-    P POTA, B WWBOTA, H HOTA, F WWFF, T TOTA, C WCA, M MOTA, L a lighthouse (BEL 002), G a Tiles tile (JO20ab); ""
-    when it is none of them"""
+    P POTA, B WWBOTA, H HOTA, F WWFF, T TOTA, C WCA, M MOTA, L a lighthouse (BEL 002), G a Tiles tile (JO20ab),
+    K an LLOTA lake (LLPL-0001); "" when it is none of them"""
     if re.fullmatch(r'X[0-9]{5}', ref):                                # X42018
         return "M"
     if re.fullmatch(TILE, ref.upper()):                                # JO20ab
@@ -1641,6 +1796,8 @@ def ref_prog(ref):
         return "H"
     if len(pre) >= 3 and pre.endswith("FF"):                           # DLFF-0123
         return "F"
+    if re.fullmatch(r'LL[A-Z]{2}-[0-9]{4,5}', ref):                    # LLPL-0001, before the towers (LLAR-0001)
+        return "K"
     if 3 <= len(pre) <= 5 and pre.endswith("R") and re.fullmatch(r'[0-9]{4}', num):  # OKR-0150
         return "T"
     if 1 <= len(pre) <= 3 and re.fullmatch(r'[0-9]{5}', num) and (num[0] == "0" or pre == "I"):   # DL-01156
@@ -1818,7 +1975,7 @@ def get_logs():
     for log in field_logs():
         for n, rec in enumerate(log_records(log["name"])):
             q = adif_fields(rec)
-            if q.get("submode"):   # MFSK with SUBMODE FT4, JS8, FT2: the submode names it
+            if q.get("submode"):   # MFSK with SUBMODE FT4, JS8, FT2, JTTY, PSK with PSK31: the submode names it
                 q["mode"] = q["submode"]
             qsos.append(dict(q, file=log["name"], n=n, id=rec_id(rec)))
     return {"qsos": qsos, "active": field_active_log()}
@@ -1831,8 +1988,10 @@ LOG_FIELDS = {"call": r'[A-Z0-9/]{3,15}', "qso_date": r'\d{8}', "time_on": r'\d{
               "qth": r'[^<>]{0,40}', "gridsquare": r'([A-R]{2}\d{2}([A-X]{2})?)?', "comment": r'[^<>]{0,80}',
               "sota_ref": r'(%s)?' % SOTA_REF, "pota_ref": r'(%s)?' % POTA_REF,
               "ref": r'[A-Z0-9/ -]{0,15}'}   # the other station's reference, any programme (BEL 002): set_ref
-# The modes ADIF files as a SUBMODE of MFSK (the radio logs FT4, JS8 and FT2 that way)
-SUBMODE_OF = {"FT4": "MFSK", "JS8": "MFSK", "FT2": "MFSK", "FST4": "MFSK", "FST4W": "MFSK", "Q65": "MFSK", "MSK144": "MFSK"}
+# The modes ADIF files as a SUBMODE (the radio logs FT4, JS8, FT2 and JTTY under MFSK, PSK31 and PSK63 under PSK).
+# MSK144 is a MODE of its own in ADIF, as FT8 is
+SUBMODE_OF = {"FT4": "MFSK", "JS8": "MFSK", "FT2": "MFSK", "JTTY": "MFSK", "FST4": "MFSK", "FST4W": "MFSK",
+              "Q65": "MFSK", "PSK31": "PSK", "PSK63": "PSK"}
 
 
 def log_unchanged(q, k, v):
@@ -1909,7 +2068,8 @@ def export_logs():
     recs = [rec for name in sorted(want) for rec in log_records(name) if rec_id(rec) in want[name]]
     stamp = time.strftime("%Y%m%d-%H%M")
     if bottle.request.forms.get("fmt") == "csv":
-        cols = ["qso_date", "time_on", "call", "band", "freq", "mode", "rst_sent", "rst_rcvd", "name", "qth",
+        # SUBMODE beside MODE: PSK31 and PSK63 are both MODE PSK, FT4, JS8 and JTTY all MFSK
+        cols = ["qso_date", "time_on", "call", "band", "freq", "mode", "submode", "rst_sent", "rst_rcvd", "name", "qth",
                 "gridsquare", "sota_ref", "pota_ref", "sig", "sig_info", "my_sota_ref", "my_pota_ref", "my_sig",
                 "my_sig_info", "comment"]
         out = io.StringIO()
@@ -1920,12 +2080,70 @@ def export_logs():
             w.writerow([f.get(c, "") for c in cols])
         body, ext, mime = out.getvalue(), "csv", "text/csv"
     else:
-        body = b"OpenX6X00 log export\n<adif_ver:5>3.1.4 <programid:9>OpenX6X00 <eoh>\n" + \
+        body = b"OpenX6X00 log export\n<adif_ver:5>3.1.8 <programid:9>OpenX6X00 <eoh>\n" + \
                b"".join(rec.strip() + b" <eor>\n" for rec in recs)   # the records' bytes: their lengths hold
         ext, mime = "adi", "text/plain"
     bottle.response.content_type = mime + "; charset=utf-8"
     bottle.response.set_header("Content-Disposition", f'attachment; filename="x6100-log-{stamp}.{ext}"')
     return body
+
+
+# The keyboard modes' text log (src/digi_textlog.c, #55): <TEXTLOG_DIR>/YYYY-MM-DD.txt, a line for each line PSK31,
+# PSK63, Olivia and JTTY received or sent and RTTY received, one file a UTC day; the GUI keeps the folder within the
+# size limit of Settings > General > TEXT LOG. Listed on the Logs page, read in the browser, downloaded, deleted.
+TEXTLOG_NAME = re.compile(r"\d{4}-\d{2}-\d{2}\.txt")
+
+
+def textlog_files():
+    try:
+        names = os.listdir(settings.TEXTLOG_DIR)
+    except OSError:
+        return []
+    files = []
+    for name in names:
+        path = os.path.join(settings.TEXTLOG_DIR, name)
+        try:   # the GUI may delete the oldest day (the size limit) while the list is made
+            if not TEXTLOG_NAME.fullmatch(name) or not os.path.isfile(path):
+                continue
+            n = os.stat(path).st_size
+        except OSError:
+            continue
+        files.append({"name": name, "day": name[:10], "bytes": n, "size": fmt_size(n)})
+    return sorted(files, key=lambda f: f["name"], reverse=True)
+
+
+@app.get('/api/textlog')
+def get_textlog():
+    files = textlog_files()
+    return {"files": files, "total": fmt_size(sum(f["bytes"] for f in files))}
+
+
+@app.get('/textlog/<name>')
+def textlog_file(name):
+    """A day's text in the browser, or with ?dl=1 as a download. Plain text that is never sniffed into a page: the
+    text is what came over the air, and anyone on the band can send "<script>". Never kept by the browser either
+    (as Files and the Gallery): today's file grows, and a copy the browser took for fresh by its age (it has a
+    Last-Modified and no Cache-Control) would be shown again without the lines that came since"""
+    if not TEXTLOG_NAME.fullmatch(name):
+        raise bottle.HTTPError(404, "Not found")
+    r = bottle.static_file(name, root=settings.TEXTLOG_DIR, mimetype="text/plain",
+                           download=name if bottle.request.query.get("dl") else False)
+    r.set_header("X-Content-Type-Options", "nosniff")
+    r.set_header("Cache-Control", "private, no-cache, no-store")
+    return r
+
+
+@app.delete('/api/textlog/<name>')
+def delete_textlog(name):
+    if not TEXTLOG_NAME.fullmatch(name):
+        return api_error(400, "Not a day of the text log")
+    try:
+        os.remove(os.path.join(settings.TEXTLOG_DIR, name))
+    except FileNotFoundError:
+        return api_error(404, "Not found")
+    except OSError as e:
+        return api_error(500, f"Can't delete: {e}")
+    return get_textlog()
 
 
 # The GUI's local configurator socket (src/cfg_socket.cpp): one JSON object per line, one answer line
@@ -2096,6 +2314,124 @@ def display_set():
     return {"status": "OK"}
 
 
+# Boot picture (#101): the owner's own picture for the start, on the Display page. Kept on the DATA partition
+# (settings.BOOT_PICTURE), which updates leave as it is; bootanim/bootanim.c shows it in place of ours, and ours when
+# it can't read it. Checked here before it is kept, so the start doesn't fall back to ours unexplained
+
+BOOT_PICTURE_MAX = 2 * 1024 * 1024
+BOOT_PICTURE_SIZE = (800, 480)   # the screen, landscape (W and H in bootanim.c)
+PNG_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}   # colour type: bit depths
+# The radio's libpng (1.6.39) reads the picture at boot as root, with its simplified API. A boot picture needs
+# none of these, and each is a way to make that libpng write or read out of bounds, or allocate far past the file:
+# an interlaced picture decoded to 8 bits a channel (a heap overflow before 1.6.51), a palette with transparency
+# (an out-of-bounds read before 1.6.52), and the chunks that carry compressed text or a colour profile (a 2 MB
+# file of them unpacks to more than a gigabyte). zTXt/iTXt/iCCP are kept to a handful: a photo has one or two
+PNG_COMPRESSED_CHUNKS = (b"zTXt", b"iTXt", b"iCCP")
+BOOT_PICTURE_MAX_COMPRESSED_CHUNKS = 4
+
+
+def boot_picture_error(data):
+    """Why data is no picture the radio can start with, None when it is one: a PNG of the screen's size, every
+    chunk whole with its checksum up to IEND (an upload cut short, a damaged file), and none of the shapes that
+    the radio's libpng mishandles at boot (interlaced, a palette with transparency, a wall of compressed chunks).
+    The size cap is the caller's"""
+    if len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "Not a PNG picture"
+    if data[8:16] != b"\0\0\0\x0dIHDR":
+        return "Not a PNG picture: its header is missing"
+    w, h = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if (w, h) != BOOT_PICTURE_SIZE:
+        return f"The picture is {w}x{h} pixels: the radio needs 800x480, the screen's size"
+    depth, colour, compression, filtering, interlace = data[24:29]
+    if depth not in PNG_DEPTHS.get(colour, ()) or compression or filtering:
+        return "Not a PNG picture the radio can read: an unknown kind of PNG"
+    if interlace:
+        return "The picture is interlaced: save it without interlacing (Adam7 off)"
+    at, kinds, compressed = 8, set(), 0
+    while b"IEND" not in kinds:
+        n = int.from_bytes(data[at:at + 4], "big")
+        if at + 12 + n > len(data):
+            return "The file is cut short: upload it again"
+        if binascii.crc32(data[at + 4:at + 8 + n]) != int.from_bytes(data[at + 8 + n:at + 12 + n], "big"):
+            return "The file is damaged: a checksum in it is wrong"
+        kind = data[at + 4:at + 8]
+        kinds.add(kind)
+        compressed += kind in PNG_COMPRESSED_CHUNKS
+        at += 12 + n
+    if b"IDAT" not in kinds:
+        return "Not a PNG picture: it has no picture data"
+    if compressed > BOOT_PICTURE_MAX_COMPRESSED_CHUNKS:
+        return "The picture carries too much embedded text or colour-profile data: save a plain PNG"
+    if colour == 3 and b"tRNS" in kinds:
+        return "The picture is a palette with transparency: save it as a plain RGB or RGBA PNG"
+    return None
+
+
+def boot_picture_state():
+    """own: a picture of the owner's is kept, with its size, date and why the radio can't show it ("": it can)"""
+    try:
+        with open(settings.BOOT_PICTURE, "rb") as f:
+            data = f.read(BOOT_PICTURE_MAX + 1)
+            when = os.fstat(f.fileno()).st_mtime
+    except FileNotFoundError:
+        return {"own": False}
+    except OSError as e:
+        return {"own": True, "size": "", "date": "", "error": f"It can't be read: {e.strerror}"}
+    whole = len(data) <= BOOT_PICTURE_MAX   # one over 2 MB put there by hand is not checked
+    return {"own": True, "size": fmt_size(len(data)) if whole else "over 2 MB",
+            "date": datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M"),
+            "error": (boot_picture_error(data) or "") if whole else ""}
+
+
+@app.get('/api/boot_picture')
+def get_boot_picture():
+    return boot_picture_state()
+
+
+@app.get('/api/boot_picture/png')
+def boot_picture_png():
+    """The picture on the Display page: the owner's when there is one, else ours"""
+    path = settings.BOOT_PICTURE if os.path.isfile(settings.BOOT_PICTURE) else settings.BOOT_PICTURE_BUILTIN
+    response = bottle.static_file(os.path.basename(path), root=os.path.dirname(path), mimetype="image/png")
+    response.set_header("Cache-Control", "private, no-cache, no-store")
+    return response
+
+
+@app.post('/api/boot_picture')
+def set_boot_picture():
+    """A PNG (multipart field "file") kept as the own boot picture, once boot_picture_error finds nothing"""
+    if bottle.request.content_length > BOOT_PICTURE_MAX + 65536:
+        return api_error(413, "Larger than 2 MB")
+    upload = bottle.request.files.get("file")
+    if upload is None:
+        return api_error(400, "No file")
+    data = upload.file.read(BOOT_PICTURE_MAX + 1)
+    if len(data) > BOOT_PICTURE_MAX:
+        return api_error(413, "Larger than 2 MB")
+    err = boot_picture_error(data)
+    if err:
+        return api_error(400, err)
+    try:
+        replace_file(settings.BOOT_PICTURE, lambda f: f.buffer.write(data))   # bytes, through the text file's buffer
+        os.sync()   # the radio is often switched off at once, to see the picture
+    except OSError as e:
+        return api_error(500, f"Can't save the picture: {e}")
+    return dict(boot_picture_state(), status="OK")
+
+
+@app.delete('/api/boot_picture')
+def delete_boot_picture():
+    """Default: the own picture removed, the radio starts with ours again"""
+    try:
+        os.remove(settings.BOOT_PICTURE)
+        os.sync()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return api_error(500, f"Can't remove the picture: {e}")
+    return dict(boot_picture_state(), status="OK")
+
+
 # Ethernet: the USB adapter's address, as Settings > Wireless > Ethernet. Read and applied through the
 # GUI socket (eth_get / eth_set, src/cfg_socket.cpp); the GUI checks the values as its own page does
 
@@ -2141,6 +2477,61 @@ def hostname_set():
     if r.returncode != 0:
         return api_error(409, r.stderr.strip() or "Name not set")
     return hostname_state()
+
+
+# The radio's own names (#105, local_host_ok): the ones it has from its network, and the ones its owner adds. Not in
+# the Backup, as the network name is not: they are this radio's names on this network, and a second radio that took
+# them from a backup would answer to the first one's
+OWN_NAMES_REFUSED = ("by another name a page from another site could add its own name here through your browser, so "
+                     "this list changes only by one of the radio's own names")
+
+
+def own_names_state():
+    name = socket.gethostname().lower()
+    st = {"names": [name + ".local"] + [f"{name}.{d}" for d in network_domains()], "listed": listed_names(),
+          "max": OWN_NAMES_MAX, "host": request_host(), "host_ok": local_host_ok(), "address": radio_address()}
+    ts = tailscale_status()
+    if ts.get("state") == "running" and ts.get("name"):
+        st["tailscale"] = ts["name"].lower()
+    if not st["host_ok"]:
+        st["refused"] = not_own_name(OWN_NAMES_REFUSED)
+    return st
+
+
+@app.get('/api/own_names')
+def own_names_get():
+    return own_names_state()
+
+
+@app.post('/api/own_names')
+def own_names_set():
+    """The list replaced whole. Only by one of the radio's own names, which refuse_other_sites asks of every change
+    already: a page from another site must never add the name it reached the radio by"""
+    if not local_host_ok():
+        return api_error(403, not_own_name(OWN_NAMES_REFUSED))
+    try:
+        data = bottle.request.json
+    except ValueError:
+        data = None
+    names = data.get("names") if isinstance(data, dict) else None
+    if not isinstance(names, list) or len(names) > 4 * OWN_NAMES_MAX or not all(isinstance(n, str) for n in names):
+        return api_error(400, "Invalid list")
+    clean = []
+    for n in names:
+        n = n.strip().lower().rstrip(".")
+        if n and n not in clean:
+            err = own_name_error(n)
+            if err:
+                return api_error(400, err)
+            clean.append(n)
+    if len(clean) > OWN_NAMES_MAX:
+        return api_error(400, f"Up to {OWN_NAMES_MAX} names")
+    try:
+        replace_file(OWN_NAMES_CONF, lambda f: f.write("".join(n + "\n" for n in clean)))
+    except OSError as e:
+        return api_error(503, f"Can't save the names: {e}")
+    file_cache.pop(OWN_NAMES_CONF, None)   # FAT's times are 2 s apart: read anew whatever the file's
+    return own_names_state()
 
 
 @app.get('/api/network')
@@ -2561,11 +2952,12 @@ def cluster_alert_input(data):
     if not isinstance(bands, list):
         return None, cluster_error(400, "Invalid bands")
     try:
-        bands = sorted({int(b) for b in bands}, reverse=True)
+        bands = {int(b) for b in bands}
     except (TypeError, ValueError):
         return None, cluster_error(400, "Invalid bands")
     if any(b not in CLUSTER_BANDS for b in bands):
         return None, cluster_error(400, "Invalid bands")
+    bands = [b for b in CLUSTER_BANDS if b in bands]   # 20,17 as before; 2,70 (70 cm) after 6
     mode = str(data.get("mode", "")).strip().upper()
     if mode not in ("", "CW", "SSB", "DIG"):
         return None, cluster_error(400, "Invalid mode")
@@ -2925,7 +3317,7 @@ def upload_tx_pic(kind):
 
 BACKUP_MAX_BYTES = 50 * 1024 * 1024   # upload size and total unpacked size
 BACKUP_MAX_MEMBERS = 200
-BACKUP_TEXT_MAX = 1024 * 1024         # any member that is not a .db or .mp3
+BACKUP_TEXT_MAX = 1024 * 1024         # any member that is not a .db, an .mp3 or the boot picture (BOOT_PICTURE_MAX)
 BACKUP_NAME = r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}"
 BACKUP_DIRS = (("voice", "msg/", re.compile("msg/" + BACKUP_NAME + r"\.mp3")),
                ("wifi", "wifi/", re.compile("wifi/" + BACKUP_NAME + r"\.nmconnection")))
@@ -2947,7 +3339,8 @@ def backup_files():
             "cluster.conf": ("cluster", settings.CLUSTER_CONF),
             "tci.conf": ("tci", settings.TCI_CONF),
             "qso_log.db": ("qso", settings.QSO_LOG_DB),
-            "cw_trainer.json": ("cw", settings.CW_TRAINER_FILE)}
+            "cw_trainer.json": ("cw", settings.CW_TRAINER_FILE),
+            "bootlogo.png": ("bootpic", settings.BOOT_PICTURE)}
 
 
 def backup_member(name):
@@ -3042,6 +3435,8 @@ def describe_backup(files, date=None):
         wifi = [n for n in files if n.startswith("wifi/")]
         if wifi:
             out["wifi"] = plural(len(wifi), "network")
+        if "bootlogo.png" in files:
+            out["bootpic"] = "your own, " + fmt_size(os.path.getsize(files["bootlogo.png"]))
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         pass   # a part that can't be read just has no summary
     return out
@@ -3082,6 +3477,11 @@ def check_member(name, path):
         elif name == "cw_trainer.json":
             with open(path) as f:
                 json.load(f)
+        elif name == "bootlogo.png":   # as the Display page takes one: else the radio would start with ours
+            with open(path, "rb") as f:
+                why = boot_picture_error(f.read(BOOT_PICTURE_MAX + 1))
+            if why:
+                raise BackupError(f"The boot picture in the file: {why}")
         elif name.endswith((".conf", ".nmconnection")):
             with open(path, "rb") as f:
                 data = f.read()
@@ -3108,7 +3508,8 @@ def unpack_backup(archive, stage):
                 if m.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or m.name in seen:
                     raise BackupError(f"Unexpected item in the file: {m.name[:60]!r}")
                 total += m.size
-                if total > BACKUP_MAX_BYTES or (m.size > BACKUP_TEXT_MAX and not m.name.endswith((".db", ".mp3"))):
+                limit = BOOT_PICTURE_MAX if m.name == "bootlogo.png" else BACKUP_TEXT_MAX
+                if total > BACKUP_MAX_BYTES or (m.size > limit and not m.name.endswith((".db", ".mp3"))):
                     raise BackupError("The file is too large")
                 seen.add(m.name)
                 dst = os.path.join(stage, m.name)

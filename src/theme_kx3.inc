@@ -56,7 +56,7 @@ bool theme_kx3_use(int b) {
     theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
     theme_set(plus, sizeof(plus) / sizeof(plus[0]));
     theme_shape = (theme_shape_t){.border = 1, .focus_solid = true, .font = FONT_RCOND, .deck = true,
-                                  .mono_cluster = true,
+                                  .mono_cluster = true, .btn_text_size = 24,
                                   /* the glass to the ink */
                                   .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
                                   .waterfall_n = 5};

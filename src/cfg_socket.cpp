@@ -56,6 +56,8 @@ static const struct {
     int32_t             min, max;
 } disp_ints[] = {
     {"wf_mode", &cfg_sm.p_wf_mode, 0, 1},
+    {"wf_fixed_jump", &cfg_sm.p_wf_fixed_jump, 0, 2},  /* Fixed mode: live, waterfall_view.c reads them */
+    {"wf_fixed_after", &cfg_sm.p_wf_fixed_after, 0, 2},
     {"auto_level", &cfg_sm.p_auto_level_enabled, 0, 1},
     {"wf_speed", &cfg_sm.p_waterfall_speed, 1, 5},
     {"band_plan", &cfg_sm.p_band_plan, 0, 1},
@@ -84,6 +86,7 @@ static const struct {
     {"band_region", &cfg_sm.p_band_region, 0, BP_PLAN_COUNT - 1},  /* Station: the band plan; live, screen_main.c */
     {"birdie_marks", &cfg_sm.p_birdie_marks, 0, 2},     /* Main screen: Birdie Cal's carriers */
     {"zoom_step_per_mode", &cfg_sm.p_zoom_step_per_mode, 0, 1},   /* Main screen: live, zoom_step_scope follows it */
+    {"power_display", &cfg_sm.p_power_display, 0, 3},  /* Main screen: live, clock.c reads it */
 #ifdef BOARD_X6200
     {"wr12", &cfg_sm.p_wr12, 0, 1},                     /* live: screen_main.c follows it; the X6100 has no row */
 #endif

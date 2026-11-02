@@ -49,6 +49,7 @@
 #include "theme.h"
 #include "params/params.h"
 #include "pskreporter.h"
+#include "digi_textlog.h"       /* the text on the card (#55) */
 #include "station.h"
 #include "main.h"
 
@@ -218,12 +219,12 @@ static void macro_hold(int idx);
 
 static char macro_labels[OLIVIA_MACRO_MAX][OLIVIA_MACRO_NAME_LEN + 2];
 
-static buttons_page_t page_1, page_2, page_3, page_4, page_5;
+static buttons_page_t page_1, page_2, page_3, page_4, page_5, page_6;
 
 static button_data_t btn_p1 = {
-    .type = BTN_TEXT, .label = "(OLV 1:5)",
+    .type = BTN_TEXT, .label = "(OLV 1:6)",
     .press = button_next_page_cb, .hold = button_prev_page_cb,
-    .next = &page_2, .prev = &page_5,
+    .next = &page_2, .prev = &page_6,
 };
 static button_data_t btn_text = {
     .type = BTN_TEXT, .label = "Free\nText", .press = text_press_cb,
@@ -241,7 +242,7 @@ static button_data_t btn_status = {
 };
 
 static button_data_t btn_p2 = {
-    .type = BTN_TEXT, .label = "(OLV 2:5)",
+    .type = BTN_TEXT, .label = "(OLV 2:6)",
     .press = button_next_page_cb, .hold = button_prev_page_cb,
     .next = &page_3, .prev = &page_1,
 };
@@ -298,19 +299,25 @@ static button_data_t *const macro_btns[OLIVIA_MACRO_MAX] = {
 };
 
 static button_data_t btn_p3 = {
-    .type = BTN_TEXT, .label = "(OLV 3:5)",
+    .type = BTN_TEXT, .label = "(OLV 3:6)",
     .press = button_next_page_cb, .hold = button_prev_page_cb,
     .next = &page_4, .prev = &page_2,
 };
 static button_data_t btn_p4 = {
-    .type = BTN_TEXT, .label = "(OLV 4:5)",
+    .type = BTN_TEXT, .label = "(OLV 4:6)",
     .press = button_next_page_cb, .hold = button_prev_page_cb,
     .next = &page_5, .prev = &page_3,
 };
 static button_data_t btn_p5 = {
-    .type = BTN_TEXT, .label = "(OLV 5:5)",
+    .type = BTN_TEXT, .label = "(OLV 5:6)",
     .press = button_next_page_cb, .hold = button_prev_page_cb,
-    .next = &page_1, .prev = &page_4,
+    .next = &page_6, .prev = &page_4,
+};
+/* TUNE for an external tuner, on the centre chosen for TX (ext_tune.h) */
+static button_data_t btn_p6 = {
+    .type = BTN_TEXT, .label = "(OLV 6:6)",
+    .press = button_next_page_cb, .hold = button_prev_page_cb,
+    .next = &page_1, .prev = &page_5,
 };
 
 static buttons_page_t page_1 = {
@@ -327,6 +334,9 @@ static buttons_page_t page_4 = {
 };
 static buttons_page_t page_5 = {
     {&btn_p5, &btn_macro8, &btn_macro9, &btn_macro10, &btn_macro11}
+};
+static buttons_page_t page_6 = {
+    {&btn_p6, &btn_ext_tune}
 };
 
 static dialog_t dialog = {
@@ -476,6 +486,20 @@ static void text_timer_cb(lv_timer_t *t)
     }
 }
 
+/* The text log's mode and frequency: OLIVIA-8/250, the dial and the audio centre */
+static const char *log_mode(void)
+{
+    static char buf[24];
+
+    snprintf(buf, sizeof(buf), "OLIVIA-%s", olivia_tx_mode_name(olivia_tx_get_mode()));
+    return buf;
+}
+
+static uint32_t sig_freq(void)
+{
+    return (uint32_t)cparam_i_get(cfg_fg_freq) + olivia_tx_get_center();
+}
+
 /* UI thread: one decoded block, at most 8 characters. */
 static void rx_text_ui(void *data)
 {
@@ -484,6 +508,7 @@ static void rx_text_ui(void *data)
 
     if (!alive)
         return;
+    digi_textlog_rx(log_mode(), sig_freq(), DIGI_TEXTLOG_SIG_Q, olivia_app_quality(), s);
 
     snprintf(before, sizeof(before), "%s", digi_qso_dx());
 
@@ -514,6 +539,7 @@ static void tx_echo_cb(const char *text)
 
     if (!alive || !text)
         return;
+    digi_textlog_tx(log_mode(), sig_freq(), text);
 
     /* The line breaks sent around every transmission are for the other
      * station's screen; here each transmission gets its own line. */
@@ -1524,6 +1550,7 @@ static void destruct_cb(void)
     olivia_app_set_text_cb(NULL);
     olivia_app_set_audio_tap(NULL);
     olivia_tx_set_echo_cb(NULL);
+    digi_textlog_end();
 
     pthread_mutex_lock(&spec_mux);
     if (spec_ok)
