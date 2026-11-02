@@ -1,13 +1,12 @@
 /*
  *  SPDX-License-Identifier: LGPL-2.1-or-later
  *
- *  KX3Lovers Plus: the radio's state on amber glass, laid out as the LCD drawn in Elecraft's KX3
- *  owner's manual (Rev C5, page 8): the bar graph with its scales, CWT and the filter graphic on the
- *  left, VFO A in seven segments, the icons and VFO B in fourteen segments under it, the VFO and mode
- *  icons on the right; what is lit shows, the unlit digit segments as a faint outline. The manual's
- *  drawing (1248 x 313 units) is stretched a little to fill the top of the screen. Under it, what the
- *  KX3 has not: a spectrum strip (the spectrum itself, screen_main.c; in CW the decoded text beside
- *  it), power, IF, the time and the voltage.
+ *  Amber Trey: the radio's state on an amber segment LCD: the bar graph with its scales, CWT and
+ *  the filter graphic on the left, VFO A in seven segments, the icons and VFO B in fourteen
+ *  segments under it, the VFO and mode icons on the right; what is lit shows, the unlit digit
+ *  segments as a faint outline. The layout (drawn in 1248 x 313 units) is stretched a little to fill
+ *  the top of the screen. Under it, a spectrum strip (the spectrum itself, screen_main.c; in CW the
+ *  decoded text beside it), power, IF, the time and the voltage.
  *
  *  Copyright (c) 2026 Pavol Calfa OM0WT
  */
@@ -65,19 +64,19 @@ static lcd_state_t shown;
 
 enum { I_VOX, I_ATU, I_RIT, I_XIT, I_SPLT, I_ATT, I_PRE, I_NB, I_NR, I_NTCH };
 
-/* Units to pixels: the manual's drawing for the KX3 part, 1:1 for what is under it */
+/* Units to pixels: the layout's units for the segment LCD, 1:1 for what is under it */
 #define ART_W   1248
 #define ART_H   313
-#define KX_X    (800.0f / ART_W)
-#define KX_Y    ((float)LCD_PLUS_LCD_H / ART_H)
-static float kx = 1, ky = 1;
+#define ART_SX    (800.0f / ART_W)
+#define ART_SY    ((float)LCD_PLUS_LCD_H / ART_H)
+static float sx = 1, sy = 1;
 
 static lv_coord_t UX(float v) {
-    return lroundf(v * kx);
+    return lroundf(v * sx);
 }
 
 static lv_coord_t UY(float v) {
-    return lroundf(v * ky);
+    return lroundf(v * sy);
 }
 
 static lv_color_t ink(bool lit) {
@@ -93,12 +92,12 @@ static int text(int x, int y, const char *s, bool lit, const lv_font_t *font) {
     dsc.font  = font;
     dsc.color = ink(lit);
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    if (!lit) return x + lroundf(size.x / kx);
+    if (!lit) return x + lroundf(size.x / sx);
     lv_area_t a = {.x1 = ox + UX(x), .y1 = oy + UY(y) - size.y / 2};
     a.x2 = a.x1 + size.x;
     a.y2 = a.y1 + size.y;
     lv_draw_label(ctx, &dsc, &a, s, NULL);
-    return x + lroundf(size.x / kx);
+    return x + lroundf(size.x / sx);
 }
 
 /* Centred on x */
@@ -106,7 +105,7 @@ static void text_c(int x, int y, const char *s, bool lit, const lv_font_t *font)
     lv_point_t size;
 
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    text(x - lroundf(size.x / (2 * kx)), y, s, lit, font);
+    text(x - lroundf(size.x / (2 * sx)), y, s, lit, font);
 }
 
 /* Ending at x */
@@ -114,7 +113,7 @@ static int text_r(int x, int y, const char *s, bool lit, const lv_font_t *font) 
     lv_point_t size;
 
     lv_txt_get_size(&size, s, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    x -= lroundf(size.x / kx);
+    x -= lroundf(size.x / sx);
     text(x, y, s, lit, font);
     return x;
 }
@@ -193,8 +192,8 @@ typedef struct {
     int  dw_pct;        /* the digit's width, % of its place */
     int  thick;         /* the stroke: the digit's width / thick */
     int  lean_pct;      /* the top this % of the height to the right */
-    bool outline;       /* the unlit segments as a faint outline (Plus) */
-    bool one_point;     /* only the decimal point, before the 10 Hz (Plus); else after MHz and kHz */
+    bool outline;       /* the unlit segments as a faint outline (Amber Trey) */
+    bool one_point;     /* only the decimal point, before the 10 Hz (Amber Trey); else after MHz and kHz */
 } seg_style_t;
 
 static const seg_style_t *style;    /* the display being drawn */
@@ -349,7 +348,7 @@ static void digits(int x1, int x2, int y1, int y2, const char cells[9], bool fou
 }
 
 /* The bar graph: 20 bars, S1..S9 on the first 9, +20..+60 on the other 11; in TX SWR on the first 7,
- * RF on the last 11. CWT (the KX3's CW tuning aid, on with the tuning setting in CW): the S-meter
+ * RF on the last 11. CWT (a CW tuning aid, on with the tuning setting in CW): the S-meter
  * keeps the first 9, the other 11 show the tone's offset from the pitch, zero beat in their middle
  * under the mark, a bar 10 Hz (as cw_tune_view: a lower tone to the right) */
 #define BARS        20
@@ -531,20 +530,20 @@ static void plus_cw(const lcd_state_t *st) {
 static void draw_plus(void) {
     char cells[9];
 
-    kx = KX_X;
-    ky = KX_Y;
+    sx = ART_SX;
+    sy = ART_SY;
     oy += LCD_PLUS_LCD_Y;   /* the display down, near the spectrum */
     bar_graph(&shown);
     filter(&shown);
     freq_cells(shown.fa, cells);
-    digits(418, 1110, 42, 150, cells, false, &plus_a);   /* a little bigger than the KX3's 428..1078 x 37..133 */
+    digits(418, 1110, 42, 150, cells, false, &plus_a);   /* a little bigger than the layout's 428..1078 x 37..133 */
     icons(&shown);
     freq_cells(shown.fb, cells);
     digits(685, 1078, 203, 275, cells, true, &plus_b);
     vfo_icons(&shown);
     mode_icons(&shown);
 
-    kx = ky = 1;
+    sx = sy = 1;
     oy -= LCD_PLUS_LCD_Y;
     plus_info(&shown);
     plus_cw(&shown);

@@ -1,7 +1,7 @@
 /*
  *  SPDX-License-Identifier: LGPL-2.1-or-later
  *
- *  KX3Lovers Plus, the built-in theme of the KX3-style display (lcd_panel.c). Included at the end
+ *  Amber Trey, the built-in theme of the amber segment LCD (lcd_panel.c). Included at the end
  *  of theme.c (its tables and statics), and kept out of upstream's lists so their new themes merge
  *  without a conflict: theme.c only calls in here (builtin_index, use_builtin, theme_list), its
  *  index is the one after upstream's last (B_COUNT). Selected by name, as every theme.
@@ -9,9 +9,9 @@
  *  Copyright (c) 2026 Pavol Calfa OM0WT
  */
 
-bool theme_kx3;
+bool theme_amber;
 
-/* KX3Lovers: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
+/* Amber Trey: a backlit segment display, dark segments on warm amber, the unlit segments a shade darker
  * than the glass (track). On Outdoor's colours for everything this table does not set */
 #define LCD_GLASS 0xe8b04c
 #define LCD_INK   0x1e1608
@@ -42,16 +42,16 @@ static const theme_set_t lcd_colors[] = {
     {TC_bp_text, LCD_INK},
 };
 
-/* use_builtin(b): true when b is this theme, applied; every other theme turns theme_kx3 off */
-bool theme_kx3_use(int b) {
+/* use_builtin(b): true when b is this theme, applied; every other theme turns theme_amber off */
+bool theme_amber_use(int b) {
     /* the buttons as text between lines, the active one not inverted */
     static const theme_set_t plus[] = {
         {TC_btn_active, LCD_GLASS}, {TC_btn_active_grad, LCD_GLASS}, {TC_btn_active_text, LCD_INK},
         {TC_btn_page, LCD_GLASS},   {TC_panel, 0xf4c870},   /* the spectrum strip: lighter glass */
     };
 
-    theme_kx3 = b == B_COUNT;
-    if (!theme_kx3) return false;
+    theme_amber = b == B_COUNT;
+    if (!theme_amber) return false;
     memcpy(colors, builtin_colors[B_OUTDOOR], sizeof(colors));
     theme_set(lcd_colors, sizeof(lcd_colors) / sizeof(lcd_colors[0]));
     theme_set(plus, sizeof(plus) / sizeof(plus[0]));
@@ -60,6 +60,6 @@ bool theme_kx3_use(int b) {
                                   /* the glass to the ink */
                                   .waterfall = {LCD_GLASS, 0xc89038, 0x8a6024, 0x3e2a10, LCD_INK},
                                   .waterfall_n = 5};
-    snprintf(theme_shape.name, sizeof(theme_shape.name), "%s", THEME_KX3_NAME);
+    snprintf(theme_shape.name, sizeof(theme_shape.name), "%s", THEME_AMBER_NAME);
     return true;
 }

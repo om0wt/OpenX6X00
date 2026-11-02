@@ -3,11 +3,11 @@
 What this fork (om0wt/OpenX6X00) has over Guru-RF's OpenX6X00. Upstream's docs (THEMES.md, MANUAL.md)
 are left as they are, so their changes merge without a conflict; this page is ours.
 
-## Theme: KX3Lovers Plus
+## Theme: Amber Trey
 
-Settings -> Display -> INTERFACE -> Theme, or `"base": "KX3Lovers Plus"` in a theme file (THEMES.md).
+Settings -> Display -> INTERFACE -> Theme, or `"base": "Amber Trey"` in a theme file (THEMES.md).
 
-Amber glass laid out as the LCD in Elecraft's KX3 owner's manual:
+Amber glass, a segment LCD:
 - **On the display:**
   - the bar graph with the S, SWR/CMP and RF/ALC scales and CWT;
   - the filter graphic with NTCH;
@@ -45,10 +45,10 @@ It transmits on every band: **into a dummy load only**.
 
 Our code lives in its own files:
 - lcd_panel.c and .h;
-- theme_kx3.inc;
+- theme_amber.inc;
 - tx_autocal.cpp and .h;
 - this page.
 
-Upstream's files only call into them, one line each, marked with a comment naming our file (`theme_kx3.inc`, `tx_autocal.cpp`, `KX3Lovers Plus`, `OM0WT`).
+Upstream's files only call into them, one line each, marked with a comment naming our file (`theme_amber.inc`, `tx_autocal.cpp`, `Amber Trey`, `OM0WT`).
 
 A conflict, when one still comes, is at one of those lines: keep upstream's side and put the call back.
