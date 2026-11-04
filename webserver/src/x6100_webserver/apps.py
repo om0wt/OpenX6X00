@@ -276,8 +276,9 @@ def cluster_option_lines(opts):
 config_lock = threading.RLock()   # cluster_update() holds it around write_cluster_conf()
 
 
-def replace_file(path, write, mode=0o644, **kw):
-    """The file written whole through a unique temporary name next to it, then put in place in one step."""
+def replace_file(path, write, mode=0o644, ready=None, **kw):
+    """The file written whole through a unique temporary name next to it, then put in place in one step. ready():
+    called with the new file on the card, just before that step, which it stops by raising"""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".", suffix=".tmp")
     try:
         os.chmod(tmp, mode)
@@ -285,6 +286,8 @@ def replace_file(path, write, mode=0o644, **kw):
             write(f)
             f.flush()
             os.fsync(f.fileno())   # /mnt is FAT on the SD card, as the GUI does
+        if ready:
+            ready()
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -292,6 +295,16 @@ def replace_file(path, write, mode=0o644, **kw):
         except OSError:
             pass
         raise
+    # The rename on the card too, as the GUI does for channels.json (channel_list.c): FAT writes the folder out
+    # later, and a power cut in between could leave the old file after the page said Saved
+    try:
+        dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
 
 
 def write_cluster_conf(host, port, servers, opts=None):
@@ -466,7 +479,13 @@ def funnel_render(out_dir, name=""):
     """The two pages with funnel=True (funnel_base.html: no menu, no callsign, nothing of the configurator; their
     sockets at wss://<name>/ws/remote and /ws/tci, which their Content-Security-Policy names when name is known),
     and the files, written whole into a new folder that then takes out_dir's place: a page of an older start never
-    mixes with files of this one. A page that loads a file tailscaled does not serve is said in the log"""
+    mixes with files of this one. A page that loads a file tailscaled does not serve is said in the log.
+    Each file's time is 0 (1970), which tailscaled's file server (Go's) takes for none: no Last-Modified, which told
+    anyone on the internet, paired or not, when the radio last started (it writes them then), and no 304 for a page
+    a browser kept from an older version (#58). So a browser loads them whole at each visit, over the radio's own
+    connection. A time fixed per version would keep the 304s, but none comes with the package (the updater writes
+    its files at the install), and with any fixed time a browser keeps a page unasked for a tenth of its age (its
+    heuristic freshness), past an update too"""
     tmp = out_dir + ".new"
     shutil.rmtree(tmp, ignore_errors=True)
     for sub in ("css", "js"):
@@ -485,6 +504,7 @@ def funnel_render(out_dir, name=""):
         os.chmod(dirpath, 0o755)
         for name in files:
             os.chmod(os.path.join(dirpath, name), 0o644)
+            os.utime(os.path.join(dirpath, name), (0, 0))
     old = out_dir + ".old"
     shutil.rmtree(old, ignore_errors=True)
     if os.path.isdir(out_dir):
@@ -873,7 +893,7 @@ def set_tailscale():
     return tailscale_status()
 
 
-# Winlink (rootfs/usr/sbin/x6100-winlink): Pat and the modem (ardopcf, or Mercury's x6x00-mercury) under a
+# Winlink (rootfs/usr/sbin/x6100-winlink): Pat and the modem (ardopcf, Mercury's x6x00-mercury or XARA) under a
 # supervisor that keeps a status file. The page writes the settings (/mnt/winlink.conf), hands a new password to the
 # helper on stdin (it goes to the root filesystem, where these pages never read it back) and runs the helper to apply
 # them and to turn it on or off
@@ -884,18 +904,20 @@ WINLINK_RADIO_FRESH = 15                              # s: older is from a GUI t
 WINLINK_CONF = "/mnt/winlink.conf"
 WINLINK_PASSWORD = "/var/lib/winlink/password"
 WINLINK_PROGRAMS = ("/usr/bin/pat", "/usr/bin/ardopcf")
+WINLINK_XARA = "/usr/bin/xara"                        # not on a radio updated from before it
 WINLINK_PORT = 8080                                   # Pat's mailbox
 WINLINK_CALL_RE = re.compile(r"[A-Z0-9]{3,12}(-[0-9]{1,2})?")   # as x6100-winlink checks them
 WINLINK_LOCATOR_RE = re.compile(r"[A-R]{2}[0-9]{2}([A-X]{2})?", re.I)
 WINLINK_BANDWIDTHS = (200, 500, 1000, 2000)           # ARDOP's, the widest Pat may use (as x6100-winlink's)
-WINLINK_MODEMS = ("ardop", "mercury")                 # the modem= choice (as x6100-winlink's), ardop the default
+WINLINK_MODEMS = ("ardop", "mercury", "xara")         # the modem= choice (as x6100-winlink's), ardop the default
 WINLINK_MERCURY_BANDWIDTHS = (500, 2300, 2750)        # Mercury's, VARA's three (as x6100-winlink's), 2300 the default
+WINLINK_XARA_BANDWIDTHS = (500, 2300, 2750)           # XARA's, VARA HF's own three, 2300 the default
 winlink_lock = threading.Lock()                       # one change at a time: Off may take 20 s
 
 
 def winlink_conf():
     conf = {"enabled": "0", "mycall": "", "locator": "", "bandwidth": "500", "modem": "ardop",
-            "mercury_bandwidth": "2300"}
+            "mercury_bandwidth": "2300", "xara_bandwidth": "2300", "vara_licence": "0"}
     try:
         with open(WINLINK_CONF) as f:
             for line in f:
@@ -910,8 +932,9 @@ def winlink_conf():
 def winlink_state():
     """The settings, the supervisor's status and the defaults; where a password is set, never the password: on this
     page (password_set), in Pat's own Settings (the supervisor's password=pat, #80) or nowhere. The modem chosen is
-    modem_choice: the status's modem is how the one that runs is doing"""
-    st = {"state": "off", "text": "Off", "pat": "off", "ardop": "off", "mercury": "off"}
+    modem_choice: the status's modem is how the one that runs is doing. vara_licence: the user's own word that they
+    hold a VARA HF licence (XARA's full speed), which nothing checks"""
+    st = {"state": "off", "text": "Off", "pat": "off", "ardop": "off", "mercury": "off", "xara": "off"}
     try:
         with open(WINLINK_STATUS) as f:
             for line in f:
@@ -930,6 +953,9 @@ def winlink_state():
               modem_choice=conf["modem"] if conf["modem"] in WINLINK_MODEMS else "ardop",
               mercury_bandwidth=int(conf["mercury_bandwidth"])
               if conf["mercury_bandwidth"] in [str(b) for b in WINLINK_MERCURY_BANDWIDTHS] else 2300,
+              xara_bandwidth=int(conf["xara_bandwidth"])
+              if conf["xara_bandwidth"] in [str(b) for b in WINLINK_XARA_BANDWIDTHS] else 2300,
+              vara_licence=conf["vara_licence"] == "1", xara_installed=os.access(WINLINK_XARA, os.X_OK),
               password_set=password_set,
               password="page" if password_set else "pat" if st.get("password") == "pat" else "none",
               radio_mycall=max(read_callsign().upper().split("/"), key=len),   # ON6URE of ON6URE/P
@@ -1003,8 +1029,9 @@ def winlink_logs():
 
 @app.post('/api/winlink')
 def set_winlink():
-    """Any of enabled, mycall, locator, bandwidth, modem_choice (ardop or mercury), mercury_bandwidth and password;
-    what is not sent stays. An empty callsign or locator is the radio's own, an empty password keeps the one set"""
+    """Any of enabled, mycall, locator, bandwidth, modem_choice (ardop, mercury or xara), mercury_bandwidth,
+    xara_bandwidth, vara_licence and password; what is not sent stays. An empty callsign or locator is the radio's own,
+    an empty password keeps the one set"""
     try:
         data = bottle.request.json
     except ValueError:
@@ -1035,13 +1062,22 @@ def set_winlink():
             new["bandwidth"] = str(data["bandwidth"])
         if "modem_choice" in data:
             if data["modem_choice"] not in WINLINK_MODEMS:
-                return api_error(400, "Modem: ARDOP or Mercury")
+                return api_error(400, "Modem: ARDOP, Mercury or XARA")
             new["modem"] = data["modem_choice"]
         if "mercury_bandwidth" in data:
             mbw = data["mercury_bandwidth"]
             if mbw not in WINLINK_MERCURY_BANDWIDTHS or isinstance(mbw, bool):
                 return api_error(400, "Mercury bandwidth: 500, 2300 or 2750")
             new["mercury_bandwidth"] = str(mbw)
+        if "xara_bandwidth" in data:
+            xbw = data["xara_bandwidth"]
+            if xbw not in WINLINK_XARA_BANDWIDTHS or isinstance(xbw, bool):
+                return api_error(400, "XARA bandwidth: 500, 2300 or 2750")
+            new["xara_bandwidth"] = str(xbw)
+        if "vara_licence" in data:
+            if not isinstance(data["vara_licence"], bool):
+                return api_error(400, "VARA HF licence: true or false")
+            new["vara_licence"] = "1" if data["vara_licence"] else "0"
         password = data.get("password", "")
         password = password.strip() if isinstance(password, str) else None
         if password is None or len(password) > 64 or any(ord(c) < 32 or ord(c) == 127 for c in password):
@@ -1050,7 +1086,8 @@ def set_winlink():
             err = winlink_run(["set-password"], password)
             if err:
                 return api_error(500, "Winlink: " + err)
-        keys = ["enabled", "mycall", "locator", "bandwidth", "modem", "mercury_bandwidth"]
+        keys = ["enabled", "mycall", "locator", "bandwidth", "modem", "mercury_bandwidth", "xara_bandwidth",
+                "vara_licence"]
         if new != conf:
             try:
                 replace_file(WINLINK_CONF, lambda f: f.write(
@@ -1060,7 +1097,8 @@ def set_winlink():
         err = None
         if new["enabled"] == "1":
             if password or any(new[k] != conf[k] for k in keys[1:]):
-                err = winlink_run(["apply"])          # Pat restarts with them, and the modem when another is chosen
+                err = winlink_run(["apply"])          # Pat restarts with them, the modem when another is chosen
+                                                      # and XARA when its own settings changed
             err = err or winlink_run(["on"])
         elif conf["enabled"] == "1" or "enabled" in data:
             err = winlink_run(["off"])
@@ -2161,23 +2199,50 @@ def cfg_connect(timeout):
 
 
 # Memories: MEM button slots (params.db, table `memory`) and named channels
-# (channels.json, same format as the radio GUI, src/channels.c)
+# (channels.json, same format as the radio GUI, src/channel_list.c)
 # Names and enum values are x6100_mode_t / x6100_agc_t from x6100_control
 MODES = ["LSB", "LSB-D", "USB", "USB-D", "CW", "CWR", "AM", "NFM", "SAM", "WFM"]
 AGCS = ["OFF", "SLOW", "FAST", "AUTO"]
 MEM_SLOTS = range(1, 10)  # MEM_HKEY_MAX_ID in src/main_screen.h; 10 is the GUI's backup slot
-FREQ_MIN, FREQ_MAX = 100000, 56000000  # the GUI HF range (HF_MIN_FREQ)
 CHANNELS_MAX = 100
 CHANNEL_NAME_RE = re.compile(r"[ -~]{0,31}")
+# Where the radio tunes a MEM slot or a channel, Hz: both go through cp_fg_freq, which takes any other frequency to
+# the nearest edge (clamp_to_valid_hw_freq, src/cfg/settings_manager.h). HF, and 70-500 MHz through a transverter;
+# the X6200 also FM broadcast and the airband and the WR12's 54 MHz-1 GHz, so all of 0.1-1000 MHz. The model's,
+# whatever is on now: a slot or a channel for a transverter or the WR12 stays good while it is off
+TUNE_RANGES = {"x6100": ((100_000, 55_000_000), (70_000_000, 500_000_000)),
+               "x6200": ((100_000, 1_000_000_000),)}
 
 
-def parse_entry(data, named):
-    """Validated slot/channel dict from request JSON; ValueError with a message."""
+def radio_model():
+    """x6100 or x6200, from the device tree, as x6100-update tells them apart"""
+    try:
+        with open(settings.DEVICE_TREE, "rb") as f:
+            return "x6200" if b"xiegu,x6200" in f.read() else "x6100"
+    except OSError:
+        return "x6100"
+
+
+def tune_ranges():
+    return TUNE_RANGES[radio_model()]
+
+
+def parse_entry(data, named, shown=None):
+    """Validated slot/channel dict from request JSON; ValueError with a message. shown: the channel as the page
+    showed it; a field the request leaves as shown is not checked and not in the dict, so the entry keeps it as the
+    file has it (a name or a frequency the page would not take, a fraction of a hertz)"""
     if not isinstance(data, dict):
         raise ValueError("Invalid request")
+    shown = shown or {}
+
+    def same(key):
+        return key in shown and type(data.get(key)) is type(shown[key]) and data.get(key) == shown[key]
     freq = data.get("frequency")
-    if isinstance(freq, bool) or not isinstance(freq, int) or not FREQ_MIN <= freq <= FREQ_MAX:
-        raise ValueError("Frequency must be between 0.5 and 56 MHz")
+    ranges = tune_ranges()
+    if not same("frequency") and (isinstance(freq, bool) or not isinstance(freq, int)
+                                  or not any(lo <= freq <= hi for lo, hi in ranges)):
+        raise ValueError("Frequency must be " + " or ".join(f"{lo / 1e6:g}-{hi / 1e6:g}" for lo, hi in ranges)
+                         + " MHz")
     if data.get("mode") not in MODES:
         raise ValueError("Invalid mode")
     if data.get("agc") not in AGCS:
@@ -2188,10 +2253,10 @@ def parse_entry(data, named):
     entry = {"frequency": freq, "mode": data["mode"], "agc": data["agc"], "pre": data["pre"], "att": data["att"]}
     if named:
         name = data.get("name")
-        if not isinstance(name, str) or not CHANNEL_NAME_RE.fullmatch(name):
+        if not same("name") and (not isinstance(name, str) or not CHANNEL_NAME_RE.fullmatch(name)):
             raise ValueError("Invalid name: up to 31 printable ASCII characters")
         entry = {"name": name, **entry}
-    return entry
+    return {k: v for k, v in entry.items() if not same(k)}
 
 
 def api_error(status, msg):
@@ -2201,7 +2266,8 @@ def api_error(status, msg):
 
 @app.route('/memories')
 def memories():
-    return bottle.template('memories')
+    ranges = tune_ranges()
+    return bottle.template('memories', mhz=(ranges[0][0] / 1e6, ranges[-1][1] / 1e6))
 
 
 def read_slots(dbcon):
@@ -2786,46 +2852,209 @@ def set_js8_texts():
     return read_js8_texts()
 
 
-def read_channels():
-    """Valid channels from channels.json; invalid ones are skipped like the GUI does."""
+CJSON_NESTING_LIMIT = 1000   # src/cJSON.h: lists and objects within each other, at most
+# A \u escape of half a UTF-16 pair (1: high, 2: the low after it, 3: a low alone), or any other escape
+SURROGATE_ESCAPE_RE = re.compile(r"\\(?:u([dD][89abAB][0-9a-fA-F]{2})(?:\\u([dD][c-fC-F][0-9a-fA-F]{2}))?"
+                                 r"|u[dD][c-fC-F][0-9a-fA-F]{2}()|.)", re.S)
+
+
+def nesting(doc):
+    deepest, todo = 0, [(doc, 1)]
+    while todo:
+        x, depth = todo.pop()
+        if isinstance(x, (dict, list)):
+            deepest = max(deepest, depth)
+            todo.extend((v, depth + 1) for v in (x.values() if isinstance(x, dict) else x))
+    return deepest
+
+
+def cjson_loads(data, finite=True):
+    """JSON bytes read as the GUI's cJSON_Parse reads them (src/cJSON.c): up to the first NUL byte (a C string), a
+    UTF-8 BOM and bytes 1-32 before the value and anything after it ignored, control characters in a string taken
+    and its bytes as they are (UTF-8 or not, kept by surrogateescape), the first value of a key given twice; no NaN
+    or Infinity, no \\u escape of half a UTF-16 pair, at most 1000 lists and objects deep. ValueError for what it
+    can't read, and with finite for a number too big for a double (1e400): cJSON takes it as infinite, which can't
+    be written back as JSON"""
+    def first(pairs):
+        obj = {}
+        for k, v in pairs:
+            obj.setdefault(k, v)
+        return obj
+
+    def constant(name):
+        raise ValueError(f"{name} is not JSON")
+
+    def number(text):
+        x = float(text)
+        if finite and abs(x) == float("inf"):
+            raise ValueError(f"{text} is too big a number")
+        return x
+    head, nul, _ = data.partition(b"\0")
+    text = head.decode("utf-8", "surrogateescape")
+    text = text[1:] if text.startswith("\ufeff") else text
+    text = text.lstrip("".join(map(chr, range(1, 33))))
+    dec = json.JSONDecoder(object_pairs_hook=first, parse_constant=constant, parse_float=number, strict=False)
     try:
-        with open(settings.CHANNELS_FILE) as f:
-            items = json.load(f)["channels"]
-        items = [parse_entry(x, True) for x in items if isinstance(x, dict)] if isinstance(items, list) else []
-    except (OSError, ValueError, KeyError, TypeError):
-        return []
-    return items[:CHANNELS_MAX]
+        doc, end = dec.raw_decode(text)
+    except RecursionError:
+        raise ValueError("lists or objects nested too deep") from None
+    except ValueError as ex:
+        raise ValueError(f"{ex}; the radio reads up to the NUL byte at byte {len(head)}" if nul else str(ex)) \
+            from None
+    for m in SURROGATE_ESCAPE_RE.finditer(text, 0, end):
+        if (m.group(1) and not m.group(2)) or m.group(3) is not None:
+            raise ValueError(f"{m.group(0)[:6]} is half a UTF-16 pair")
+    if nesting(doc) > CJSON_NESTING_LIMIT:
+        raise ValueError(f"lists or objects more than {CJSON_NESTING_LIMIT} deep")
+    return doc
 
 
-def write_channels(channels):
+def gui_channel(x):
+    """The channel the GUI makes of an entry of channels.json (parse_entry in src/channel_list.c), None for one it
+    leaves out: a name, a frequency of 1 Hz to 4294967295 Hz (a fraction cut off), a mode and an AGC it knows, PRE
+    and ATT true or false, each string as the GUI holds it, up to a NUL; the name at most 31 bytes"""
+    if not isinstance(x, dict):
+        return None
+    name, freq, mode, agc, pre, att = (x.get(k).partition("\0")[0] if isinstance(x.get(k), str) else x.get(k)
+                                       for k in ("name", "frequency", "mode", "agc", "pre", "att"))
+    if not isinstance(name, str) or isinstance(freq, bool) or not isinstance(freq, (int, float)) \
+            or not isinstance(pre, bool) or not isinstance(att, bool):
+        return None
+    if not 0 < freq <= 0xFFFFFFFF or mode not in MODES or agc not in AGCS:
+        return None
+    name = name.encode("utf-8", "surrogateescape")[:31].decode("utf-8", "surrogateescape")
+    return {"name": name, "frequency": int(freq), "mode": mode, "agc": agc, "pre": pre, "att": att}
+
+
+def channels_read():
+    """channels.json's bytes, None for no file"""
+    try:
+        with open(settings.CHANNELS_FILE, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def channels_load(data, finite=True):
+    """channels.json as the GUI reads it (channels_load in src/channel_list.c), from its bytes: the file's object,
+    and each entry of its "channels" list the GUI keeps, the first 100, as (its place in the list, the channel). An
+    entry the GUI leaves out is left out alone. None, no file: no channels. ValueError for a file the GUI can't
+    read either: the radio keeps the list it has then, and the page must not write over the file (and, with
+    finite, for one with a number too big, which the page can't write back)"""
+    if data is None:
+        return {"version": 1, "channels": []}, []
+    doc = cjson_loads(data, finite)
+    if not isinstance(doc, dict) or not isinstance(doc.get("channels"), list):
+        raise ValueError("no list of channels in it")
+    kept = []
+    for place, x in enumerate(doc["channels"]):
+        c = gui_channel(x)
+        if c and len(kept) < CHANNELS_MAX:
+            kept.append((place, c))
+    return doc, kept
+
+
+def channels_unreadable(ex):
+    return f"channels.json can't be read ({ex}): the page leaves it as it is. A change in APP → Channels on the " \
+           "radio writes it anew"
+
+
+def write_channels(doc, ready):
+    """The file whole again, the bytes of each string as they were read: an entry left as it was means to the GUI
+    what it meant (a name not in UTF-8 too). No NaN or Infinity, which the GUI can't read. ready: replace_file's.
+    The GUI sees a change of the file by its time (channels_reload_if_changed), which FAT keeps to 2 s: a second
+    write within those left it the same, and the radio on the list before until APP > Channels was opened. So the
+    new file's time is later than the one it replaces"""
     def write(f):
-        json.dump({"version": 1, "channels": channels}, f, indent="\t")
+        json.dump(doc, f, indent="\t", ensure_ascii=False, allow_nan=False)
         f.write("\n")
-    replace_file(settings.CHANNELS_FILE, write)
+    before = []
+
+    def check():
+        ready()
+        try:
+            before.append(os.stat(settings.CHANNELS_FILE).st_mtime_ns)
+        except FileNotFoundError:
+            pass
+    replace_file(settings.CHANNELS_FILE, write, ready=check, encoding="utf-8", errors="surrogateescape")
+    try:
+        st = os.stat(settings.CHANNELS_FILE)
+        if before and st.st_mtime_ns <= before[0]:
+            os.utime(settings.CHANNELS_FILE, ns=(st.st_atime_ns, before[0] + 2_000_000_000))
+    except OSError:
+        pass   # saved all the same
 
 
 def channels_state():
-    return {"channels": read_channels(), "max": CHANNELS_MAX}
+    try:
+        return {"channels": [c for _, c in channels_load(channels_read())[1]], "max": CHANNELS_MAX}
+    except (OSError, ValueError) as ex:
+        return {"channels": [], "max": CHANNELS_MAX, "error": channels_unreadable(ex)}
+
+
+class ChannelsChanged(Exception):
+    """The channel a change names is not the one the page showed: the list changed since"""
+
+
+CHANNELS_CHANGED = "The channel list changed since the page showed it, on the radio or in another tab: nothing was " \
+                   "changed, and the page shows the radio's list now"
+
+
+class ChannelsWritten(Exception):
+    """channels.json is no longer what the page read: the GUI saved its list meanwhile"""
 
 
 def channels_edit(change):
-    """Read, change (raises ValueError), write, return the new list."""
+    """Read, change (raises ValueError or ChannelsChanged), write, return the new list and what change() returns.
+    change(entries, kept) changes the file's "channels" list itself; kept[i] is (where channel i of the page is in
+    it, the channel). Every other entry goes back into the file as it was, also one the GUI leaves out: the page
+    never drops what it doesn't show. ChannelsChanged: 409 with the list as it is, and nothing written.
+    A save of the GUI's that lands between the read and the write is not written over: the change is made again
+    on the GUI's list, once; a second one is a 409 too"""
+    def unchanged():
+        if channels_read() != data:
+            raise ChannelsWritten()
     with config_lock:
-        channels = read_channels()
-        try:
-            change(channels)
-        except ValueError as ex:
-            return api_error(400, str(ex))
-        try:
-            write_channels(channels)
-        except OSError as ex:
-            return api_error(500, f"Can't save: {ex}")
-    return channels_state()
+        for last in (False, True):
+            try:
+                data = channels_read()
+                doc, kept = channels_load(data)
+            except (OSError, ValueError) as ex:
+                return api_error(500, channels_unreadable(ex))
+            try:
+                more = change(doc["channels"], kept)
+            except ChannelsChanged:
+                return dict(api_error(409, CHANNELS_CHANGED), channels=[c for _, c in kept], max=CHANNELS_MAX)
+            except ValueError as ex:
+                return api_error(400, str(ex))
+            try:
+                write_channels(doc, unchanged)
+                break
+            except ChannelsWritten:
+                if last:
+                    return dict(api_error(409, CHANNELS_CHANGED), **channels_state())
+            except (OSError, ValueError) as ex:
+                return api_error(500, f"Can't save: {ex}")
+            except RecursionError:   # json.dump, on a file this Python reads but can't write back
+                return api_error(500, "Can't save: channels.json is nested too deep for the page")
+    return dict(channels_state(), **(more or {}))
 
 
-def check_index(channels, i):
-    if not 0 <= i < len(channels):
-        raise ValueError("No such channel")
+def shown_place(kept, i, was):
+    """Where channel i of the page is in the file, when it is still the channel the page showed there (was, as
+    GET gave it): else ChannelsChanged. By its place alone a change hit another channel once the list had changed
+    under the page: one deleted or moved on the radio or in another tab. The page's own changes go one at a time,
+    each made with the places the answer before gave"""
+    if not 0 <= i < len(kept) or not isinstance(was, dict) or any(was.get(k) != v for k, v in kept[i][1].items()):
+        raise ChannelsChanged()
+    return kept[i][0]
+
+
+def channel_request():
+    data = bottle.request.json
+    if not isinstance(data, dict):
+        raise ValueError("Invalid request")
+    return data
 
 
 @app.get('/api/channels')
@@ -2835,37 +3064,68 @@ def get_channels():
 
 @app.post('/api/channels')
 def add_channel():
-    def change(channels):
-        if len(channels) >= CHANNELS_MAX:
+    def change(entries, kept):
+        if len(kept) >= CHANNELS_MAX:
             raise ValueError(f"At most {CHANNELS_MAX} channels")
-        channels.append(parse_entry(bottle.request.json, True))
+        entries.append(parse_entry(bottle.request.json, True))
     return channels_edit(change)
 
 
+# A change to channel i says which channel it means: "was", the channel as the page showed it
 @app.put('/api/channels/<i:int>')
 def set_channel(i):
-    def change(channels):
-        check_index(channels, i)
-        channels[i] = parse_entry(bottle.request.json, True)
+    def change(entries, kept):
+        data = channel_request()
+        place = shown_place(kept, i, data.get("was"))
+        # Into the entry: what the page left as it showed it stays as the file has it, the entry's other keys too
+        entries[place] = {**entries[place], **parse_entry(data, True, kept[i][1])}
     return channels_edit(change)
 
 
 @app.delete('/api/channels/<i:int>')
 def delete_channel(i):
-    def change(channels):
-        check_index(channels, i)
-        del channels[i]
+    def change(entries, kept):
+        place = shown_place(kept, i, channel_request().get("was"))
+        # For Undo: the entry as the file had it, as JSON text the page hands back as it is (/restore)
+        return {"deleted": {"entry": json.dumps(entries.pop(place), ensure_ascii=False), "place": place}}
     return channels_edit(change)
 
 
+# Undo of a delete: the entry its answer gave, put back at its place in the file as it was, a name or a frequency
+# the page would not take too, and its other keys. Any entry the GUI keeps, as there is room for 100
+@app.post('/api/channels/restore')
+def restore_channel():
+    def change(entries, kept):
+        data = channel_request()
+        place, text = data.get("place"), data.get("entry")
+        try:
+            entry = cjson_loads(text.encode("utf-8", "surrogateescape"))
+        except (AttributeError, ValueError):
+            entry = None
+        if gui_channel(entry) is None or isinstance(place, bool) or not isinstance(place, int):
+            raise ValueError("Invalid request")
+        if len(kept) >= CHANNELS_MAX:
+            raise ValueError(f"At most {CHANNELS_MAX} channels")
+        entries.insert(min(max(place, 0), len(entries)), entry)
+    return channels_edit(change)
+
+
+# The body: to, the place it goes to; was; past, the channel the page showed at place to
 @app.post('/api/channels/<i:int>/move')
 def move_channel(i):
-    def change(channels):
-        check_index(channels, i)
-        to = (bottle.request.json or {}).get("to")
-        if isinstance(to, bool) or not isinstance(to, int) or not 0 <= to < len(channels):
+    def change(entries, kept):
+        data = channel_request()
+        to = data.get("to")
+        if isinstance(to, bool) or not isinstance(to, int):
             raise ValueError("Invalid position")
-        channels.insert(to, channels.pop(i))
+        shown_place(kept, i, data.get("was"))
+        shown_place(kept, to, data.get("past"))
+        # The channels change places among themselves; an entry the GUI leaves out stays where it is
+        places = [p for p, _ in kept]
+        moved = [entries[p] for p in places]
+        moved.insert(to, moved.pop(i))
+        for p, x in zip(places, moved):
+            entries[p] = x
     return channels_edit(change)
 
 
@@ -3322,6 +3582,11 @@ BACKUP_NAME = r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}"
 BACKUP_DIRS = (("voice", "msg/", re.compile("msg/" + BACKUP_NAME + r"\.mp3")),
                ("wifi", "wifi/", re.compile("wifi/" + BACKUP_NAME + r"\.nmconnection")))
 BACKUP_GUI_PARTS = ("settings", "memories", "qso", "cw")   # files the GUI owns: restore with it stopped
+# NetworkManager reads its profile files again, the restored WiFi networks among them: the D-Bus call that
+# `nmcli connection reload` makes. The radios have no nmcli, and no D-Bus module for Python; dbus-send comes with D-Bus
+NM_RELOAD = ["dbus-send", "--system", "--print-reply", "--dest=org.freedesktop.NetworkManager",
+             "/org/freedesktop/NetworkManager/Settings", "org.freedesktop.NetworkManager.Settings.ReloadConnections"]
+NM_RELOAD_DELAY = 2   # s after the restore's answer, see nm_reload_later
 TAR_ERRORS = (tarfile.TarError, EOFError, OSError) + ((zlib.error,) if zlib else ())
 
 backup_lock = threading.Lock()
@@ -3410,9 +3675,9 @@ def describe_backup(files, date=None):
         if "channels.json" in files or "memory_slots.json" in files:
             slots = len({r[0] for r in memory_rows(files["memory_slots.json"]) if r[1] == "vfoa_freq" and r[0] in MEM_SLOTS}) \
                 if "memory_slots.json" in files else 0
-            try:
-                with open(files["channels.json"]) as f:
-                    chans = len(json.load(f)["channels"])
+            try:   # the channels the radio takes from it, as the Memories page lists them
+                with open(files["channels.json"], "rb") as f:
+                    chans = len(channels_load(f.read(), finite=False)[1])
             except (KeyError, OSError, ValueError, TypeError):
                 chans = 0
             out["memories"] = f"{plural(slots, 'slot')}, {plural(chans, 'channel')}"
@@ -3470,10 +3735,9 @@ def check_member(name, path):
                     isinstance(r, list) and len(r) == 3 and isinstance(r[0], int) and isinstance(r[1], str) and len(r[1]) <= 32
                     and isinstance(r[2], (int, float)) and not isinstance(r[2], bool) for r in rows):
                 raise ValueError
-        elif name == "channels.json":
-            with open(path) as f:
-                if not isinstance(json.load(f)["channels"], list):
-                    raise ValueError
+        elif name == "channels.json":   # one the radio reads, as the Memories page reads it
+            with open(path, "rb") as f:
+                channels_load(f.read(), finite=False)
         elif name == "cw_trainer.json":
             with open(path) as f:
                 json.load(f)
@@ -3749,6 +4013,22 @@ def gui_stop_for_restore():
     return f"The radio screen did not stop (exit {rc}): nothing was replaced"
 
 
+def nm_reload_later():
+    """NetworkManager reads the restored networks a moment after the restore's answer has gone out. A restored
+    file that replaces the network the radio is on with another profile (another radio's, a new UUID) makes it
+    leave that network and join the restored one: the browser's link drops meanwhile, and with another radio's
+    static Ethernet address the radio moves to that address. A reload that fails leaves them to the next start"""
+    def reload():
+        try:
+            subprocess.run(NM_RELOAD, capture_output=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    t = threading.Timer(NM_RELOAD_DELAY, reload)
+    t.daemon = True
+    t.start()
+
+
 @app.post('/api/backup/restore')
 def restore_backup():
     body = bottle.request.json or {}
@@ -3801,11 +4081,6 @@ def restore_backup():
                 except (OSError, sqlite3.Error, ValueError, KeyError) as e:
                     failed[part] = str(e)
             os.sync()
-            if "wifi" in restored:
-                try:
-                    subprocess.run(["nmcli", "connection", "reload"], capture_output=True, timeout=20)
-                except (OSError, subprocess.SubprocessError):
-                    pass
         finally:
             if gui:
                 try:
@@ -3816,6 +4091,8 @@ def restore_backup():
                 except (OSError, subprocess.SubprocessError) as e:
                     failed["gui"] = f"Can't start the radio screen: {e}"
             stage_clear()
+        if "wifi" in restored:
+            nm_reload_later()
         restored = [p for p in restored if p not in failed]
         return {"restored": restored, "failed": failed, "gui_restarted": gui_up}
     finally:

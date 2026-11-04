@@ -105,14 +105,17 @@ void params_float_set(params_float_t *p, float v) {
     params_writes++;
 }
 
+static int pointers;     /* "Baseband: Settings > Info" lines asked (#152) */
+
 void msg_schedule_text_fmt(const char *fmt, ...) {
+    char    text[128];
     va_list ap;
 
-    printf("        screen: ");
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
-    putchar('\n');
+    printf("        screen: %s\n", text);
+    if (!strncmp(text, "Baseband", 8)) pointers++;
 }
 
 static radio_state_t state = RADIO_RX;     /* RADIO_TX: something else is on the air */
@@ -215,6 +218,18 @@ bool radio_get_modem(void) {
     return base.modem;
 }
 
+/* The base sends no data (#152): radio_no_data says so from its call number no_data_from on (1: at once, 0: never),
+ * counted from the case's reset of no_data_calls, and the stand-in base's modem is refused then, as radio.c's
+ * tx_refused refuses it */
+static atomic_int no_data_from, no_data_calls;
+
+bool radio_no_data(void) {
+    int n = atomic_fetch_add(&no_data_calls, 1) + 1;
+    int from = atomic_load(&no_data_from);
+
+    return from > 0 && n >= from;
+}
+
 int32_t radio_tx_freq(void) {
     int32_t fg = cfg.freq[cfg.cur];
 
@@ -257,6 +272,7 @@ void radio_set_tx_freq(int32_t f) {
 void radio_set_modem(bool tx) {
     static bool moved;
 
+    if (tx && radio_no_data()) return;
     if (tx && cfg.split && !split_held) {
         radio_set_tx_freq(radio_tx_freq());
         moved = true;
@@ -539,6 +555,10 @@ static void pure_rules(void) {
           "on the air (an app, PTT, TCI, the ATU): on the air");
     check(tune_refusal(&(tune_ask_t){.tx_freq_ok = true, .winlink = true}) == TUNE_WINLINK,
           "a Winlink connection under way: Winlink holds the radio");
+    check(tune_refusal(&(tune_ask_t){.tx_freq_ok = false, .no_data = true}) == TUNE_NO_TX,
+          "receive only, and no data from the base: the frequency first, as the screen says it");
+    check(tune_refusal(&(tune_ask_t){.tx_freq_ok = true, .no_data = true, .on_air = true, .winlink = true}) ==
+          TUNE_NO_DATA, "no data from the base (#152): before on the air and Winlink");
 
     puts("-- the SWR protection during a tune: off for the tune's own power and time only");
     tune_guard_t g = {.pwr_w = 1.0f, .start_ms = 100000, .limit_ms = 15000};
@@ -782,9 +802,38 @@ int32_t cparam_i_get(const ComputedParamInt *p) {
     return cfg.mode[cfg.cur];
 }
 
-/* Where the radio transmits here: 40 m up to 7.200 (Region 1), 20 m, 10 m */
+/* Where the radio transmits here: 40 m up to 7.200 (Region 1), 20 m, 10 m; HF elsewhere is outside the amateur bands
+ * (#121), under 0 Hz (a TX shift) receive only */
 bool cfg_is_tx_freq(int32_t f) {
     return (f >= 7000000 && f <= 7200000) || (f >= 14000000 && f <= 14350000) || (f >= 28000000 && f <= 29700000);
+}
+
+const char *cfg_tx_refusal(int32_t f) {
+    return cfg_is_tx_freq(f) ? NULL : f < 0 ? "receive only" : "outside the amateur bands (Settings > TX Cal)";
+}
+
+/* A copy of settings_manager_api.cpp's two: change both (the refusal at 7.2005 MHz below runs the Hz digits) */
+const char *cfg_tx_mhz(int32_t freq, char *buf, size_t size) {
+    int32_t f      = freq < 0 ? -freq : freq;
+    int32_t sub    = f % 1000000;
+    int     digits = 3;
+
+    if (sub % 1000) {
+        for (digits = 6; sub % 10 == 0; digits--) sub /= 10;
+    } else {
+        sub /= 1000;
+    }
+    snprintf(buf, size, "%s%d.%0*d MHz", freq < 0 ? "-" : "", (int)(f / 1000000), digits, (int)sub);
+    return buf;
+}
+
+const char *cfg_tx_refusal_text(int32_t freq, char *buf, size_t size) {
+    const char *why = cfg_tx_refusal(freq);
+    char        mhz[24];
+
+    if (!why) return NULL;
+    snprintf(buf, size, "%s: %s", cfg_tx_mhz(freq, mhz, sizeof(mhz)), why);
+    return buf;
 }
 
 float cfg_pwr_max_get(void) {
@@ -834,6 +883,29 @@ void msg_update_text_fmt(const char *fmt, ...) {
     pthread_mutex_unlock(&said_mux);
 }
 
+/* As radio.c says it: the frequency, then why on a line of its own (that one only printed, said keeps the first).
+ * Here cfg_is_tx_freq is the bands too: the reason tells them apart */
+bool radio_say_no_tx(const char *what, int32_t freq, bool now) {
+    const char *why = cfg_tx_refusal(freq);
+    char        mhz[24];
+
+    if (!why) return false;
+    cfg_tx_mhz(freq, mhz, sizeof(mhz));
+    if (now) msg_update_text_fmt("%s on %s", what, mhz);
+    else msg_schedule_text_fmt("%s on %s", what, mhz);
+    msg_schedule_text_fmt("%s", strcmp(why, "receive only") ? "Out of band: Settings > TX Cal" : "Receive only there");
+    return true;
+}
+
+/* As radio.c says it, when radio_no_data: the reason, then where to look (that one only printed) */
+bool radio_say_no_data(const char *what, bool now) {
+    if (!radio_no_data()) return false;
+    if (now) msg_update_text_fmt("%s: no data from the base", what);
+    else msg_schedule_text_fmt("%s: no data from the base", what);
+    msg_schedule_text_fmt("Baseband: Settings > Info");
+    return true;
+}
+
 static bool said_is(const char *text) {
     pthread_mutex_lock(&said_mux);
     bool same = !strcmp(said, text);
@@ -876,6 +948,10 @@ uint16_t jtty_tx_get_freq(void) {
 
 unsigned radio_swr_trips(void) {
     return (unsigned)seen.trips;
+}
+
+unsigned radio_band_stops(void) {
+    return 0;
 }
 
 /* What happens during the tune (sc.event): on the tune's thread, as the knob's or the Panel's would on theirs */
@@ -997,6 +1073,17 @@ static void gui_side(void) {
     no = gui_tune(TUNE_BY_RADIO);
     check(no && ui.atu && base.atu && atu_writes == 0 && said_is("No tune: on the air"), "\"%s\", the ATU on", said);
     state = RADIO_RX;
+
+    puts("-- the ATU on, TUNE 5.0 W refused for want of data from the base (#152): the ATU stays on");
+    reset();
+    atu_writes = 0;
+    atomic_store(&no_data_calls, 0);
+    atomic_store(&no_data_from, 1);
+    no = gui_tune(TUNE_BY_RADIO);
+    atomic_store(&no_data_from, 0);
+    check(no && !strcmp(no, "no data from the base") && ui.atu && base.atu && atu_writes == 0 && seen.keys == 0 &&
+          said_is("No tune: no data from the base") && !ext_tune_on(), "\"%s\", the Panel's \"%s\", the ATU on", said,
+          no ? no : "");
 
     puts("-- the ATU on, TUNE 5.0 W, an app's slot has taken the player and not keyed yet: refused, the ATU stays on");
     reset();
@@ -1120,8 +1207,15 @@ static void gui_side(void) {
     reset();
     state = RADIO_TX;
     no = gui_tune(TUNE_BY_RADIO);
-    check(no && !strcmp(no, "no TX on 7.250 MHz") && said_is("No tune: no TX on 7.250 MHz") && !ext_tune_on() &&
-          seen.keys == 0, "7.250 where the radio only receives, on the air too: \"%s\"", said);
+    check(no && !strcmp(no, "no TX on 7.250 MHz: outside the amateur bands (Settings > TX Cal)") &&
+          said_is("No tune on 7.250 MHz") && !ext_tune_on() && seen.keys == 0,
+          "7.250 where the radio may not transmit, on the air too: \"%s\", the Panel's \"%s\"", said, no);
+    cfg = (typeof(cfg)){.freq = {7200500, 7200500}, .mode = {radio_mode_lsb, radio_mode_lsb}, .pwr = 5.0f};
+    reset();
+    no = gui_tune(TUNE_BY_RADIO);
+    check(no && !strcmp(no, "no TX on 7.2005 MHz: outside the amateur bands (Settings > TX Cal)") &&
+          said_is("No tune on 7.2005 MHz") && !ext_tune_on() && seen.keys == 0,
+          "500 Hz past the stub's 40 m, named with its Hz, not as the edge: \"%s\", the Panel's \"%s\"", said, no);
     cfg = (typeof(cfg)){.freq = {14200000, 14200000}, .mode = {radio_mode_usb, radio_mode_usb}, .pwr = 5.0f};
     reset();
     state = RADIO_TX;
@@ -1134,11 +1228,29 @@ static void gui_side(void) {
     check(no && said_is("No tune: Winlink in session") && !ext_tune_on() && seen.keys == 0, "Winlink in session: \"%s\"",
           said);
     ui.winlink = false;
+    reset();
+    atomic_store(&no_data_calls, 0);
+    atomic_store(&no_data_from, 1);
+    state = RADIO_TX;
+    no = gui_tune(TUNE_BY_RADIO);
+    atomic_store(&no_data_from, 0);
+    check(no && !strcmp(no, "no data from the base") && said_is("No tune: no data from the base") && !ext_tune_on() &&
+          seen.keys == 0, "no data from the base, on the air too (#152): \"%s\", the Panel's \"%s\"", said, no ? no : "");
+    reset();
+    atomic_store(&no_data_calls, 0);
+    atomic_store(&no_data_from, 2);     /* data at the start's look, none by the key */
+    pointers = 0;
+    no = gui_tune(TUNE_BY_RADIO);
+    atomic_store(&no_data_from, 0);
+    /* radio.c's refusal of the key gives the pointer (this stand-in's refuses quietly): none of the tune's own */
+    check(!no && said_is("No tune: no data from the base") && !ext_tune_on() && seen.keys == 0 && as_set() &&
+          pointers == 0, "the data gone between the look and the key: refused at the key, said so: \"%s\"", said);
     cfg = (typeof(cfg)){.freq = {7150000, 7150000}, .mode = {radio_mode_lsb, radio_mode_lsb}, .split = true,
                         .shift = -8000000, .pwr = 5.0f};
     reset();
     no = gui_tune(TUNE_BY_RADIO);
-    check(no && said_is("No tune: no TX on -0.850 MHz") && seen.keys == 0, "a TX shift below 0 Hz: \"%s\"", said);
+    check(no && !strcmp(no, "no TX on -0.850 MHz: receive only") && said_is("No tune on -0.850 MHz") && seen.keys == 0,
+          "a TX shift below 0 Hz: \"%s\", the Panel's \"%s\"", said, no);
 }
 
 int main(void) {

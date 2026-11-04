@@ -730,11 +730,11 @@ static uint8_t make_audio_gain(uint8_t row) {
     return row + 1;
 }
 
-/* Popups on the main screen: frequency, info, ALC */
+/* Popups on the main screen: frequency, info, the TX panel (tx_meters.c; its key is still mag_alc) */
 static uint8_t make_mag(uint8_t row) {
     params_bool_t *p[] = {&params.mag_freq, &params.mag_info, &params.mag_alc};
 
-    wl_row_label(row, "Popups Freq/Info/ALC");
+    wl_row_label(row, "Popups Freq/Info/TX");
     for (int i = 0; i < 3; i++) {
         bool_switch(row, 1 + 2 * i, 3, SMALL_2, p[i]);
     }
@@ -869,7 +869,7 @@ static uint8_t make_key_rows(uint8_t row, int first, int last) {
     return row;
 }
 
-/* Transverters: the band they cover (from, to) and the shift, in MHz; a shift of 0 is off (the X6200's default) */
+/* Transverters: the band they cover (from, to) and the shift, in MHz; a shift of 0 is off (the default) */
 static void xvrt_cb(lv_event_t *e) {
     ((ParamInt *)lv_event_get_user_data(e))->set(lv_spinbox_get_value(lv_event_get_target(e)) * 1000000L);
 }
@@ -3239,7 +3239,7 @@ static void make_general_page() {
 
 #ifdef BOARD_X6200
     /* Xiegu's WR12 on the HOST port: 54 MHz-1 GHz to receive; the band keys and the band plan follow it at once
-     * (screen_main.c). A switch until the radio can tell it is plugged in */
+     * (screen_main.c), and the radio drives the WR12 while it is on (wr12.c, radio.c, #134) */
     row = card_begin("WR12 RECEIVER");
     wl_row_label(row, "WR12 on HOST");
     param_switch(row, 1, 3, SMALL_3, cfg_sm.p_wr12);
@@ -3670,10 +3670,10 @@ static lv_obj_t * upd_line(uint8_t row);
  * noise) the meter is read with everything off, then with PRE, with ATT, and at RF gain 40, 1.5 s
  * to settle and 1.5 s of readings each, and what was left over moves the three settings.
  * PRE, ATT and the RF gain go back as they were after, also when the page closes or on TX.
- * The X6200's attenuator takes 29 to 53 dB off depending on the band (#125): there its figure is the
- * band's, up to 60 dB, and Measure sets the band's; and the signal has to be about S9 or more, so that
- * it stays over the noise with ATT on: 3 dB under S9 passes, as its readings are whole dB from the base
- * and a generator set to S9, -73 dBm, reading a dB under it was refused. The X6100 has one
+ * The X6200's attenuator takes 29 to 51 dB off depending on the band and the radio (#125): there its
+ * figure is the band's, up to 60 dB, and Measure sets the band's; and the signal has to be about S9 or
+ * more, so that it stays over the noise with ATT on: 3 dB under S9 passes, as its readings are whole dB
+ * from the base and a generator set to S9, -73 dBm, reading a dB under it was refused. The X6100 has one
  * figure, up to 40 dB, and takes S5 or more. */
 #ifdef BOARD_X6200
 static ParamInt &sm_att = cfg_sm.p_band_smeter_att;
@@ -3830,6 +3830,10 @@ static void smc_timer_cb(lv_timer_t *t) {
     sm_att.set(att);
     cfg_sm.p_smeter_rfg.set(rfg);
 #ifdef BOARD_X6200
+    /* The band's row also when Measure came out at the band's start, which set() does not write: so the band keeps
+     * its measured figure when a later version changes the start (smeter_att.c) */
+    sm_att.store();
+
     /* The band by its name: the page follows the band, so "this band" would be another one after a band change, and
      * a broadcast carrier next to a ham band sets the broadcast band's figure, not the ham band's. PRE and ATT as on
      * the keys, for the line to hold "Broadcast 41m" */
@@ -3965,6 +3969,14 @@ static uint8_t make_txcal_auto(uint8_t row) {
     return row + 1;
 }
 
+/* TX outside the amateur bands (#121): off by default, for operators licensed outside them. The receive-only ranges
+ * stay so. The note on a line of its own: beside the switch, VISION's type ran the label into it */
+static uint8_t make_tx_bands(uint8_t row) {
+    row = make_param_switch(row, "TX outside ham bands", cfg_sm.p_tx_outside_bands);
+    lv_label_set_text(upd_line(row), "Only if licensed outside the amateur bands: MARS, CAP");
+    return row + 1;
+}
+
 /* TX CAL: the transmitter's calibration and CESSB, per band where the base keeps them per band */
 static void make_txcal_page() {
     uint32_t caps = radio_caps();
@@ -3996,6 +4008,7 @@ static void make_txcal_page() {
 
     row = card_begin("TX PROTECTION");
     row = make_swr_protect(row);
+    row = make_tx_bands(row);
     card_end(row);
 
     row = card_begin("EXTERNAL TUNER");
@@ -4063,6 +4076,9 @@ static void make_display_page() {
     wl_row_label(row, "Icon menus");   /* APP, Modes and the rail as icons: the next time they open */
     bool_switch(row++, 1, 3, SMALL_3, &params.icon_menus);
     row = make_param_switch(row, "Knob info", cfg_sm.p_knob_info);
+    /* The main screen's buttons and knob lines hidden after so long without a key, back at the next (screen_main.c) */
+    row = make_param_choice(row, "Hide buttons", " Off \n After 3 s \n After 5 s \n After 10 s ",
+                            cfg_sm.p_buttons_hide);
     row = make_theme(row);
     row = make_font(row);
     /* CW / RTTY decoder text: Large or Compact (more lines), from SP2KMO's upstream c2fbe40c */

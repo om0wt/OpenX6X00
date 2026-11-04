@@ -81,6 +81,12 @@ Asked 2026-10-27 (#37; #52 asked the same and was closed for it). FreeDV's RADE 
 with the FARGAN vocoder model from the Opus project) as a digital voice mode in APP, and FreeDV's older Codec 2
 modes (1600, 700D) with it. No date.
 
+- **Open work: draft PR #130** (jochenhammes, 2026-10-31, in place of #129): RADE V1 as APP > Modes > RADE, receive
+  (the speech to Bluetooth headphones only) and send as record-then-send, like a voice message, through
+  `tx_player_stream()`; RADE V2 and the Codec 2 modes are not in it. Run on a PC only so far. Before a merge: a run
+  on an X6100 and an X6200 (its decode, synthesis and encode times, the GUI's CPU), its build (tools/rade/build.sh,
+  run by hand for now) from local-build.sh with every download pinned and checked, the licence notices on the
+  radio, V1 only for the size, and a TX power of its own instead of the level the digital apps share.
 - **The audio path is there**: RADE is a modem in an SSB passband, and the digital apps (FT8, Winlink) already take
   the receiver's audio into Linux and transmit audio from Linux (`radio_set_modem()`). What is new: the decoded
   voice on the speaker while receiving, and the mic recorded in Linux while transmitting (`AUDIO_PLAY_VOICE_REC`),
@@ -92,7 +98,7 @@ modes (1600, 700D) with it. No date.
   model's memory on 1 GB.
 - **Not counted on**: fventuri's base firmware that streams audio and IQ over USART6 to Linux and back is a base
   of its own, so a card image cannot rely on it.
-- **Codec 2 1600 and 700D** need far less CPU (they run on the SM1000's microcontroller): a first step that
+- **Codec 2 1600 and 700D** need far less CPU (they run on a microcontroller): a first step that
   needs only the audio path.
 - **Reporting**: FreeDV Reporter (https://qso.freedv.org), later.
 
@@ -147,11 +153,42 @@ write it: Pat (getpat.io, Go, MIT) as the client, ARDOP as the HF modem.
     gateway (KO0OOO, K7EK-10) once the Winlink account works. Upstream reports to post: the VERSION reply (Pat's
     start race), the daemon build's two missing Android hooks, an option for the TNC ports' address, nanorq's and
     oblas's licence files, PUBLIC in TNC.md.
-- **XARA** (github.com/x0rro/xara, a VARA-compatible modem in Rust, first release 2026-10-21; #18): a watch
-  item, not built. Watch it regularly: its fix for HF calls with an SSID (XARA issue #22, PR #23), the sound-card
-  clock drift that makes a VARA peer time out (XARA #20), its releases, and any takedown or statement by EA5HVK
-  (VARA's author). Implement it when it stabilises; earlier has no added value. Never its "registered" feature
-  (VARA's paid speed without a licence).
+- **XARA** (github.com/x0rro/xara, MIT, a VARA-compatible modem in Rust; #120): built, experimental, the third
+  Winlink modem (branch gh44-xara, 2026-11-04; the owner's decision of 4 November). v0.1.3 from its release
+  tarballs with a pinned Rust 1.99.1 (tools/xara, its UPSTREAM.md), our patch 0001 for the GUI's modem socket
+  (--audio x6x00, --ptt x6x00), 0002 for the CW ID with any callsign when Pat asks (CWID ON; the owner's decision
+  of 4 November: 0.1.3 identifies only with a US call) and 0003, a call Pat cancels given up at once, its ID on the
+  call's frequency before Pat tunes back. VARA's free speed by default; its `registered` feature is
+  compiled in and used only with the Winlink page's VARA HF licence tick box, the user's own statement, which nothing
+  checks. Tested between two stations on a PC only (make modems, eight runs: free, levels 2 to 4; ticked, the
+  highest level 9 to 14).
+  - **Bench** (the owner; no air yet): `top -H` on the X6100 and the X6200 with XARA listening and in calls (48 kHz
+    f64 DSP next to the GUI; "xara is falling behind real time" in xara.log). The audio path XARA times its
+    replies by: path()'s 25/50/80 ms (capture, keying, out) are guesses; measure with XARA's `--record` (a FLAC
+    with PTT) against the GUI's log and the dummy load, per radio, then set them (xara_path_ms= for the test, the
+    patch's PATH_MS after). VARA calling XARA leaves about 150 ms of margin for XARA's answer. A GUI playback
+    underrun (XARA's audio comes just in time, the stream's 60 ms prebuf is the only cushion) would cut a frame:
+    listen for gaps in the dummy load's audio. P2P between the X6100 and the X6200 into dummy loads at 2300 Hz,
+    free and ticked; a 30 s key; the PA's linearity on the full-speed OFDM levels (PAPR 8-9 dB) at up to 7 W and
+    the shared digital level on XARA's frames (drive-db 0). The CW ID with an ON call at each session's end and after
+    a call with no answer, heard whole on a receiver; the station that did not end the link keys about 3 s silent
+    first, waiting out the other's ID: tx_level takes no readings in silence nor in the 0.75 s after it
+    (tools/txlevel). Check that key on its own, in the GUI's log (/tmp/x6100_log.txt, then app_logs/): each key that
+    moved the shared level has a "tx_player: level A -> B dB, N windows decided in M blocks, S of them silent" line.
+    The ID-wait key (S about 58 to 77, 2.7 to 3.6 s) should have none, or N at most (M - S - 16) / 12 (about 3) and
+    no more of a rise than the radio's own ID key at the end of a session it ends (S 0); before the fix about 7
+    windows, 3 or 4 of them stepping up on the silence. The level before and after a whole session says nothing: on
+    the X6100 every key's level is kept, and the session's data keys and the ID's audio move it too. A call
+    cancelled in Pat (Dialing..., then the second click that forces it): the ID at once on the call's frequency,
+    Pat's tune back after it (0003; make modems tunes half a second after ABORT).
+  - **Then on the air**: yo4cil against his own gateway (YO4CIL, VARA and ARDOP on 4 bands), free speed first; a
+    test build announced on #120 first.
+  - **Upstream**: 0002 is prepared as a patch for x0rro/xara's main with a PR text (not sent yet); drop 0002 once
+    upstream acts on CWID ON. 0003 is not offered yet (0.1.3 waits the same way with a US call).
+  - **Watch**: 0.1.4, "a significant departure from 0.1.3 (libxara is coming)": 0001 then needs a rebase, or a
+    program of ours that links libxara as x6x00-mercury links Mercury. Its open PRs for slow audio paths (#39 the
+    extra answer lead, #40 the detector before a reply deadline, #38 the ACK margin), #37; any statement by EA5HVK
+    (VARA's author).
 
 ## X6200: the H-22 hand mic's keys (#56)
 
@@ -172,9 +209,16 @@ window is open, which can hold a WiFi password).
   with its own actions (Settings > Keys, X6200 only), VOL+/VOL- the volume a step a press and repeating while held,
   A/B as the front A/B key, 0x12/0x11 as the BAND keys; the X6100 keeps its mic's table. Harness `mic-keys.c` walks
   both mics on both boards; manual: Getting started > Hand mic.
+- After v0.3.8 (#145): PR #136 gave every digit on the X6200 the H-22's band, the X6100 mic's too (its 3 at 60 m).
+  A key sent with one of the H-22's own codes is marked now and takes the H-22's print, the rest the X6100 mic's.
+  This rests on the X6100 mic sending its own codes on the X6200, as the X6200 library's table has them: no log of
+  it from a radio yet (on v0.3.8, which #145 reports right, 0xE4 and 0x18 both give 40 m).
 - **Next**: on the bench X6200 with its H-22, on the main screen, each key pressed once (and VOL+, A/B, a digit
   held): the band on 3-9 and 0, the dot and HOME in the F-INP box, F3 with an action set, the volume stepping on
-  while VOL+ is held and stopping when let go, A/B swapping and its hold copying.
+  while VOL+ is held and stopping when let go, A/B swapping and its hold copying. Then the X6100's mic in the same
+  radio (#145): 3, 9 and the dot on the main screen log `hand mic: key 0xE4 (3)`, `0xA4 (9)` and `0x21 (.)` and
+  give 40 m, 10 m and no band, and the H-22's 3 again `0x18 (3)` and 60 m. If the X6100 mic sends 0x18 there, the
+  radio cannot tell the mics apart by their codes: the manual's line that it does goes, and #145 is open again.
 - Open: the H-22's side UP/DOWN. If they are to work, they are outside the packet's key word (Xiegu's manual names
   two data lines on the mic's plug, MDATA and MSVSW): the packet's other words (`reserved_2`, `reserved_3`, the flag
   bits the library leaves unnamed) logged when they change, in hw_x6200.c.
@@ -191,3 +235,36 @@ The https Panel and Screen page open their sockets on the page's own port since 
 (`wss://<address>/ws/remote` and `/ws/tci`, make_https_server in webserver/.../__main__.py). 50003 and 50004
 (WssProxy, start_wss_proxies, /api/remote's wss_port and wss_tci_port) stay for that one release, for a page left open
 over the update, and go in the release after it.
+
+## PSK, Olivia and JTTY: a Log QSO button in the apps (#55)
+
+Asked 2026-10-27 (#55). FT8, FT4 and FT2 log their QSOs by themselves, and JS8 has Log QSO (page 5, and its popup
+at 73 or SK); the keyboard apps log nothing themselves (docs/MANUAL.md, PSK31, PSK63 and Olivia: "The apps don't log
+QSOs themselves yet"). Today a QSO from them goes into the log only from the browser panel's Log tab, in the app's
+mode (#92), and since v0.3.8 the text log keeps what they receive and send (/mnt/digi_text), which is not a log of
+QSOs.
+
+- **The button**: on a page of PSK31, PSK63, Olivia (Contestia too) and JTTY, and of RTTY once it sends. It takes the
+  DX call and the two RSTs the apps already keep (src/digi_qso.c, shared by them), the time, the frequency and the
+  mode as the Log tab gives it, into the radio's log as JS8 does (`qso_log_record_create()` and
+  `qso_log_record_save()`, `dialog_field_day_log()`; src/js8_window.c): so it shows on the Logs page and goes to
+  Wavelog and Field Ops.
+- **Only on a press** at first: the end of a QSO is hard to tell in a keyboard mode, so no offer at 73 or SK as JS8
+  makes (the #55 reply of 29 October). The reporter cared most about the text and the reports, which the text log
+  now keeps.
+
+## CW Trainer: the receiver turned down while it is open (#110)
+
+Asked 2026-10-31 (joanpao, #110). The trainer leaves the receiver as it is in Learn, Practice and Calls, so the
+band's noise plays under the side tone, and the trainer's decoder, which listens to the side tone to check the
+keying, hears it too: while it waits for an answer, noise can come out as extra letters. The idea: the trainer turns
+the RF gain down by itself while it is open and gives it back when it closes, as it already does with key train and
+the mode (src/dialog_cw_trainer.c, `construct_cb()` and `destruct_cb()`). By hand today: RF gain to 0 before opening
+it (the #110 reply of 31 October).
+
+- **To check first, on both radios**: that the side tone stays as loud with the RF gain at 0 (the X6200's is made in
+  the base and follows the volume) and that the decoder still hears it, in all three modes.
+- **How**: given back on every exit, as key train is. The RF gain is a saved setting (`rfgain`, sent to the base by
+  radio.c as `HW_RFG`): better to set the base's gain alone and leave the setting as it is, so a power-off with the
+  trainer open doesn't leave the radio deaf at the next start. Meanwhile the S-meter's correction for the RF gain
+  (src/smeter.c) and the browser panel's RF gain (`P_RFG`) should see the gain the user set.

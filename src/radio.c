@@ -16,6 +16,7 @@
 
 #include <unistd.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -56,6 +57,7 @@
 #include "clock.h"
 #include "wifi.h"
 #include "settings_window.h"
+#include "wr12.h"
 
 /*********************
  *      DEFINES
@@ -123,12 +125,30 @@ static void on_change_i(Subject *subj, void *user_data);
 static void on_change_f(Subject *subj, void *user_data);
 static void on_pwr_change(Subject *subj, void *user_data);
 static void on_train_hold_change(Subject *subj, void *user_data);
+static void on_band_hold_change(Subject *subj, void *user_data);
+static void band_settle_cb(void *arg);
+static void band_hold_set(bool hold);
+static bool band_hold_early(radio_vfo_t vfo, int32_t freq);
+static void band_look(bool settled);
+static bool split_keys_dial(void);
+static void split_held_look(void);
+static void on_vox_change(Subject *subj, void *user_data);
+static void on_key_train_change(Subject *subj, void *user_data);
 static void on_volume_change(Subject *subj, void *user_data);
+static bool wr12_takes(int32_t freq);
+static void wr12_follow(bool rx, int32_t dial);
 
 #ifndef BOARD_X6200
 static void recover_processing_audio_inputs();
+#else
+static bool wr12_notify(void);
+static bool wr12_keyed(void);
+static void on_wr12_change(Subject *subj, void *user_data);
 #endif
-static bool tx_refused(void);
+/* Who keys (tx_refused): the CW Trainer's key goes through outside the amateur bands, at 0 W, its PTT quietly not */
+typedef enum { TX_BY_GUI, TX_BY_PTT, TX_BY_MORSE } tx_by_t;
+static bool tx_refused(tx_by_t by);
+static bool tx_refused_at(int32_t freq, tx_by_t by);
 #ifdef BOARD_PWR_MAX_BAT
 static void tune_cap_top(float top);
 #endif
@@ -208,6 +228,10 @@ static uint64_t         prev_time;
 static uint64_t         idle_time;
 static uint64_t         start_time;     /* radio_init() */
 static uint64_t         pack_time;      /* last packet from the base */
+static bool             base_seen;      /* a packet came in this run */
+static atomic_uint_fast64_t data_time;  /* pack_time for the other threads (radio_no_data), 0 before the first packet */
+static bool             gone_said;      /* "No data from the base" said, until a packet comes (base_gone) */
+static bool             tx_by_gui;      /* the GUI keyed the TX under way (PTT, an app, the CW key): radio thread */
 static uint8_t          pack_vbat, pack_vext;   /* its voltages, 0.1 V */
 static volatile int8_t  bat_pct = -1;   /* the battery %, -1 on external power or not measured yet */
 static volatile bool    charger_asked;  /* the charger setting as last applied (Shadow at power-off left out: no bolt then) */
@@ -226,6 +250,19 @@ static float            txpwr_asked;
  * thread too; train_said: its note on the screen, once while it holds (train_note) */
 static atomic_bool      train_hold;
 static atomic_bool      train_said;
+/* Where the radio may not transmit (#121: cfg_tx_refusal of radio_tx_freq; Birdie Cal off the dial): the power at the
+ * base held at 0 W, its VOX off and its KEY Train on, for what the base keys by itself (the hand mic's PTT, VOX, the
+ * KEY jack); what the GUI keys is refused there (tx_refused), or stopped (band_stop). Written under the lock
+ * (band_hold_set), read by the radio thread too; band_said: its note, once while it holds (band_note); band_looked:
+ * the first look made (radio_start), no early hold before it; off_dial: radio_set_freq moved a VFO of the base off
+ * its dial, Birdie Cal's, held until radio_set_freq_dial at the run's end; band_stops: the GUI's TX stopped by it,
+ * for tx_player; atu_band_stop: the radio's tuner to give up, for the radio thread */
+static atomic_bool      band_hold;
+static atomic_bool      band_said;
+static bool             band_looked;
+static atomic_bool      off_dial;
+static atomic_uint      band_stops;
+static atomic_bool      atu_band_stop;
 static pthread_mutex_t  tune_mux = PTHREAD_MUTEX_INITIALIZER;
 static tune_guard_t     tune_guard;     /* that tune, for the SWR protection (under tune_mux) */
 
@@ -257,6 +294,7 @@ static void set_txpwr(float w) {
     if (xvtr_cap > 0.0f && w > xvtr_cap) w = xvtr_cap;     /* whoever asks: PWR, an app's own, TUNE's, TCI, CAT */
     /* A TUNE keeps its own power: the base is in USB-D for it, and the user asked for that carrier */
     if (atomic_load(&train_hold) && tune_cap <= 0.0f) w = 0.0f;
+    if (atomic_load(&band_hold)) w = 0.0f;     /* a TUNE too: none starts there, one moved there is stopped */
     hw_set_f(HW_TXPWR_F, w);
 }
 
@@ -314,6 +352,14 @@ void radio_start() {
     base_ver = hw_base_ver();
     cfg_hw_caps_set(hw_caps());     /* the LO offset from them, before the first frame */
     start_trace("base: version %s", hw_base_ver_str());
+#ifdef BOARD_X6200
+    /* The WR12 on the HOST port (wr12.c, #134): its thread, and WR12 on HOST, before the VFOs go to the base. While
+     * it is out of its bypass, or may be, nothing transmits anywhere (cfg_tx_refusal), from the first look at the
+     * hold below on: one a GUI before this one left out of it too */
+    wr12_init(wr12_notify, wr12_keyed);
+    cfg_tx_block_set(wr12_tx_block);
+    subject_subscribe_and_notify((Subject*)cfg_wr12, on_wr12_change, NULL);
+#endif
     /* What the digital TX level comes from, for a report of an app at 0 W (#16); the base version was nowhere */
     fprintf(stderr, "radio: base %s, line_in %u, line_out %u, play %.1f dB, rec %.1f dB, digital level %.1f dB\n",
             hw_base_ver_str(), params.line_in, params.line_out, params.play_gain_db_f.x, params.rec_gain_db_f.x,
@@ -342,6 +388,20 @@ void radio_start() {
     }
     on_xvtr_pwr_change(NULL, NULL);
 
+    /* Outside the amateur bands the base held at 0 W, VOX off, KEY Train on (#121): where the radio transmits and the
+     * switch. Looked at once now, before PWR, VOX and Train go to the base below; subscribed before the split bit and
+     * the VFO in use (HW_SPLIT, HW_VFO_CUR below), which observers get in that order: held before the base moves */
+    Subject *band_by[] = {
+        (Subject*)cfg_fg_freq, (Subject*)cfg_bg_freq, (Subject*)cfg_band_split, (Subject*)cfg_band_tx_shift,
+        (Subject*)cfg_band_current_vfo, (Subject*)cfg_transverter_0_from, (Subject*)cfg_transverter_0_to,
+        (Subject*)cfg_transverter_0_shift, (Subject*)cfg_transverter_1_from, (Subject*)cfg_transverter_1_to,
+        (Subject*)cfg_transverter_1_shift, (Subject*)cfg_wr12, (Subject*)cfg_tx_outside_bands,
+    };
+    for (size_t i = 0; i < sizeof(band_by) / sizeof(band_by[0]); i++) {
+        subject_subscribe(band_by[i], on_band_hold_change, NULL);
+    }
+    on_band_hold_change(NULL, NULL);
+
     subject_subscribe_and_notify((Subject*)cfg_band_vfoa_mode, on_vfo_mode_change, (void*)RADIO_VFO_A);
     subject_subscribe_and_notify((Subject*)cfg_band_vfob_mode, on_vfo_mode_change, (void*)RADIO_VFO_B);
 
@@ -358,6 +418,9 @@ void radio_start() {
     subject_subscribe_and_notify((Subject*)cfg_band_vfob_pre, on_vfo_pre_change, (void*)RADIO_VFO_B);
 
     subject_subscribe_and_notify((Subject*)cfg_band_current_vfo, on_change_i, (void*)HW_VFO_CUR);
+#ifdef BOARD_X6200
+    subject_subscribe((Subject*)cfg_band_current_vfo, on_wr12_change, NULL);  /* once the base has it: the WR12 follows */
+#endif
     subject_subscribe_and_notify((Subject*)cfg_band_split, on_change_i, (void*)HW_SPLIT);
     subject_subscribe_and_notify((Subject*)cfg_rfgain, on_change_i, (void*)HW_RFG);
 
@@ -392,7 +455,7 @@ void radio_start() {
     subject_subscribe_and_notify((Subject*)cfg_comp_makeup_offset, on_change_f, (void*)HW_COMP_MAKEUP_F);
 
     /* VOX */
-    subject_subscribe_and_notify((Subject*)cfg_vox_on, on_change_i, (void*)HW_VOX);
+    subject_subscribe_and_notify((Subject*)cfg_vox_on, on_vox_change, NULL);
     subject_subscribe_and_notify((Subject*)cfg_vox_gain, on_change_i, (void*)HW_VOX_GAIN);
     subject_subscribe_and_notify((Subject*)cfg_vox_ag, on_change_i, (void*)HW_VOX_AG);
     subject_subscribe_and_notify((Subject*)cfg_vox_delay, on_change_i, (void*)HW_VOX_DELAY);
@@ -417,7 +480,7 @@ void radio_start() {
     subject_subscribe_and_notify((Subject*)cfg_key_mode, on_change_i, (void*)HW_KEY_MODE);
     subject_subscribe_and_notify((Subject*)cfg_iambic_mode, on_change_i, (void*)HW_IAMBIC_MODE);
     subject_subscribe_and_notify((Subject*)cfg_key_vol, on_change_i, (void*)HW_KEY_VOL);
-    subject_subscribe_and_notify((Subject*)cfg_key_train, on_change_i, (void*)HW_KEY_TRAIN);
+    subject_subscribe_and_notify((Subject*)cfg_key_train, on_key_train_change, NULL);
     subject_subscribe_and_notify((Subject*)cfg_qsk_time, on_change_i, (void*)HW_QSK_TIME);
     subject_subscribe_and_notify((Subject*)cfg_key_ratio, on_change_f, (void*)HW_KEY_RATIO_F);
     subject_subscribe_and_notify((Subject*)cfg_cw_peak_on, on_change_i, (void*)HW_CW_PEAK);
@@ -499,11 +562,51 @@ void radio_set_freq(int32_t freq) {
     }
     radio_vfo_t vfo = param_i_get(cfg_band_current_vfo);
     int32_t shift = cfg_transverter_shift_for(freq);
-    WITH_RADIO_LOCK(hw_vfo_set_freq(vfo, freq - shift));
+    bool    off;
+
+    /* The base's VFO in use moved without the dial (Birdie Cal, #121): held at 0 W, VOX off, for the whole run (the
+     * CB bands are in the band list), let go by radio_set_freq_dial only. Not when the knob puts that VFO back: with
+     * the VFOs swapped meanwhile the other one stays where the run had it, the one an X6100 in split keys */
+    radio_lock();
+    off = freq != cparam_i_get(cfg_fg_freq);
+    if (off) {
+        atomic_store(&off_dial, true);
+        band_hold_set(true);
+    }
+    hw_vfo_set_freq(vfo, freq - shift);
+    if (off) {
+        wr12_follow(false, freq);   /* the base's own receiver for the run: the X6200's WR12 in its bypass (#134) */
+    }
+    radio_unlock();
+    if (!off) band_look(true);
+}
+
+/* Birdie Cal's end: both VFOs of the base on their own frequency as it is now, IF shift and all, as
+ * radio_set_tx_freq(0) does. The knob, CAT or a spot may have moved one meanwhile, and a VFO swapped during the run
+ * left the other one where radio_set_freq had it, unseen by the hold (radio_tx_freq reads the settings) and keyed
+ * there by the base after a swap back or in split. Then the hold off the dial goes; outside the bands it stays */
+void radio_set_freq_dial(void) {
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
+    atomic_store(&off_dial, false);
+#ifdef BOARD_X6200
+    /* Where the WR12 receives, the base back on its IF and the WR12 out of its bypass, now that the run is over */
+    on_vfo_freq_change(NULL, (void *)(intptr_t)param_i_get(cfg_band_current_vfo));
+#endif
+    band_look(true);
 }
 
 bool radio_check_freq(int32_t freq) {
     return cfg_is_valid_hw_freq(freq);
+}
+
+/* A VFO's frequency from its own param, in_use: the dial's. The param is set before its observers run, cfg_fg_freq
+ * and cfg_bg_freq only after them (ComputedParameter::set): a dial set through cfg_fg_freq read as the old one
+ * meanwhile, in on_vfo_freq_change and on an app's thread, and a hold went on the old one's word (#121) */
+static int32_t vfo_freq(bool in_use) {
+    bool a = param_i_get(cfg_band_current_vfo) == RADIO_VFO_A;
+
+    return param_i_get(a == in_use ? cfg_band_vfoa_freq : cfg_band_vfob_freq);
 }
 
 /* With a TX shift the frequency the shift asks for, not the other VFO's: that VFO is held to 100 kHz and up, so a
@@ -511,7 +614,7 @@ bool radio_check_freq(int32_t freq) {
  * on the screen instead */
 int32_t radio_tx_freq(void) {
     int32_t shift = param_i_get(cfg_band_tx_shift);
-    int32_t fg = cparam_i_get(cfg_fg_freq);
+    int32_t fg = vfo_freq(true);
 
     if (!param_i_get(cfg_band_split)) {
         return fg;
@@ -519,11 +622,45 @@ int32_t radio_tx_freq(void) {
     if (shift) {
         return param_i_get(cfg_band_current_vfo) == RADIO_VFO_A ? fg + shift : fg - shift;
     }
-    return cparam_i_get(cfg_bg_freq);
+    return vfo_freq(false);
 }
 
-/* The base's split bit off while the active VFO carries the TX frequency (radio_set_tx_freq) */
+/* The base's split bit off while the active VFO carries the TX frequency (radio_set_tx_freq). cur_on_tx: the base's
+ * VFO in use on radio_set_tx_freq's frequency, not the dial, until on_vfo_freq_change sends it its own again (the
+ * knob turned in an app's slot, the slot's end) */
 static atomic_bool split_held;
+static atomic_bool cur_on_tx;
+
+/* In split, whether the base keys the dial, the VFO in use (#121). The X6200's base does whatever split says: 1.0.8
+ * ignores its split bit and has no TX VFO (2026-10-26: the GUI's CW spotted by RBN on VFO A with B 3 kHz up). Either
+ * base does while split is held off, unless radio_set_tx_freq has that VFO on the TX frequency. Otherwise the other
+ * VFO keys (radio_tx_freq). Out of split the dial is radio_tx_freq */
+static bool split_keys_dial(void) {
+    if (!param_i_get(cfg_band_split)) {
+        return false;
+    }
+    if (atomic_load(&split_held)) {
+        return !atomic_load(&cur_on_tx);
+    }
+#ifdef BOARD_X6200
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool radio_key_refused(int32_t *freq) {
+    int32_t f = radio_tx_freq();
+    bool    wr12 = wr12_takes(vfo_freq(true));  /* the base on the X6200's WR12's IF, or on its way: nothing keys (#134) */
+
+    if (wr12 || (!cfg_tx_refusal(f) && split_keys_dial())) {
+        f = vfo_freq(true);
+    }
+    if (freq) {
+        *freq = f;
+    }
+    return wr12 || cfg_tx_refusal(f) != NULL;
+}
 
 /* The VFO the radio transmits on to `freq`. In split that is the active VFO, with the base's split bit off until
  * radio_set_tx_freq(0): the X6200's base (1.0.8) sent the apps' tone from VFO A whatever B said, an FT8 CQ at
@@ -535,24 +672,37 @@ void radio_set_tx_freq(int32_t freq) {
 
     if (freq == 0) {
         /* Both VFOs on their own frequency, transverter and IF shift as tuned: the one that transmits can have
-         * changed since (split off during an SWR scan left B on a sweep point); one that did not move is not resent */
+         * changed since (split off during an SWR scan left B on a sweep point); one that did not move is not resent.
+         * split_held until the bit is back: either base keys the VFO in use until then, and the dial it goes back to
+         * is held where the radio may not transmit (band_hold_early, #121) */
         on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
         on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
         if (atomic_exchange(&split_held, false)) {
             on_train_hold_change(NULL, NULL);   /* the other VFO transmits again: its CW held, before the bit */
             WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, param_i_get(cfg_band_split)));
+            split_held_look();  /* on the X6100 the other VFO keys again: the dial's hold goes */
         }
         return;
     }
-    if (!cfg_is_tx_freq(freq)) {
+    if (!cfg_is_tx_freq(freq)) {    /* the hardware's check: the bands are tx_refused's, at the key */
         LV_LOG_ERROR("TX freq %i incorrect", freq);
         return;
     }
-    if (param_i_get(cfg_band_split) && !atomic_exchange(&split_held, true)) {
+
+    bool held = param_i_get(cfg_band_split) && !atomic_exchange(&split_held, true);
+
+    if (held) {
+        split_held_look();  /* from the bit on the base keys the VFO in use, still on the dial: held there first */
         WITH_RADIO_LOCK(hw_set_i(HW_SPLIT, false));
         on_train_hold_change(NULL, NULL);   /* this VFO transmits now: the other one's CW holds nothing */
     }
-    WITH_RADIO_LOCK(hw_vfo_set_freq(vfo, freq - cfg_transverter_shift_for(freq)));
+    radio_lock();
+    hw_vfo_set_freq(vfo, freq - cfg_transverter_shift_for(freq));
+    atomic_store(&cur_on_tx, true);
+    radio_unlock();
+    if (held) {
+        split_held_look();  /* the dial no longer keys: its hold goes before the app keys */
+    }
 }
 
 uint16_t radio_change_vol(int16_t df) {
@@ -630,7 +780,11 @@ bool radio_change_spmode(int16_t df) {
 void radio_start_atu() {
     float xvtr;
 
-    if (tx_refused()) {
+    if (tx_refused(TX_BY_GUI)) {
+        return;
+    }
+    /* In split the base's tuner may key on either VFO, which one the GUI cannot tell: the dial too (#121) */
+    if (param_i_get(cfg_band_split) && tx_refused_at(cparam_i_get(cfg_fg_freq), TX_BY_GUI)) {
         return;
     }
     /* The tuner's carrier is the base's own, at a power the GUI does not set: not into a transverter with a TX power
@@ -640,6 +794,7 @@ void radio_start_atu() {
         msg_schedule_text_fmt("No tuner: %.1f W transverter", xvtr);
         return;
     }
+    atomic_store(&atu_band_stop, false);    /* one asked of a tune over already */
     state_move(RADIO_RX, RADIO_ATU_START);
 }
 
@@ -667,7 +822,7 @@ static uint64_t    swrscan_up_ms;       /* the power last went up */
 
 /* Nothing moves before the scan is known to start: the VFO that transmits goes to `from` only then */
 bool radio_start_swrscan(int32_t from) {
-    if (tx_refused() || !state_move(RADIO_RX, RADIO_SWRSCAN)) {
+    if (tx_refused(TX_BY_GUI) || !state_move(RADIO_RX, RADIO_SWRSCAN)) {
         return false;
     }
 
@@ -812,34 +967,111 @@ void radio_set_charger(bool on) {
     }
 }
 
-/* Keying from the GUI where the radio does not transmit is refused, with a word on the screen: the X6200's FM
- * broadcast and airband, what the WR12 receives, anything above HF that no transverter covers. Where it transmits:
- * radio_tx_freq, the other VFO in split, wherever a TX shift put it. PTT, the modem
- * (the apps), CW, the tuner and the SWR scan come through here; the base's own TX permit covers its hand-mic PTT
- * and paddle */
-static bool tx_refused(void) {
-    int32_t freq = radio_tx_freq();
+/* KEY Train practice in the CW Trainer (#121): its key sounds the sidetone, at 0 W (train_hold) */
+static bool practice(void) {
+    return atomic_load(&train_hold) && cw_trainer_on();
+}
 
+/* Keying from the GUI where the radio may not transmit is refused, with a word on the screen (cfg_tx_refusal): where
+ * the hardware does not (the X6200's FM broadcast and airband, what the WR12 receives, above HF without a
+ * transverter: "receive only"), and on HF outside the amateur bands with TX outside them off (#121). Where it
+ * transmits: radio_tx_freq, the other VFO in split, wherever a TX shift put it. PTT, the modem (the apps), CW, the
+ * tuner and the SWR scan come through here; what the base keys by itself (its hand-mic PTT, VOX, the KEY jack) is
+ * not, it is held at 0 W there instead (band_hold). The CW Trainer's key goes through outside the bands, where the
+ * hardware transmits, its PTT is refused without a word: the key that follows it sounds. Not while the X6200's WR12
+ * is out of its bypass, or may be (cfg_tx_block, #134): then nothing goes, anywhere */
+static bool tx_refused_at(int32_t freq, tx_by_t by) {
     static uint64_t said;
 
-    if (cfg_is_tx_freq(freq)) {
+    if (!cfg_tx_refusal(freq)) {
         return false;
     }
-    if (get_time() - said > 3000) {     /* once, not for every CW element */
-        int32_t f = freq < 0 ? -freq : freq;    /* a TX shift below 0 Hz */
-
+    if (by != TX_BY_GUI && practice() && cfg_is_tx_freq(freq) && !cfg_tx_block()) {
+        return by == TX_BY_PTT;
+    }
+    if (get_time() - said > 5000) {     /* once, not for every CW element nor each slot of a beacon */
         said = get_time();
-        msg_schedule_text_fmt("No TX on %s%d.%03d MHz: receive only", freq < 0 ? "-" : "", f / 1000000,
-                              f / 1000 % 1000);
+        radio_say_no_tx("No TX", freq, false);
     }
     return true;
 }
 
-void radio_set_ptt(bool tx) {
-    if (tx && tx_refused()) {
-        return;
+bool radio_say_no_tx(const char *what, int32_t freq, bool now) {
+    char        mhz[24];
+    const char *block = cfg_tx_block();
+
+    if (!cfg_tx_refusal(freq)) {
+        return false;
+    }
+    cfg_tx_mhz(freq, mhz, sizeof(mhz));
+    if (now) {
+        msg_update_text_fmt("%s on %s", what, mhz);
+    } else {
+        msg_schedule_text_fmt("%s on %s", what, mhz);
+    }
+    /* Where the hardware transmits it is the bands (cfg_tx_refusal): where the switch is. The WR12 holds it anywhere */
+    if (block) {
+        msg_schedule_text_fmt("%s: no TX", block);
+    } else {
+        msg_schedule_text_fmt("%s", cfg_is_tx_freq(freq) ? "Out of band: Settings > TX Cal" : "Receive only there");
+    }
+    return true;
+}
+
+bool radio_no_data(void) {
+    uint64_t pack = atomic_load(&data_time);    /* before the clock: never a packet newer than now */
+
+    return base_no_data(get_time(), pack, pack != 0);
+}
+
+bool radio_say_no_data(const char *what, bool now) {
+    if (!radio_no_data()) {
+        return false;
+    }
+    if (now) {
+        msg_update_text_fmt("%s: no data from the base", what);
+    } else {
+        msg_schedule_text_fmt("%s: no data from the base", what);
+    }
+    msg_schedule_text_fmt("Baseband: Settings > Info");     /* the notice's pointer (base_gone) */
+    return true;
+}
+
+/* While the base sends no data (#152, radio_no_data) what the GUI keys is refused, said as tx_refused_at says its own:
+ * the radio would transmit with no SWR protection, no power reading and no TX on the screen. A normal start's first
+ * packet can take 16 s (#47): a key before it is refused too, one pressed again after it goes. What the base keys by
+ * itself (the hand mic's PTT, VOX, the KEY jack) is not the GUI's to refuse. The CW Trainer's key still sounds at 0 W,
+ * its PTT quietly not, as outside the bands. A TX under way as the data stops: the flow resets end it (radio_tick) */
+static bool no_data_refused(tx_by_t by) {
+    static uint64_t said;
+
+    if (!radio_no_data()) {
+        return false;
+    }
+    if (by != TX_BY_GUI && practice()) {
+        return by == TX_BY_PTT;
+    }
+    if (get_time() - said > 5000) {     /* once, not for every CW element nor each slot of a beacon */
+        said = get_time();
+        radio_say_no_data("No TX", false);
+    }
+    return true;
+}
+
+/* The modem goes out on radio_tx_freq (radio_set_tx_freq moves the VFO in use there), PTT and the GUI's CW key on
+ * the X6200 in split on the dial too (split_keys_dial). Where it may, not without data from the base either */
+static bool tx_refused(tx_by_t by) {
+    return tx_refused_at(radio_tx_freq(), by) ||
+           (by != TX_BY_GUI && split_keys_dial() && tx_refused_at(vfo_freq(true), by)) ||
+           no_data_refused(by);
+}
+
+bool radio_set_ptt(bool tx) {
+    if (tx && tx_refused(TX_BY_PTT)) {
+        return false;
     }
     WITH_RADIO_LOCK(hw_set_i(HW_PTT, tx));
+    return true;
 }
 
 static int mic_override = -1;      /* the walkie screen's mic, cfg_mic stays as saved */
@@ -861,7 +1093,7 @@ static atomic_bool modem_on;    /* read on other threads (Winlink's on_air) whil
 void radio_set_modem(bool tx) {
     static bool moved;
 
-    if (tx && tx_refused()) {
+    if (tx && tx_refused(TX_BY_GUI)) {
         return;
     }
     if (tx && param_i_get(cfg_band_split) && !atomic_load(&split_held)) {
@@ -959,14 +1191,15 @@ void radio_set_rec_moni(bool on) {
     radio_vol_refresh();
 }
 
-void radio_set_morse_key(bool on) {
-    if (on && tx_refused()) {
-        return;
+bool radio_set_morse_key(bool on) {
+    if (on && tx_refused(TX_BY_MORSE)) {
+        return false;
     }
     morse_on = on;
     morse_ms = get_time();
     hw_pin_set(HW_PIN_MORSE_KEY, on);
     atomic_store(&morse_down_ms, on ? morse_ms | 1 : 0);
+    return true;
 }
 
 void radio_set_morse_key_limit(uint32_t ms) {
@@ -1064,6 +1297,256 @@ static void train_note(void) {
     }
 }
 
+/* Under the lock: the hold outside the amateur bands on or off (band_hold). The base gets the power, VOX and Train
+ * at once; the user's VOX and Train settings stay as saved (on_vox_change, on_key_train_change) */
+static void band_hold_set(bool hold) {
+    int32_t f;
+
+    if (hold == atomic_load(&band_hold)) {
+        return;
+    }
+    atomic_store(&band_hold, hold);
+    if (hold) {
+        atomic_store(&band_said, false);
+    }
+    set_txpwr(txpwr_asked);
+    hw_set_i(HW_VOX, param_i_get(cfg_vox_on) && !hold);
+    hw_set_i(HW_KEY_TRAIN, param_i_get(cfg_key_train) || hold);
+    radio_key_refused(&f);  /* the one refused: the dial where the base keys it (split_keys_dial) */
+    LV_LOG_USER("Radio TX %s: TX at %i%s", hold ? "held at 0 W, VOX off, KEY Train on" : "hold off", f,
+                atomic_load(&off_dial) ? ", Birdie Cal off the dial" : "");
+}
+
+/* VOX and KEY Train to the base as set, VOX off and Train on while band_hold holds. Under the lock, which
+ * band_hold_set holds: a hold between the read and the write left VOX on at the base */
+static void on_vox_change(Subject *subj, void *user_data) {
+    (void)user_data;
+    radio_lock();
+    hw_set_i(HW_VOX, subject_i_get((SubjectInt*)subj) && !atomic_load(&band_hold));
+    radio_unlock();
+}
+
+static void on_key_train_change(Subject *subj, void *user_data) {
+    (void)user_data;
+    radio_lock();
+    hw_set_i(HW_KEY_TRAIN, subject_i_get((SubjectInt*)subj) || atomic_load(&band_hold));
+    radio_unlock();
+}
+
+/* Under the lock, before a VFO of the base goes to freq: held at once where the radio would transmit there and may
+ * not (#121), as xvtr_hold does for a transverter's limit (#104): a band key, a memory, a spot or CAT moves the VFOs
+ * before the dial's frequency is notified, and a hand-mic PTT held through it sent PWR there meanwhile. The VFO that
+ * transmits counts: the one in use, in split the other one; with a TX shift also the one in use at freq + or - the
+ * shift (the other VFO follows it, tx_shift_follow, inside its round). The VFO in use in split only where the base
+ * keys it (split_keys_dial: the X6200, split held off): elsewhere split going off and the VFO in use changing come
+ * to band_look before the base. Holding too early is harmless, the hold goes only after the round (band_settle_cb).
+ * True: held here */
+static bool band_hold_early(radio_vfo_t vfo, int32_t freq) {
+    bool    cur   = vfo == param_i_get(cfg_band_current_vfo);
+    bool    split = param_i_get(cfg_band_split);
+    int32_t shift = param_i_get(cfg_band_tx_shift);
+    bool    keys  = cur ? !split || split_keys_dial() : split;
+
+    if (!band_looked || atomic_load(&band_hold)) {
+        return false;   /* not looked at yet (radio_start), or held already */
+    }
+    if ((keys && cfg_tx_refusal(freq)) ||
+        (cur && split && shift && cfg_tx_refusal(vfo == RADIO_VFO_A ? freq + shift : freq - shift))) {
+        band_hold_set(true);
+        return true;
+    }
+    return false;
+}
+
+/* The GUI keys the radio: its PTT, the modem, the tuner, the SWR scan, the CW key (the CW Trainer's aside) */
+static bool gui_keys(void) {
+    radio_state_t s = atomic_load(&state);
+
+    return s == RADIO_ATU_START || s == RADIO_ATU_WAIT || s == RADIO_ATU_RUN || s == RADIO_SWRSCAN ||
+           hw_tx_keyed_by_gui() || atomic_load(&modem_on) || (morse_on && !practice());
+}
+
+/* The radio's tuner on, in split, with the dial where the radio may not transmit: which VFO its carrier goes out on
+ * the GUI cannot tell (radio_start_atu), so the dial counts on both radios, where radio_key_refused counts it on the
+ * X6200 only. Its carrier is the base's own, which the hold does not hold: not held, given up. *freq (may be NULL):
+ * the dial */
+static bool atu_dial_refused(int32_t *freq) {
+    radio_state_t s = atomic_load(&state);
+    int32_t       f = vfo_freq(true);
+
+    if ((s != RADIO_ATU_START && s != RADIO_ATU_WAIT && s != RADIO_ATU_RUN) || !param_i_get(cfg_band_split) ||
+        !cfg_tx_refusal(f)) {
+        return false;
+    }
+    if (freq) {
+        *freq = f;
+    }
+    return true;
+}
+
+/* The GUI's own TX on where the radio may not transmit, after a move, the switch or a band key while it keys (#121),
+ * on the GUI thread: let go as swr_trip_cb does, the CW Trainer's key excepted. Held at 0 W meanwhile; it went on
+ * there, an app's slot learning its level from 0 W. The SWR scan stops as its Stop does, the tuner gives up */
+static void band_stop(int32_t freq) {
+    radio_state_t s = atomic_load(&state);
+
+    if (s == RADIO_SWRSCAN) {
+        dialog_swrscan_stop(freq);
+        return;
+    }
+    atomic_fetch_add(&band_stops, 1);   /* before the modem bit drops: tx_player keeps no level from it */
+    if (s == RADIO_ATU_START || s == RADIO_ATU_WAIT || s == RADIO_ATU_RUN) {
+        atomic_store(&atu_band_stop, true);
+    }
+    if (!practice()) {
+        cw_encoder_stop();
+        paddle_keyer_stop();
+        radio_set_morse_key(false);
+    }
+    dialog_msg_voice_ptt_pressed();
+    radio_set_modem(false);     /* the digital apps see it and stop (tx_player.c) */
+    radio_set_ptt(false);
+    radio_say_no_tx("TX stopped", freq, false);
+}
+
+/* Looked at again: where the radio may not transmit it holds at once; elsewhere the hold goes only after the round of
+ * notifications (settled: band_settle_cb), once the base has the VFOs, split and the VFO in use that came with it, as
+ * xvtr_pwr_look (at once if that job cannot be queued). The GUI's own TX still on there is stopped after the round */
+static void band_look(bool settled) {
+    bool    no, stop, hold, later;
+    int32_t f;
+
+    radio_lock();
+    no    = radio_key_refused(&f);
+    stop  = no || atu_dial_refused(&f);     /* the tuner in split: on the dial too, stopped without a hold */
+    hold  = no || atomic_load(&off_dial);
+    later = !settled && (stop ? gui_keys() : atomic_load(&band_hold));
+    band_looked = true;
+    if (hold || !later) {
+        band_hold_set(hold);
+    }
+    radio_unlock();
+    if (later && !scheduler_put_coalesced(band_settle_cb)) {
+        WITH_RADIO_LOCK(band_hold_set(radio_key_refused(NULL) || atomic_load(&off_dial)));
+    } else if (settled && stop && gui_keys() && scheduler_on_gui_thread()) {
+        band_stop(f);
+    }
+}
+
+static void band_settle_cb(void *arg) {
+    (void)arg;
+    band_look(true);
+}
+
+/* split_held came or went, or the VFO in use reached the TX frequency (radio_set_tx_freq): the base keys the dial
+ * or no longer does (split_keys_dial), its hold with it, at once: an app's tone on a TX frequency in the bands is not
+ * held at 0 W by a dial outside them. Any thread, no stop */
+static void split_held_look(void) {
+    radio_lock();
+    if (band_looked) {
+        band_hold_set(radio_key_refused(NULL) || atomic_load(&off_dial));
+    }
+    radio_unlock();
+}
+
+static void on_band_hold_change(Subject *subj, void *user_data) {
+    (void)user_data;
+    band_look(subj == NULL);
+}
+
+/* The base went into TX by itself while held (the hand mic's PTT, the KEY jack): the screen says why nothing goes out,
+ * once while it holds. Not with KEY Train's own hold (train_note says it) nor in the CW Trainer. Radio thread */
+static void band_note(void) {
+    int32_t f;
+
+    if (!atomic_load(&band_hold) || atomic_load(&train_hold) || cw_trainer_on() || atomic_exchange(&band_said, true)) {
+        return;
+    }
+    if (radio_key_refused(&f)) {
+        radio_say_no_tx("0 W", f, false);
+    } else {
+        msg_schedule_text_fmt("0 W during Birdie Cal");
+    }
+    fprintf(stderr, "radio: the base keyed by itself while held at 0 W (#121)\n");
+}
+
+unsigned radio_band_stops(void) {
+    return atomic_load(&band_stops);
+}
+
+#ifdef BOARD_X6200
+/* ---- The WR12 on the HOST port (wr12.c, #134) ---- */
+
+/* The base listens on the WR12's IF for the VFO in use at freq: where the WR12 receives (WR12 on HOST, 54 MHz-1 GHz
+ * that no transverter covers: cfg_wr12_freq), once it is set up, and not while Birdie Cal has the base off the dial */
+static bool wr12_takes(int32_t freq) {
+    return cfg_wr12_freq(freq) && wr12_ready() && !atomic_load(&off_dial);
+}
+
+/* Under the lock, the VFO in use just sent to the base: the WR12 follows the dial. Out of its bypass on it where the
+ * base is on its IF (rx: held at 0 W already, by cfg_tx_refusal from wr12_want on), the base taking the IF's I and Q
+ * the other way round; in its bypass elsewhere, IQ as it was. WR12 on HOST off: the WR12 let go */
+static void wr12_follow(bool rx, int32_t dial) {
+    hw_set_i(HW_IQ_SWAP, rx);
+    wr12_want(param_i_get(cfg_wr12), rx, dial);
+}
+
+/* Both VFOs to the base again, the WR12 following the one in use (on_vfo_freq_change), the one no longer in use back on
+ * its own frequency. Not while Birdie Cal has the base off the dial: the WR12 in its bypass then, and the VFOs go back
+ * at the run's end (radio_set_freq_dial) */
+static void wr12_retune(void) {
+    if (atomic_load(&off_dial)) {
+        WITH_RADIO_LOCK(wr12_follow(false, vfo_freq(true)));
+        return;
+    }
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_A);
+    on_vfo_freq_change(NULL, (void *)RADIO_VFO_B);
+}
+
+/* On the GUI thread: what the WR12's thread has to say (found, lost, an ERROR answer); the base onto its IF now that it
+ * is set up, or back on the dial, and the hold looked at again: TX goes free once the WR12 is seen back in its
+ * bypass, or unplugged (cfg_tx_block) */
+static void wr12_changed_cb(void *arg) {
+    char note[64];
+
+    (void)arg;
+    while (wr12_note(note, sizeof(note))) {
+        msg_schedule_text_fmt("%s", note);
+    }
+    wr12_retune();
+    band_look(true);
+}
+
+/* From the WR12's thread: its news to the GUI thread. False: the queue is full, it asks again */
+static bool wr12_notify(void) {
+    return scheduler_put_coalesced(wr12_changed_cb);
+}
+
+/* The radio is in TX, or the GUI keys it (a PTT, the modem or the tuner's bit set before the base reports TX, the CW
+ * Trainer's key too): the WR12 stays in its bypass meanwhile. Any thread */
+static bool wr12_keyed(void) {
+    return atomic_load(&state) != RADIO_RX || gui_keys() || morse_on;
+}
+
+/* Settings > General > WR12 on HOST (also the web Display page), or another VFO in use: the WR12 looked for or let
+ * go, and following the dial */
+static void on_wr12_change(Subject *subj, void *user_data) {
+    (void)subj;
+    (void)user_data;
+    wr12_retune();
+}
+#else
+static bool wr12_takes(int32_t freq) {
+    (void)freq;
+    return false;
+}
+
+static void wr12_follow(bool rx, int32_t dial) {
+    (void)rx;
+    (void)dial;
+}
+#endif
+
 /* Under the lock, before a VFO of the base goes to freq: a transverter's TX power limit there, lower than the one in
  * force, goes to the base first (#104). A band key, a memory, a spot or CAT moves the VFOs before the dial's frequency
  * is notified (on_xvtr_pwr_change), and with PTT held the base sent PWR on the transverter's IF meanwhile. The VFO in
@@ -1094,14 +1577,32 @@ static void on_vfo_freq_change(Subject *subj, void *user_data) {
     int32_t shift = cfg_transverter_shift_for(new_val);
     shift += param_i_get(cfg_band_if_shift);
     radio_lock();
+    bool cur = vfo == param_i_get(cfg_band_current_vfo);
+    if (cur) {
+        atomic_store(&cur_on_tx, false);    /* on the dial, not an app's TX frequency: it keys here (band_hold_early) */
+    }
+    /* The VFO in use where the X6200's WR12 receives (#134): the base on the WR12's IF, held at 0 W before it goes
+     * there whatever the frequency allows (54-55 MHz with TX outside the bands on); the other VFO on its own */
+    bool    wr12 = cur && wr12_takes(new_val);
+    int32_t base = wr12 ? WR12_IF_HZ : new_val - shift;
+    if (wr12) {
+        band_hold_set(true);
+    }
     bool held = xvtr_hold(vfo, new_val);
-    bool changed = hw_vfo_set_freq(vfo, new_val - shift);
+    bool band = band_hold_early(vfo, new_val);
+    bool changed = hw_vfo_set_freq(vfo, base);
+    if (cur) {
+        wr12_follow(wr12, new_val);
+    }
     radio_unlock();
     if (held && !scheduler_put_coalesced(xvtr_settle_cb)) {
         LV_LOG_ERROR("Radio: the transverter's TX power limit not looked at again (the next change does)");
     }
+    if (band && !scheduler_put_coalesced(band_settle_cb)) {
+        LV_LOG_ERROR("Radio: the hold outside the amateur bands not looked at again (the next change does)");
+    }
     if (changed) {
-        LV_LOG_USER("Radio set vfo %i freq=%i (%i)", vfo, new_val, new_val - shift);
+        LV_LOG_USER("Radio set vfo %i freq=%i (%i)", vfo, new_val, base);
     }
 }
 
@@ -1409,7 +1910,7 @@ static void recover_processing_audio_inputs() {
     radio_vfo_t vfo = param_i_get(cfg_band_current_vfo);
     radio_lock();
     hw_vfo_set_mode(vfo, radio_mode_usb_dig);
-    hw_set_f(HW_TXPWR_F, 0.1f);
+    hw_set_f(HW_TXPWR_F, atomic_load(&band_hold) ? 0.0f : 0.1f);   /* the dial moved out during the tune (#121) */
     hw_set_i(HW_MODEM, true);
     usleep(50000);
     hw_set_i(HW_MODEM, false);
@@ -1511,7 +2012,7 @@ static void battery_log(const hw_pack_t *p) {
     }
     clock_update_estimate(min, approx);
 
-    /* On battery at 10% or less: a warning every minute (the 30 s power-off comes at 6.0 V) */
+    /* On battery at 10% or less: a warning every minute (the 30 s power-off comes at BAT_LOW, bat_watch.h) */
     if (s.vext < 3.0f && s.vbat >= 3.0f && s.cap <= 10) {
         int w[2] = { s.cap, min };
 
@@ -1614,14 +2115,48 @@ uint64_t radio_swr_trip_at(void) {
     return atomic_load(&swr_trip_at);
 }
 
+/* A flow reset's line for the base log: now if this second has no line yet (base_guard_log_free), else from the
+ * first tick that finds one free (radio_tick), the step it tells of acting at once. One line a second gets in, and
+ * "base silent" (every 10 s) or "register block not sent" (every 200 ms while I2C fails too) take the second: a tune
+ * or an SWR scan's carrier that waited for a free one stayed on for seconds. One kept, a newer one in its place.
+ * Radio thread */
+static char later_line[160];
+
+static void later_flush(void) {
+    if (later_line[0] && base_guard_log_free()) {
+        base_guard_log("%s", later_line);
+        later_line[0] = 0;
+    }
+}
+
+static void log_later(const char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(later_line, sizeof(later_line), fmt, ap);
+    va_end(ap);
+    later_flush();
+}
+
+#ifndef BOARD_X6200
+/* A tune given up for want of data: the X6100's 0.1 W key after it waits for the first packet back (radio_tick), as
+ * nothing the GUI keys goes out without data (#152). Radio thread */
+static bool recover_due;
+#endif
+
 /* The base never keyed for the tuner, or ended a tune without its done flag (no match: more likely on 10 and 15 m
  * with a real antenna). The GUI stayed in the tuner's state for good with the tune bit set: no new tune, the SWR
  * scan refused, CAT and TCI reporting TX (#25). Now the tune bit off, back to RX, a word on the screen and a line in
- * the base log with what the base reported */
+ * the base log with what the base reported. Also a tune given up where the radio may not transmit (#121), and one
+ * the base sends no data for (#152), its line with how long */
 static void atu_give_up(radio_state_t from, const char *why) {
+    bool flow = now_time - pack_time > FLOW_RESTART_TIMEOUT;    /* from the flow resets: no data for seconds */
+
     WITH_RADIO_LOCK(hw_set_i(HW_ATU_TUNE, false));
 #ifndef BOARD_X6200
-    if (from == RADIO_ATU_RUN) {
+    if (from == RADIO_ATU_RUN && flow) {
+        recover_due = true;
+    } else if (from == RADIO_ATU_RUN) {
         recover_processing_audio_inputs();      /* as after a tune that found its network */
     }
 #endif
@@ -1631,9 +2166,94 @@ static void atu_give_up(radio_state_t from, const char *why) {
     if (from == RADIO_ATU_RUN && notify_rx_tx) {
         notify_rx_tx(false);
     }
-    base_guard_log("ATU: %s (tx %d, atu_status %d, atu_params %08x)", why, pack->tx, pack->atu_status,
-                   (unsigned)pack->atu_params);
+    if (flow) {
+        /* from the flow resets: the packet's fields are the last one's, seconds old (a TX that was) */
+        log_later("ATU: %s for %u ms", why, (unsigned)(now_time - pack_time));
+    } else {
+        base_guard_log("ATU: %s (tx %d, atu_status %d, atu_params %08x)", why, pack->tx, pack->atu_status,
+                       (unsigned)pack->atu_params);
+    }
     msg_schedule_text_fmt("%s", why);
+}
+
+/* The notice's lines (base_gone), whole in every font (DejaVu, the widest: 558 px at most), each as long as the base's
+ * own warnings */
+static const char *const gone_lines[] = {
+    "No data from the base",
+    "No spectrum, no SWR protection",
+    "Baseband: Settings > Info",
+    "Base versions: see the README",    /* an X6200's below 1.0.7 is not the only case */
+};
+
+#define GONE_LINE_MS        4000    /* the notice's next line as the one before goes (msg_box's long message) */
+
+typedef struct {
+    uint8_t line;       /* in gone_lines */
+    bool    never;      /* none since the start: a start stage too */
+} gone_line_t;
+
+/* On the GUI thread: a line of the notice */
+static void base_gone_cb(void *arg) {
+    gone_line_t *g = arg;
+
+    msg_schedule_long_text_fmt("%s", gone_lines[g->line]);
+    if (g->never) {
+        start_trace("base: no data in %u s", BASE_GONE_START_MS / 1000);
+    }
+}
+
+/* No packet from the base for BASE_GONE_MS in receive, looked at in the flow resets (#152). The spectrum, the
+ * waterfall, the S-meter, the battery, the TX meters and the SWR protection stood still, the tuner and the X6200's
+ * POWER key did nothing, and only the base log said so ("base silent"). An X6200 base older than 1.0.7 does that:
+ * the library reads the packets as 1.0.7 sends them (README, The baseband). Counted from the start, the last packet
+ * or the GUI's last TX (base_gone_due, tools/base_guard tests it): BASE_GONE_START_MS at a start (one X6200 on 1.0.8
+ * sent its first packet 16 s in, #47), not while the GUI keys, and a GUI restart (an update, LOCK's base restart)
+ * counts afresh. The TX state alone does not count as keyed: one the GUI keys nothing in is the base's own or one
+ * whose PTT off did not get through (radio_tick), which stays TX, and it is said then too. Said once, again only
+ * after packets came (radio_tick) and stopped again. The first line at once, each next one GONE_LINE_MS on from the
+ * resets, so none comes once the data is back: all four queued at once stayed 16 s after it, and held up any other
+ * message (the tuner's) as long. True: its line went to the base log */
+static bool base_gone(void) {
+    static uint64_t tx_time, line_time;
+    static uint8_t  line;       /* the next line of the notice */
+    radio_state_t   s = atomic_load(&state);
+    bool            keyed = (s != RADIO_RX && s != RADIO_TX) || hw_tx_keyed_by_gui() || atomic_load(&modem_on) ||
+                            morse_on;
+    bool            due = base_gone_due(now_time, pack_time, base_seen, keyed, &tx_time, gone_said);
+    gone_line_t     g = {.line = 0, .never = !base_seen};
+
+    if (gone_said) {
+        if (line < ARRAY_SIZE(gone_lines) && now_time - line_time >= GONE_LINE_MS) {
+            g.line = line;
+            g.never = false;
+            if (scheduler_put(base_gone_cb, &g, sizeof(g))) {
+                line++;
+                line_time = now_time;
+            }
+        }
+        return false;
+    }
+    if (!due || !base_guard_log_free()) {
+        return false;   /* a line written in this second: the next reset tries again (radio_tick) */
+    }
+    if (!scheduler_put(base_gone_cb, &g, sizeof(g))) {
+        return false;   /* the next reset tries again (the note above radio_tick) */
+    }
+    gone_said = true;
+    line = 1;
+    line_time = now_time;
+    base_guard_log("no data from the base for %u ms%s: said on the screen", (unsigned)(now_time - pack_time),
+                   g.never ? ", none since the start" : "");
+    return true;
+}
+
+/* On the GUI thread: the SWR scan stopped for want of data (radio_tick), asked once until it has run. "SWR scan: no
+ * data from the base" fits whole (DejaVu 38: 570 px) */
+static atomic_bool swrscan_stop_asked;
+
+static void swrscan_gone_cb(void *arg) {
+    dialog_swrscan_give_up("SWR scan: no data from the base");
+    atomic_store(&swrscan_stop_asked, false);
 }
 
 /* What the base reports by a change alone goes to the GUI thread once: the low battery, the POWER key, a hand mic
@@ -1646,15 +2266,41 @@ static uint32_t atu_network;        /* the tuner's network, for atu_done_cb */
 static bool     atu_network_due;    /* found, its job not in the queue yet */
 
 static bool radio_tick() {
+    static bool power_was;      /* the X6200's POWER key as the GUI was told it (the packets, the flow resets) */
+
     if (now_time < prev_time) {
         prev_time = now_time;
     }
+    later_flush();
 
     int32_t d = now_time - prev_time;
 
     if (hw_flow_read(pack)) {
+        /* Its gap kept until a line is free: right after a "base silent" line it was dropped (one a second) */
+        static uint32_t again_ms;
+
+        if (gone_said) {
+            again_ms = now_time - pack_time;
+        }
+        if (again_ms && base_guard_log_free()) {
+            base_guard_log("data from the base again after %u ms", (unsigned)again_ms);
+            again_ms = 0;
+        }
+#ifndef BOARD_X6200
+        /* Before the other threads see the data and may key, which its end would cut. Not while the base transmits
+         * by itself (the hand mic's PTT, its tune still on): dropped then */
+        if (recover_due) {
+            recover_due = false;
+            if (!pack->tx && atomic_load(&state) == RADIO_RX) {
+                recover_processing_audio_inputs();
+            }
+        }
+#endif
+        base_seen = true;
+        gone_said = false;      /* said again if it stops again (base_gone) */
         prev_time = now_time;
         pack_time = now_time;
+        atomic_store(&data_time, now_time);
         pack_vbat = pack->vbat;
         pack_vext = pack->vext;
 
@@ -1666,7 +2312,8 @@ static bool radio_tick() {
              * the battery log and time left, its warnings and the power-off wait until they count */
             static bat_watch_t bat_watch;
 
-            bat_watch_reading(&bat_watch, pack->vbat, pack->vext, pack->vext_flag, pack->charging, now_time);
+            bat_watch_reading(&bat_watch, pack->vbat, pack->vext, pack->vext_flag, pack->charging, pack->bat_missing,
+                              pack->tx, now_time);
 
             battery_startup_log(&bat_watch, pack);
             battery_model_load();
@@ -1754,8 +2401,6 @@ static bool radio_tick() {
 
         /* The POWER key where the base reports it (the X6200): to the GUI thread as a key. power_was: what
          * the GUI was told (the note above radio_tick) */
-        static bool power_was;
-
         if (pack->power_key != power_was) {
             bool down = pack->power_key;
 
@@ -1770,10 +2415,12 @@ static bool radio_tick() {
         switch (state) {
             case RADIO_RX:
                 if (pack->tx && state_move(RADIO_RX, RADIO_TX)) {
+                    tx_by_gui = false;  /* set below while the GUI keys it */
                     if (notify_rx_tx) {
                         notify_rx_tx(true);
                     }
                     train_note();
+                    band_note();
                 }
                 break;
 
@@ -1805,13 +2452,22 @@ static bool radio_tick() {
                 break;
 
             case RADIO_ATU_START:
+                /* Moved where the radio may not transmit since the press, or the switch turned off (#121): its
+                 * carrier is the base's own, which the hold's 0 W does not hold, so it never starts. In split either
+                 * VFO, as radio_start_atu */
+                if (atomic_exchange(&atu_band_stop, false) || atomic_load(&band_hold) || atu_dial_refused(NULL)) {
+                    atu_give_up(RADIO_ATU_START, "Tuner stopped");
+                    break;
+                }
                 WITH_RADIO_LOCK(hw_set_i(HW_ATU_TUNE, true));
                 atu_time = now_time;
                 state_move(RADIO_ATU_START, RADIO_ATU_WAIT);
                 break;
 
             case RADIO_ATU_WAIT:
-                if (pack->tx) {
+                if (atomic_exchange(&atu_band_stop, false)) {
+                    atu_give_up(RADIO_ATU_WAIT, "Tuner stopped");   /* band_stop said why */
+                } else if (pack->tx) {
                     if (notify_rx_tx) {
                         notify_rx_tx(true);
                     }
@@ -1823,7 +2479,9 @@ static bool radio_tick() {
                 break;
 
             case RADIO_ATU_RUN:
-                if (pack->atu_status && !pack->tx) {
+                if (atomic_exchange(&atu_band_stop, false)) {
+                    atu_give_up(RADIO_ATU_RUN, "Tuner stopped");
+                } else if (pack->atu_status && !pack->tx) {
                     /* The settings on the LVGL thread: their observers run where they are set, and
                      * the delayed ones (the info bar) schedule LVGL calls, which only that thread may.
                      * Not in the queue: the next packets try again (the note above radio_tick) */
@@ -1888,6 +2546,10 @@ static bool radio_tick() {
             || hw_tx_keyed_by_gui()
             || morse_on || (uint32_t)now_time - morse_ms < MORSE_HANG_MS;
 
+        /* Not by the CW key's hang: a paddle in the KEY jack answering a CW message within it is the base's TX */
+        if (state == RADIO_TX && (hw_tx_keyed_by_gui() || morse_on)) {
+            tx_by_gui = true;
+        }
         if (tx_watch_check(&tx_watch, now_time, pack->tx, gui_tx)) {
             base_guard_log("base still in TX %u ms after an un-key or write error, nothing keying it from the GUI: PTT off resent",
                            TX_WATCH_HOLD_MS);
@@ -1922,7 +2584,67 @@ static bool radio_tick() {
         if (d > FLOW_RESTART_TIMEOUT) {
             LV_LOG_WARN("Flow reset");
             static uint64_t silent_logged;
-            if (base_silent_due(now_time, start_time, &silent_logged)) {
+            radio_state_t   s = atomic_load(&state);
+
+            /* The steps below act at once, their line in the base log through log_later: in the first second
+             * with none yet */
+
+            /* The tuner's steps above go by the packets: with none (a base whose packets do not decode, #152), a tune
+             * asked stayed in its state for good without a word, and tx_player refused every digital TX until the GUI
+             * restarted. Given up on both radios once the base has been silent for as long as a tune has to start;
+             * the tune bit goes to the base only on a packet, so a base silent from the press on is never asked to tune */
+            if ((s == RADIO_ATU_START || s == RADIO_ATU_WAIT || s == RADIO_ATU_RUN) &&
+                now_time - pack_time > ATU_START_MS) {
+                atu_give_up(s, "Tuner: no data from the base");
+            }
+            /* A TX ends on a packet without the TX flag: with none (the data lost while the base keyed, or while the
+             * GUI did and let go since) the state stayed RADIO_TX for good, tx_player refusing every digital TX, CAT
+             * and TCI reporting TX, and base_gone never saying it. Back to RX once the base has been silent this long
+             * and the GUI keys nothing, its CW past the base's hang; a packet with the TX flag brings TX back. A TX
+             * the GUI never keyed is the base's own (the hand mic's PTT, VOX, the KEY jack), which the GUI cannot see
+             * let go: it waits as long as the notice (base_gone), the base taken for gone, not 3 s into a gap while
+             * still keyed, CAT, TCI and the remote saying RX and a remote client free to take control. Nor while the
+             * register block is due (resync_due): a base that hangs also NAKs on I2C, and the GUI's PTT off that
+             * failed with it may not have reached it. TX is what the screen should say then; tx_watch, which resends
+             * and cuts the power, needs packets. The first block that gets through clears it */
+            if (s == RADIO_TX && now_time - pack_time > (tx_by_gui ? NO_DATA_MS : BASE_GONE_MS) && !gui_keys() &&
+                (uint32_t)now_time - morse_ms >= MORSE_HANG_MS && !resync_due && state_move(RADIO_TX, RADIO_RX)) {
+                if (notify_rx_tx) {
+                    notify_rx_tx(false);
+                }
+                log_later("TX: no data from the base for %u ms, back to RX", (unsigned)(now_time - pack_time));
+            }
+            /* The SWR scan keys the base at its start and steps on the readings: with none a 1 W carrier went out
+             * until Stop, the sweep standing still and the state refusing digital TX. Stopped as its Stop does, the
+             * stop asked once (marked before the put: the job may run before the put returns) */
+            if (s == RADIO_SWRSCAN && now_time - pack_time > NO_DATA_MS &&
+                !atomic_exchange(&swrscan_stop_asked, true)) {
+                if (scheduler_put_urgent(swrscan_gone_cb, NULL, 0)) {
+                    log_later("SWR scan: no data from the base for %u ms, stopped", (unsigned)(now_time - pack_time));
+                } else {
+                    atomic_store(&swrscan_stop_asked, false);   /* the next reset tries again */
+                }
+            }
+            /* The X6200's POWER key is in the data alone: a tap whose release fell into a gap stayed down, and its
+             * hold timer (front_keys.c) made it a power-off, which the step below now carries out at once. A key
+             * the data no longer reports is let go */
+            if (power_was) {
+                bool down = false;
+
+                if (scheduler_put_urgent(power_key_cb, &down, sizeof(down))) {
+                    power_was = false;
+                }
+            }
+            /* The X6100's POWER key is its own, not in the data: radio_poweroff saved, synced and said "Power off",
+             * and only a packet switched the radio off. With none it stayed on. The switch-off is a register write,
+             * which does not need the data */
+            if (s == RADIO_POWEROFF) {
+                WITH_RADIO_LOCK(hw_poweroff());
+                state_move(RADIO_POWEROFF, RADIO_OFF);
+            }
+            if (base_gone()) {
+                silent_logged = now_time;   /* its line instead of a "base silent" one */
+            } else if (base_guard_log_free() && base_silent_due(now_time, start_time, &silent_logged)) {
                 char vb[8] = "n/a", ve[8] = "n/a";
                 if (pack_vbat) {
                     snprintf(vb, sizeof(vb), "%.1f V", pack_vbat * 0.1f);

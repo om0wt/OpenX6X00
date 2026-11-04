@@ -1785,10 +1785,14 @@ static bool allowed(client_t *c, uint8_t role, bool control) {
  * same every second to renew the lease (ptt_lease). Only the hold that keyed is renewed: one that ended (the lease
  * ran out, three minutes, a release) or was refused stays ended, so the renewals a stalled link delivers late key
  * nothing, and a press on purpose comes with a new number (audit C02). A page without the numbers, open since
- * before an update, renewed with the press itself: it is told to reload. Socket thread */
+ * before an update, renewed with the press itself: it is told to reload. A press where the radio may not transmit is
+ * told why and not passed on, as TUNE's (#121), and one while the base sends no data (#152): the page's operator does
+ * not see the radio's screen. Socket thread */
 static void ptt_down(client_t *c, const char *hold_text) {
     uint32_t hold = hold_text ? (uint32_t)strtoul(hold_text, NULL, 10) : 0;
     int      k    = 0;
+    char     no[96];
+    int32_t  f;
 
     while (k < c->nheld && c->held[k] != BTN_TRIGGER_HAPPY4) k++;
     if (!hold) {
@@ -1807,6 +1811,14 @@ static void ptt_down(client_t *c, const char *hold_text) {
     c->ptt_ms = now_ms();
     if (k < c->nheld)
         return;                                 /* down already: the lease renewed, the three minutes count on */
+    if (radio_key_refused(&f) && cfg_tx_refusal_text(f, no, sizeof(no))) {    /* where the PTT would go out (#121) */
+        client_textf(c, "err ptt: no TX on %s", no);
+        return;
+    }
+    if (radio_no_data()) {      /* none from the base (#152) */
+        client_text(c, "err ptt: no data from the base");
+        return;
+    }
     if (c->nheld == MAX_HELD) {
         client_text(c, "err too many keys held");
         return;

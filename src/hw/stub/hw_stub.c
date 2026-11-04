@@ -148,6 +148,7 @@ void hw_vfo_set_pre(radio_vfo_t v, bool on) {
 }
 
 void hw_poweroff(void) {
+    fprintf(stderr, "hw_stub: power off\n");     /* the PC build stays on: its log says it was asked */
 }
 
 bool hw_resend_all(void) {
@@ -188,8 +189,8 @@ static float gauss(void) {
     return r * cosf(2.0f * (float)M_PI * u2);
 }
 
-/* What PRE and ATT do to the stream: twice and half the level, or HOST_STUB_FE in dB ("16,52": a preamp of 16 dB
- * and an attenuator of 52 dB, an X6200 on 80 m in #125), for the S-meter's corrections and their Measure */
+/* What PRE and ATT do to the stream: twice and half the level, or HOST_STUB_FE in dB ("16,51": a preamp of 16 dB
+ * and an attenuator of 51 dB, an X6200 on 80 m in #125), for the S-meter's corrections and their Measure */
 static float front_end_gain(bool pre, bool att) {
     static float pre_gain = -1.0f, att_gain = 0.5f;
 
@@ -237,10 +238,40 @@ static void add_band(float _Complex *s, int32_t center, float gain) {
     n += SAMPLES;
 }
 
+/* HOST_STUB_SILENT="<from>,<to>,...": no packets between those ms after the first read, as from a base whose packets
+ * do not decode (#152: an X6200 base older than 1.0.7); a last <from> without its <to> holds for good, "0" none at all */
+static bool silent(uint64_t now) {
+    static int64_t  edge[8];
+    static int      edges = -1;
+    static uint64_t first;
+
+    if (edges < 0) {
+        const char *e = getenv("HOST_STUB_SILENT");
+        char       *end;
+
+        edges = 0;
+        first = now;
+        while (e && *e && edges < 8) {
+            edge[edges++] = strtoll(e, &end, 10);
+            e = *end == ',' ? end + 1 : "";
+        }
+    }
+    bool    in = false;
+    int64_t ms = (int64_t)((now - first) / 1000000);
+
+    for (int i = 0; i < edges && ms >= edge[i]; i++) {
+        in = !in;
+    }
+    return in;
+}
+
 bool hw_flow_read(hw_pack_t *p) {
     uint64_t now = now_ns();
     const uint64_t period = (uint64_t)SAMPLES * 1000000000ULL / SAMPLE_RATE;   /* 5.12 ms */
 
+    if (silent(now)) {
+        return false;
+    }
     if (next_pack_ns == 0) {
         next_pack_ns = now;
     }

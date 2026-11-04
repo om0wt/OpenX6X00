@@ -13,6 +13,10 @@
  *     ses.can()                     -> "" when this browser may operate now, else the reason
  *     ses.explain()                 the dialog that changes what can() refused (pair, take control)
  *     ses.chips()                   -> [{n, s, t}] for RadioLink.health: Access and Control
+ *     ses.holds(err)                how long the radio's refusal "err TEXT" holds: a function, true while this
+ *                                   browser may still not do it (view only, controlled elsewhere), or null
+ *   status(text, error, holds), the page's: a text that says how things are (Take control first, On the
+ *   air) comes with holds(), true while it is so, and the page's status line drops it once it is not (#58)
  *   The element `el` gets two buttons: the role (Pair, or this browser's name) and the control
  *   holder (Take control / Release); an admin gets Sessions. The token lives in localStorage
  *   "x6100session", so the Panel and the Remote page share one pairing. With awayUrl (a function
@@ -96,6 +100,7 @@
   function Session(o) {
     this.o = o; this.role = "view"; this.tx = false; this.name = "-"; this.pending = false; this.radioTx = false;
     this.ctl = {who: "none", name: "", mine: false}; this.sessions = null; this.pairing = false;
+    this.taking = false;     /* a Take control sent: its answer says so in the status line */
     this.$role = $("<button type='button' class='ses'>").on("click", this.roleClick.bind(this));
     this.$ctl = $("<button type='button' class='ses'>").on("click", this.ctlClick.bind(this));
     this.$adm = $("<button type='button' class='ses' hidden>Sessions</button>").on("click", this.sessionsOpen.bind(this));
@@ -120,12 +125,15 @@
     if (head === "ctl") {
       /* "ctl none|local|tci 0" or "ctl browser NAME 0|1" */
       const mine = w[w.length - 1] === "1", who = w[0], name = who === "browser" ? w.slice(1, -1).join(" ") : "";
-      const was = this.ctl;
-      this.ctl = {who: who, name: name, mine: mine};
+      const was = this.ctl, self = this, took = this.taking;
+      this.ctl = {who: who, name: name, mine: mine}; this.taking = false;
       /* This page's own Mic on keys through its TCI link, which holds control for the over and gives it back after
        * (#97): not a takeover to report, nor a Take control to ask for */
       const own = who === "tci" && this.ptt && this.ptt.micOver();
-      if (was.mine && !mine && !own && this.o.status) this.o.status(who === "local" ? "Control taken at the radio: Take control to operate from here again" : who === "tci" ? "A TCI client took control: Take control to operate from here again" : who === "browser" ? "Control taken by " + name : "Control released", who !== "none");
+      /* what the status line says of it goes when control moves again (#58: "Take control first" stayed up) */
+      const still = function() { return self.ctl.who === who && self.ctl.name === name && self.ctl.mine === mine; };
+      if (was.mine && !mine && !own && this.o.status) this.o.status(who === "local" ? "Control taken at the radio: Take control to operate from here again" : who === "tci" ? "A TCI client took control: Take control to operate from here again" : who === "browser" ? "Control taken by " + name : "Control released", who !== "none", still);
+      else if (took && mine && !was.mine && this.o.status) this.o.status("In control: this browser operates the radio", false, still);
       this.render(); if (this.o.onChange) this.o.onChange();
       return true;
     }
@@ -157,6 +165,16 @@
       return false;    /* the page shows it too */
     }
     return false;
+  };
+  /* The radio's refusals about this browser's access or control hold as long as their cause (#58). One because the
+   * radio is on the air (Take control, TUNE) holds while it is, and for its first second in any case: the radio tells
+   * its TX state after the command it refused, so a command sent just as it keyed is refused before "tx 1" comes */
+  const TX_TOLD_MS = 1000;
+  Session.prototype.holds = function(err) {
+    const self = this, at = Date.now();
+    if (/^(view only|controlled by)/.test(err)) return function() { return !!self.can(); };
+    if (/^(busy: the radio is transmitting|tune: on the air)/.test(err)) return function() { return self.radioTx || Date.now() - at < TX_TOLD_MS; };
+    return null;
   };
   Session.prototype.can = function() {
     if (this.role === "view") return "This browser only watches: Pair it to operate";
@@ -252,9 +270,10 @@
   };
   Session.prototype.ctlClick = function() {
     if (this.role === "view") { this.pairError = null; this.pairOpen(); return; }
+    const self = this;
     if (this.ctl.mine) this.o.send("control release");
-    else if (this.radioTx) { if (this.o.status) this.o.status("The radio is transmitting: control cannot move now", true); }
-    else this.o.send("control take");
+    else if (this.radioTx) { if (this.o.status) this.o.status("The radio is transmitting: control cannot move now", true, function() { return self.radioTx; }); }
+    else { this.taking = true; this.o.send("control take"); }
   };
   Session.prototype.sessionsOpen = function() { this.sessions = null; this.o.send("sessions"); this.sessionsRender(); };
   Session.prototype.sessionsRender = function() {
@@ -281,9 +300,10 @@
   function Ptt(o) {
     this.o = o; this.state = "idle"; this.path = null; this.since = 0; this.timer = null; this.renew = null; this.why = ""; this.tick = null;
     this.hold = 0;    /* the last press's number */
+    this.holds = null;    /* while a refusal's cause lasts (set) */
     const self = this;
     if (o.session) o.session.ptt = this;     /* its Mic on over is no takeover to the session (#97) */
-    this.tick = setInterval(function() { if (self.state === "tx") self.render(); }, 1000);
+    this.tick = setInterval(function() { if (self.state === "tx" || self.state === "refused") self.render(); }, 1000);
     this.render();
   }
   /* A transmission of the browser's microphone, from its press until the radio confirmed its end */
@@ -293,12 +313,12 @@
     const self = this, o = this.o;
     if (this.state === "requesting" || this.state === "tx") return;
     if (this.state === "releasing") { this.why = "Wait: the radio is still unkeying"; this.render(); return; }
-    if (this.state === "busy") { this.set("busy", "The radio is transmitting already"); return; }
-    if (o.link && o.link.stalled) { this.set("refused", "The radio does not answer: no transmission until it does"); return; }
+    if (this.state === "busy") { this.set("busy", "The radio is transmitting already", function() { return self.state === "busy"; }); return; }
+    if (o.link && o.link.stalled) { this.set("refused", "The radio does not answer: no transmission until it does", function() { return o.link.stalled; }); return; }
     const no = o.session ? o.session.can() : "";
-    if (no) { this.set("refused", no); return; }
+    if (no) { this.set("refused", no, function() { return o.session.can() === no; }); return; }
     const mic = o.mic && o.mic.wanted();
-    if (mic && !o.mic.ready()) { this.set("refused", "Microphone not ready: no transmission (the radio's own microphone is not used in its place)"); return; }
+    if (mic && !o.mic.ready()) { this.set("refused", "Microphone not ready: no transmission (the radio's own microphone is not used in its place)", function() { return o.mic.wanted() && !o.mic.ready(); }); return; }
     this.path = mic ? "mic" : "radio"; this.since = Date.now();
     this.clear();
     let sent;
@@ -324,7 +344,7 @@
     const self = this;
     if (on) {
       /* only the confirmation timeout goes: the renewal keeps the server's lease while the button is held (audit B10) */
-      if (this.state === "requesting") { if (this.timer) { clearTimeout(this.timer); this.timer = null; } this.state = "tx"; this.why = ""; this.render(); if (this.o.status) this.o.status("On the air (" + (this.path === "mic" ? "browser microphone" : "the radio's microphone") + ")"); }
+      if (this.state === "requesting") { if (this.timer) { clearTimeout(this.timer); this.timer = null; } this.state = "tx"; this.why = ""; this.render(); if (this.o.status) this.o.status("On the air (" + (this.path === "mic" ? "browser microphone" : "the radio's microphone") + ")", false, function() { return self.state === "tx" || self.state === "releasing"; }); }
       else if (this.state === "idle" || this.state === "ended" || this.state === "refused") { this.state = "busy"; this.render(); }
     } else {
       if (this.state === "tx") { this.clear(); this.stopPath(); this.set("ended", "The radio ended the transmission"); }
@@ -333,11 +353,13 @@
     if (!on && this.state === "ended" && !this.timer) this.timer = setTimeout(function() { if (self.state === "ended") self.set("idle", ""); }, ENDED_MS);
   };
   /* An err while a press waits for "tx 1": the PTT's own refusals (view only, control elsewhere, no TX for this
-   * session) end it, and let go as the 1.5 s timeout does: an err cannot say which command it answers, and this
-   * press may have keyed. Another err (a tune refused, a Take control refused while on the air) leaves it */
+   * session, "ptt: no TX on ...": a frequency the radio may not transmit on, #121) end it, and let go as the 1.5 s
+   * timeout does: an err cannot say which command it answers, and this press may have keyed. Another err (a tune
+   * refused, a Take control refused while on the air) leaves it */
   Ptt.prototype.err = function(text) {
     if (/^ptt released/.test(text)) { this.clear(); if (this.renew) { clearInterval(this.renew); this.renew = null; } if (this.state === "tx" || this.state === "requesting") this.set("ended", "The radio unkeyed: " + text.replace(/^ptt released: /, "")); return true; }
-    if (this.state === "requesting" && /^(controlled by|view only|this session may not transmit)/.test(text)) { this.clear(); this.stopPath(); this.set("refused", text); return true; }
+    const ses = this.o.session;
+    if (this.state === "requesting" && /^(controlled by|view only|this session may not transmit|ptt: )/.test(text)) { this.clear(); this.stopPath(); this.set("refused", text.replace(/^ptt: /, ""), ses && ses.holds ? ses.holds(text) : null); return true; }
     return false;
   };
   /* The setting changed (the microphone on or off): an old refusal or ending is no longer the news */
@@ -345,15 +367,18 @@
   Ptt.prototype.lost = function(why) {
     if (this.state === "requesting" || this.state === "tx" || this.state === "releasing") { this.clear(); this.stopPath(); this.set("ended", why || "The link dropped: the transmission is over"); }
   };
-  Ptt.prototype.set = function(state, why) {
+  /* holds: how long the status line keeps why (status), and the button a refusal (render) */
+  Ptt.prototype.set = function(state, why, holds) {
     const self = this;
     this.clear();
-    this.state = state; this.why = why || "";
-    if (why && this.o.status) this.o.status(why, state !== "idle");
+    this.state = state; this.why = why || ""; this.holds = holds || null;
+    if (why && this.o.status) this.o.status(why, state !== "idle", holds);
     if (state === "ended" || state === "refused") this.timer = setTimeout(function() { if (self.state === state) self.set("idle", ""); }, ENDED_MS);
     this.render();
   };
+  /* A refusal whose cause has gone (control back here, the radio answering again) goes with it, not 5 s later (#58) */
   Ptt.prototype.render = function() {
+    if (this.state === "refused" && this.holds && !this.holds()) { this.set("idle", ""); return; }
     const el = this.o.el; if (!el) return;
     const mic = this.o.mic && this.o.mic.wanted();
     let main, sub = "TX audio: " + (mic ? "browser microphone" : "microphone at the radio");
@@ -375,9 +400,9 @@
   const TUNE_START_MS = 2000;
   function Tune(o) {
     this.o = o; this.state = "idle"; this.hold = 0; this.renew = null; this.timer = null; this.since = 0; this.limit = 0;
-    this.why = ""; this.radioOn = false;
+    this.why = ""; this.radioOn = false; this.holds = null;
     const self = this;
-    this.tick = setInterval(function() { if (self.state === "on" || (self.state === "idle" && self.radioOn)) self.render(); }, 1000);
+    this.tick = setInterval(function() { if (self.state === "on" || self.state === "refused" || (self.state === "idle" && self.radioOn)) self.render(); }, 1000);
     this.render();
   }
   Tune.prototype.clear = function() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } if (this.renew) { clearInterval(this.renew); this.renew = null; } };
@@ -389,9 +414,9 @@
       this.timer = setTimeout(function() { if (self.state === "stopping") self.set("idle", ""); }, TUNE_START_MS);
       return;
     }
-    if (o.link && o.link.stalled) { this.set("refused", "The radio does not answer: no tune until it does"); return; }
+    if (o.link && o.link.stalled) { this.set("refused", "The radio does not answer: no tune until it does", function() { return o.link.stalled; }); return; }
     const no = o.session ? o.session.can() : "";
-    if (no) { this.set("refused", no); return; }
+    if (no) { this.set("refused", no, function() { return o.session.can() === no; }); return; }
     const key = "tune 1 " + (++this.hold);
     this.clear();
     if (!o.send(key)) { this.set("refused", "No link to the radio: no tune"); return; }
@@ -403,12 +428,12 @@
     }, TUNE_START_MS);
   };
   Tune.prototype.radio = function(on, limit) {
-    const was = this.radioOn;
+    const self = this, was = this.radioOn;
     this.radioOn = !!on; if (limit) this.limit = limit;
     if (on && this.state === "requesting") {
       if (this.timer) { clearTimeout(this.timer); this.timer = null; }     /* the renewal goes on while it is on */
       this.state = "on"; this.since = Date.now(); this.why = "";
-      if (this.o.status) this.o.status("TUNE on the air: press TUNE again to stop");
+      if (this.o.status) this.o.status("TUNE on the air: press TUNE again to stop", false, function() { return self.state === "on" || self.state === "stopping"; });
     } else if (!on && this.state === "on") {
       this.clear(); this.set("ended", "The tune is over"); return;
     } else if (!on && this.state === "stopping") {
@@ -422,8 +447,9 @@
   Tune.prototype.err = function(text) {
     if (!/^tune\b/.test(text) && !(this.state === "requesting" && /^(controlled by|view only|this session may not transmit)/.test(text))) return false;
     this.clear();
+    const ses = this.o.session;
     if (/^tune stopped/.test(text)) { this.radioOn = false; this.set("ended", "The radio stopped the tune: " + text.replace(/^tune stopped: /, "")); }
-    else this.set("refused", text.replace(/^tune: /, ""));
+    else this.set("refused", text.replace(/^tune: /, ""), ses && ses.holds ? ses.holds(text) : null);
     return true;
   };
   /* The stop goes behind the renewals a stalled link still holds, as the PTT's release does: delivered late, they end
@@ -433,15 +459,16 @@
     if (this.state === "requesting" || this.state === "on") { this.clear(); this.o.send("tune 0"); this.set("ended", why || "The link dropped: the radio stops the tune within 3 s"); }
     else if (this.state === "stopping") { this.clear(); this.set("idle", ""); }
   };
-  Tune.prototype.set = function(state, why) {
+  Tune.prototype.set = function(state, why, holds) {
     const self = this;
     this.clear();
-    this.state = state; this.why = why || "";
-    if (why && this.o.status) this.o.status(why, state === "ended" || state === "refused");
+    this.state = state; this.why = why || ""; this.holds = holds || null;
+    if (why && this.o.status) this.o.status(why, state === "ended" || state === "refused", holds);
     if (state === "ended" || state === "refused") this.timer = setTimeout(function() { if (self.state === state) self.set("idle", ""); }, ENDED_MS);
     this.render();
   };
   Tune.prototype.render = function() {
+    if (this.state === "refused" && this.holds && !this.holds()) { this.set("idle", ""); return; }    /* as the PTT's */
     const el = this.o.el; if (!el) return;
     let main, sub = "external tuner";
     const s = Math.floor((Date.now() - this.since) / 1000), lim = this.limit ? " / " + this.limit + " s" : "";

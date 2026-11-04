@@ -12,15 +12,25 @@
 #include <stdint.h>
 #include "lvgl/lvgl.h"
 
-/* The TX views: the panel under the frequency strip, the strip over the digital apps.
- * Returns the object that takes the TX and RX events */
+/* The TX views: the panel under the frequency strip (Settings > Display > INTERFACE > Popups TX, and every TUNE for
+ * an external tuner), the strip over the digital apps. Returns the object that takes the TX and RX events */
 lv_obj_t *tx_info_init(lv_obj_t *parent);
+
+/* At the TX event (LVGL thread): this TX's readings on the panel or the apps' strip; if not, the S-meter box shows
+ * them (#166) */
+bool tx_info_shown(void);
+
+/* The S-meter box while transmitting with neither up (not the deck's scales): power, SWR and ALC */
+void tx_meters_draw(lv_obj_t *box, lv_draw_ctx_t *draw_ctx);
 
 /* A reading from the base (any thread): power in W, SWR, ALC as the base sends it */
 void tx_info_update(float pwr, float swr, float alc);
 
 /* The last power and SWR */
 void tx_info_get(float *pwr, float *swr);
+
+/* The last ALC; *greyed when it only tells how far the base turned its own carrier down (CW, CW-R) */
+float tx_info_get_alc(bool *greyed);
 
 /* The length of the transmission starting, seconds (a slot: FT8 15, JS8 by its speed, WSPR 120): the
  * strip counts up to it, "5 / 15 s". 0 (the TX player at the end): the time alone. Any thread. */

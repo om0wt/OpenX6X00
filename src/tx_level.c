@@ -15,9 +15,23 @@ void tx_level_start(tx_level_t *l, float target_w) {
 
 static float tx_level_decide(tx_level_t *l);
 
-float tx_level_block(tx_level_t *l, bool have, float pwr_w, float alc) {
+bool tx_level_counts(const tx_level_t *l) {
+    return l->blocks > TX_LEVEL_SETTLE_BLOCKS && l->sound > TX_LEVEL_QUIET_BLOCKS;
+}
+
+float tx_level_block(tx_level_t *l, bool sound, bool have, float pwr_w, float alc) {
     l->blocks++;
-    if (l->blocks <= TX_LEVEL_SETTLE_BLOCKS) return 0.0f;
+    /* Silence in a key (XARA waits out the other station's CW ID keyed, 2.7-3.6 s of zeros): the base puts out
+     * nothing, and its 0 W and ALC 0 took the drive up 0.5 dB a window, kept for every app; on the X6100 towards where
+     * the ALC reads 3, on the X6200 to the codec's top. No readings in it, nor in the sound's first blocks after it,
+     * and the window it cut into starts again */
+    l->sound = sound ? l->sound + 1 : 0;
+    if (!sound) {
+        l->silent++;
+        l->n = l->wb = 0;
+        l->sum_pwr = l->sum_alc = 0.0f;
+    }
+    if (!tx_level_counts(l)) return 0.0f;
     /* A decision every half second of blocks, on the readings that came in it: the radio sends
      * about 2.5 a second, so counting readings made a window of 5 s and the drive crept down
      * by 1-2 dB a transmission */
@@ -74,6 +88,7 @@ static float tx_level_decide(tx_level_t *l) {
      * not ours: an ALC over 3 now and then (RF picked up, a base's own state) took the level down 0.75 dB a window and
      * kept it, from the setting to 0 W in two or three transmissions, then "TX 0 W" and back from the default (#123) */
     float p = l->sum_pwr / l->n, a = l->power_hold ? 0.0f : l->sum_alc / l->n;
+    l->windows++;
     l->n = l->wb = 0;
     l->sum_pwr = l->sum_alc = 0.0f;
 

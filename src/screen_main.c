@@ -22,6 +22,7 @@
 #include "msg_box.h"
 #include "msg_note.h"
 #include "clock.h"
+#include "board.h"
 #include "cw_tune_view.h"
 #include "info_bar.h"
 #include "smeter.h"
@@ -479,7 +480,7 @@ static const char *app_name(press_action_t a) {
         case ACTION_APP_BANDS:      return "Bands";
         case ACTION_APP_SNAKE:      return "Snake";
         case ACTION_APP_PSK:        return dialog_psk_is_63() ? "PSK63" : "PSK31";
-        case ACTION_APP_OLIVIA:     return "Olivia";
+        case ACTION_APP_OLIVIA:     return dialog_olivia_is_contestia() ? "Contestia" : "Olivia";
         case ACTION_APP_JTTY:       return "JTTY";
         case ACTION_APP_CHANNELS:   return "Channels";
         case ACTION_APP_BIRDIE:     return "Birdie Cal";
@@ -508,6 +509,8 @@ void main_screen_close_app(void) {
 }
 
 void main_screen_start_app(press_action_t app_action) {
+    main_screen_buttons_wake();     /* the app's buttons seen, also when it is opened from afar */
+
     /* Modes again closes its menu. */
     if (app_action == ACTION_APP_MODES && dialog_type_is_run(dialog_modes)) {
         dialog_destruct();
@@ -778,12 +781,77 @@ static void ab_key(bool tap, bool hold) {
     }
 }
 
+/* Settings > Display > Hide buttons (#128): on the main screen the five buttons and the knob lines over them hide
+ * after 3, 5 or 10 s without a key, the waterfall seen down to the bottom. A key brings them back and does what it
+ * does, but for F1-F5, whose press only brings them back: a button not seen is never pressed. The main knob tunes
+ * with them hidden; VOL and the MFK too, their value on the message line (as with Knob info off), and while the
+ * buttons show a turn or a press of them counts as a key. Never over an app (its window, RTTY) or in walkie mode */
+static const uint32_t hide_ms[] = {0, 3000, 5000, 10000};   /* the setting: Off, 3 s, 5 s, 10 s */
+
+static lv_timer_t   *hide_timer;
+static keypad_key_t woke_key;       /* the F key whose press brought them back: the rest of it does nothing */
+
+static void hide_arm(void);
+
+static void hide_cb(lv_timer_t *t) {
+    hide_timer = NULL;      /* one shot: LVGL deletes it */
+    if (dialog_is_run() || rtty_get_state() != RTTY_OFF || walkie_on()) {
+        hide_arm();         /* the app's buttons stay: counted again, for when it closes */
+        return;
+    }
+    buttons_hide(true);
+}
+
+/* The time from now; none with the setting off */
+static void hide_arm(void) {
+    int32_t i = param_i_get(cfg_buttons_hide);
+
+    if (hide_timer) {
+        lv_timer_del(hide_timer);
+        hide_timer = NULL;
+    }
+    if (i > 0 && i < (int32_t)(sizeof(hide_ms) / sizeof(hide_ms[0]))) {
+        hide_timer = timer_once(hide_cb, hide_ms[i]);
+    }
+}
+
+/* In walkie mode they are never hidden (buttons_vertical()): counted only, for the main screen after it */
+bool main_screen_buttons_wake(void) {
+    bool was = buttons_hidden();
+
+    buttons_hide(false);
+    hide_arm();
+    return was;
+}
+
+/* VOL and the MFK: hidden the buttons stay so, shown they stay a while longer */
+static void buttons_keep(void) {
+    if (!buttons_hidden()) {
+        hide_arm();
+    }
+}
+
+/* Changed in Settings or on the web Display page: shown again (Off), counted from now */
+static void on_buttons_hide_change(Subject *subj, void *user_data) {
+    main_screen_buttons_wake();
+}
+
 /* Front keys. Most act on the release (a press) or on the long press, not both */
 static void front_key_cb(lv_event_t *e) {
     event_keypad_t *ev   = lv_event_get_param(e);
     bool            tap  = ev->state == KEYPAD_RELEASE;
     bool            hold = ev->state == KEYPAD_LONG;
+    bool            woke = main_screen_buttons_wake();
 
+    if (woke && ev->state == KEYPAD_PRESS && ev->key >= KEYPAD_F1 && ev->key <= KEYPAD_F5) {
+        woke_key = ev->key;
+    }
+    if (woke_key != KEYPAD_UNKNOWN && ev->key == woke_key) {
+        if (ev->state == KEYPAD_RELEASE || ev->state == KEYPAD_LONG_RELEASE) {
+            woke_key = KEYPAD_UNKNOWN;
+        }
+        return;
+    }
     if (page_key(ev->key, tap, hold)) {
         return;
     }
@@ -928,6 +996,7 @@ static void mic_key_cb(lv_event_t *e) {
     bool            tap  = ev->state == HKEY_RELEASE;
     bool            hold = ev->state == HKEY_LONG;
 
+    main_screen_buttons_wake();     /* a key: the buttons back (Hide buttons) */
     switch (ev->key) {
         /* The band printed on the key; digits only in F-INP (dialog_freq.c). Long: memory 1-9 */
         case HKEY_0: case HKEY_1: case HKEY_2: case HKEY_3: case HKEY_4:
@@ -936,16 +1005,17 @@ static void mic_key_cb(lv_event_t *e) {
         case HKEY_DOT:
 #endif
         {
-#ifdef BOARD_X6200
-            /* The H-22 prints 5.3 on its 3 and 28 on its dot (index 10) */
-            static const int16_t band_m[11] = {6, 160, 80, 60, 40, 30, 20, 17, 15, 12, 10};
-#else
+            /* The X6100 mic's print, on the X6200 too. The H-22 prints 5.3 on its 3 and 28 on its dot (index 10):
+             * it sends its own codes for those keys, the X6100 mic's only for 1 and 2, the same bands on both (#145) */
             static const int16_t band_m[10] = {6, 160, 80, 40, 30, 20, 17, 15, 12, 10};
-#endif
+            static const int16_t h22_m[11]  = {6, 160, 80, 60, 40, 30, 20, 17, 15, 12, 10};
             int                  digit      = ev->key == HKEY_DOT ? 10 : ev->key - HKEY_0;
 
+            if (digit == 10 && !ev->h22) {
+                break;      /* the X6100 mic's dot has no band */
+            }
             if (tap && !band_lock) {
-                controls_set_band_m(band_m[digit]);
+                controls_set_band_m(ev->h22 ? h22_m[digit] : band_m[digit]);
             } else if (hold && digit > 0 && digit < 10) {
                 mem_load(digit);
             }
@@ -966,8 +1036,8 @@ static void mic_key_cb(lv_event_t *e) {
             }
             break;
 
-        case HKEY_XFC:
-            if (tap) {
+        case HKEY_XFC:     /* VFO A/B, not while an app holds the VFOs (as ab_key()) */
+            if (tap && !ab_lock) {
                 radio_toggle_vfo();
                 spectrum_clear();
             }
@@ -1213,6 +1283,21 @@ static void spectrum_key_cb(lv_event_t *e) {
     if (key == KEY_VOL_PRESS) {
         key = LV_KEY_ESC;   /* on the main screen VOL press does what ESC does */
     }
+    /* Hide buttons: the knobs and the keyboard's keys for them leave the buttons hidden, VOL and the MFK keep
+     * them while shown; any other key brings them back. A keyboard's Enter (the MFK press) comes here before
+     * spectrum_pressed_cb() */
+    switch (key) {
+        case '-': case '=':
+            break;
+        case '[': case ']': case '{': case '}': case LV_KEY_LEFT: case LV_KEY_RIGHT: case LV_KEY_ESC: case LV_KEY_ENTER:
+        case KEY_VOL_LEFT_EDIT: case KEY_VOL_RIGHT_EDIT: case KEY_VOL_LEFT_SELECT: case KEY_VOL_RIGHT_SELECT:
+        case KEY_MFK_PREV: case KEY_MFK_NEXT:
+            buttons_keep();
+            break;
+        default:
+            main_screen_buttons_wake();
+            break;
+    }
     if (cw_field_key(key)) {
         return;
     }
@@ -1264,6 +1349,7 @@ static void spectrum_pressed_cb(lv_event_t *e) {
     /* The keyboard Enter that sent the CW field line */
     if (indev && lv_indev_get_type(indev) == LV_INDEV_TYPE_KEYPAD && cw_field_visible()) return;
     if (dialog_cluster_alert_press()) return;
+    buttons_keep();
     main_screen_mfk(0);
 }
 
@@ -1439,7 +1525,7 @@ static void on_band_id_change(Subject *subj, void *user_data) {
 }
 
 /* Off a band the radio cannot use any more, to the one below (else the one above): the WR12 switched off, or at the
- * start an X6200 left on 2 m before its transverters were off by default, a radio left on 4 m. The band counts as
+ * start a radio left on 2 m before its transverters were off by default, a radio left on 4 m. The band counts as
  * well as the frequency: on 4 m the start clamp puts the VFO on 55.000 MHz, which can be tuned */
 static void band_usable_check(void *arg) {
     if (cfg_is_valid_hw_freq(cparam_i_get(cfg_fg_freq)) && cfg_band_usable()) {
@@ -1651,6 +1737,9 @@ static void build(void) {
 
     subject_subscribe_delayed((Subject*)cfg_band_if_shift, on_if_shift_zoom, NULL);
     subject_subscribe_delayed((Subject*)cfg_mode_zoom, on_if_shift_zoom, NULL);
+
+    /* the new buttons counted from now (a theme change) */
+    subject_subscribe_delayed_and_notify((Subject*)cfg_buttons_hide, on_buttons_hide_change, NULL);
 }
 
 /* A theme change, live: the open app closes, the main screen is built again with the new
@@ -1706,6 +1795,18 @@ void main_screen_notify_low_power(bool is_low) {
         }
     } else if (!power_off_timer) {
         power_off_timer = timer_once(power_off_cb, 30000);
+#ifdef BOARD_BAT_EXT_MIN
+        /* On a supply too low to hold the battery up (board.h): the radio is plugged in, say why */
+        float   ext, bat;
+        uint8_t cap;
+        bool    chg;
+
+        clock_power_get(&ext, &bat, &cap, &chg);
+        if (ext >= 3.0f) {
+            msg_schedule_long_text_fmt("Low battery, DC IN under %d V! Turning off in 30s.", BOARD_BAT_EXT_MIN / 10);
+            return;
+        }
+#endif
         msg_schedule_long_text_fmt("Low battery! Turning off in 30s.");
     }
 }

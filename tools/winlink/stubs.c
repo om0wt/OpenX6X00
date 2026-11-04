@@ -8,12 +8,13 @@
  *    WL_SOCK      the modem socket (WINLINK_ARDOP_SOCK), default /tmp/winlink-test.sock
  *    WL_RIG_PORT  the rigctld's port, default 14532
  *    WL_PLAYED    each transmission is written here when it ends (int16, 44.1 kHz), and a line is added to
- *                 WL_PLAYED.log: "played <samples> stopped <0|1>"
+ *                 WL_PLAYED.log: "played <samples> stopped <0|1> freq <the frequency it went out on, Hz>"
  *    WL_AIR_IN    a UNIX datagram socket this station hears the other on; without it, a tone of WL_TONE Hz
  *                 (default 1000)
  *    WL_AIR_OUT   the other station's WL_AIR_IN: what this one transmits goes there, as the radio sends it
  *    WL_PWR_MAX   the top of PWR in W, default BOARD_PWR_MAX (the X6200's 8 W); 5 is the X6200 on its battery
  *    WL_PWR_XVTR  a transverter's TX power limit in force, W (#104), default none; give WL_PWR_MAX the same
+ *    WL_NO_DATA   set: the base sends no data (#152, radio_no_data), the radio's TX refused
  *    WL_APP       a file: while it is there, its text is the digital app open (FT8...), else none is
  *    WL_SWR       a file: when it is there during a key, the SWR protection stops that key as radio.c's does (a trip
  *                 counted, the radio unkeyed, "TX stopped: SWR 3.0"), and the file goes: one trip each
@@ -105,6 +106,8 @@ int32_t cparam_i_get(const ComputedParamInt *p) { return p->v; }
 float   param_f_get(const ParamFloat *p) { return p->v; }
 void    cparam_i_set(ComputedParamInt *p, int32_t v) { p->v = v; }
 bool    cfg_is_valid_hw_freq(int32_t f) { return f >= 100000 && f <= 55000000; }
+/* Why the radio may not transmit (#121): WL_TX_NO's words anywhere, none without it */
+const char *cfg_tx_refusal(int32_t f) { (void)f; return getenv("WL_TX_NO"); }
 float   cfg_pwr_max_get(void) { return getenv("WL_PWR_MAX") ? (float)atof(getenv("WL_PWR_MAX")) : BOARD_PWR_MAX; }
 float   cfg_pwr_xvtr_get(void) { return getenv("WL_PWR_XVTR") ? (float)atof(getenv("WL_PWR_XVTR")) : 0.0f; }
 
@@ -130,6 +133,7 @@ unsigned radio_swr_trips(void) {
 }
 
 radio_state_t radio_get_state(void) { return atomic_load(&keyed) ? RADIO_TX : RADIO_RX; }
+bool          radio_no_data(void) { return getenv("WL_NO_DATA") != NULL; }
 bool          radio_get_modem(void) { return atomic_load(&keyed); }
 int32_t       radio_tx_freq(void) { return freq.v; }
 uint64_t      radio_swr_trip_at(void) { return atomic_load(&swr_trip_at); }
@@ -329,7 +333,7 @@ static void swr_check(void) {
 
 float tx_player_base_gain_offset(void) { return 0.0f; }
 
-static void played_write(const int16_t *s, size_t n, bool stopped) {
+static void played_write(const int16_t *s, size_t n, bool stopped, int32_t hz) {
     const char *path = getenv("WL_PLAYED");
     char        tmp[4096], log[4096];
     FILE       *f;
@@ -344,7 +348,7 @@ static void played_write(const int16_t *s, size_t n, bool stopped) {
         rename(tmp, path);
     }
     if ((f = fopen(log, "a"))) {
-        fprintf(f, "played %zu stopped %d\n", n, stopped);
+        fprintf(f, "played %zu stopped %d freq %d\n", n, stopped, (int)hz);
         fclose(f);
     }
 }
@@ -356,6 +360,7 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
     size_t   played = 0, cap = 0;
     bool     stopped = false;
     uint64_t t0 = now_us();
+    int32_t  hz = radio_tx_freq();      /* a QSY asked meanwhile is made once the key is over */
 
     (void)offset_hz;
     (void)base_gain;
@@ -384,7 +389,7 @@ bool tx_player_stream(tx_fill_fn_t fill, void *fill_ctx, int32_t offset_hz, floa
     atomic_store(&keyed, false);
     fprintf(stderr, "[stub] unkeyed: %zu samples, %.2f s%s\n", played, played / (double)PLAY_RATE,
             stopped ? ", stopped" : "");
-    played_write(all, played, stopped);
+    played_write(all, played, stopped, hz);
     free(all);
     return !stopped;
 }

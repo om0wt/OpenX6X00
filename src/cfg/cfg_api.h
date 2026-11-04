@@ -62,6 +62,7 @@ extern ParamInt         *cfg_atu_enabled;       // p_atu_enabled
 extern ParamInt         *cfg_auto_level_enabled; // p_auto_level_enabled
 extern ParamFloat       *cfg_auto_level_offset;  // p_auto_level_offset
 extern ParamInt         *cfg_knob_info;          // p_knob_info
+extern ParamInt         *cfg_buttons_hide;       // p_buttons_hide
 extern ParamInt         *cfg_mode_from_plan;     // p_mode_from_plan
 extern ParamInt         *cfg_band_region;        // p_band_region
 extern ParamInt         *cfg_birdie_marks;       // p_birdie_marks
@@ -86,6 +87,7 @@ extern ParamInt         *cfg_spectrum_fill_gradient; // p_spectrum_fill_gradient
 extern ParamInt         *cfg_smeter_bar_color;   // p_smeter_bar_color
 extern ParamInt         *cfg_swr_color;          // p_swr_color
 extern ParamInt         *cfg_swr_protect;        // p_swr_protect
+extern ParamInt         *cfg_tx_outside_bands;   // p_tx_outside_bands
 extern ParamFloat       *cfg_tune_pwr;           // p_tune_pwr
 extern ParamInt         *cfg_tune_time;          // p_tune_time
 extern ParamInt         *cfg_smeter_lamp;        // p_smeter_lamp

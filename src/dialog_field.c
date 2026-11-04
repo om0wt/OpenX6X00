@@ -161,7 +161,7 @@ static time_t      spot_armed_at;
  * or another mode) once we transmitted there and stayed QSY_SETTLE_S (field/qsy.c) */
 static lv_timer_t *qsy_timer;
 static int32_t     spot_hz;      /* where the last spot said we are */
-static char        spot_mode[8];
+static char        spot_mode[16];      /* as field_qso_t.mode */
 static field_qsy_t qsy;
 
 /* The programmes */
@@ -2236,15 +2236,18 @@ static struct {
 
 /* Why the radio would not send the test on band, NULL: it would. tx: where it transmits */
 static const char *tb_no_tx(int band, int32_t *tx) {
-    static char why[64];
+    static char why[112];
+    char        no[96];
     int32_t     f;
 
     *tx = radio_tx_freq();
     f   = *tx < 0 ? -*tx : *tx;     /* a TX shift below 0 Hz */
     if (field_band_of(*tx) != band)     /* split or a TX shift: the other VFO, wherever it is */
         snprintf(why, sizeof(why), "it sends on %.3f MHz (split or TX shift)", f / 1e6);
-    else if (!cfg_is_tx_freq(*tx))
-        snprintf(why, sizeof(why), "no TX on %.3f MHz", f / 1e6);
+    else if (cfg_tx_refusal_text(*tx, no, sizeof(no)))     /* receive only, outside the amateur bands (#121) */
+        snprintf(why, sizeof(why), "no TX on %s", no);
+    else if (radio_no_data())       /* none from the base (#152) */
+        snprintf(why, sizeof(why), "no data from the base");
     else
         return NULL;
     return why;
@@ -2412,6 +2415,10 @@ void dialog_field_test_beacon(int band) {
     }
     if (radio_get_state() != RADIO_RX) {
         msg_update_text_fmt("Test beacon: the radio is transmitting");
+        return;
+    }
+    if (radio_no_data()) {      /* none from the base (#152): before the dial moves, as QRSS3 */
+        msg_update_text_fmt("Test beacon on %s: no data from the base", field_band_name(band));
         return;
     }
     if (field_band_of(here) != band) {
